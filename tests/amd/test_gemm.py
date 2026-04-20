@@ -118,6 +118,7 @@ def test_gemm_gated_swiglu():
 
 
 def test_gemm_symmetric():
+    """Covers the torch-fallback path (A is f32)."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)
@@ -125,3 +126,15 @@ def test_gemm_symmetric():
     out = gemm_symmetric(A)
     ref = A @ A.transpose(-1, -2)
     torch.testing.assert_close(out, ref)
+
+
+def test_gemm_symmetric_dispatches_to_mfma_kernel():
+    """f16/bf16 eligible shape routes to the dedicated symmetric MFMA kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    A = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    out = gemm_symmetric(A)
+    ref = A.float() @ A.float().t()
+    torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+    assert out.dtype == torch.float32  # dedicated kernel defaults to f32 output

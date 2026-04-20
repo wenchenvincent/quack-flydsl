@@ -194,9 +194,25 @@ def gemm_gated(A, B, gate_type: str = "swiglu", **kw):
     raise NotImplementedError(f"gate_type={gate_type!r}")
 
 
-def gemm_symmetric(A, **kw):
-    """Symmetric GEMM: C = A @ A^T."""
-    return gemm(A, A.transpose(-1, -2), **kw)
+def gemm_symmetric(A, out_dtype=None, **kw):
+    """Symmetric GEMM: C = A @ A.T.
+
+    Routes through the dedicated FlyDSL kernel
+    ``quack.amd.gemm_symmetric.gemm_symmetric`` when inputs are eligible
+    (f16/bf16, M/K multiples of 16, last-dim contig). Falls back to
+    ``gemm(A, A.T)`` otherwise.
+    """
+    if (
+        A.is_cuda
+        and A.dtype in (torch.float16, torch.bfloat16)
+        and A.dim() == 2
+        and A.stride(-1) == 1
+        and A.size(0) % 16 == 0 and A.size(1) % 16 == 0
+        and not kw   # dedicated kernel doesn't yet take bias/activation/etc.
+    ):
+        from quack.amd.gemm_symmetric import gemm_symmetric as _gemm_symmetric_kernel
+        return _gemm_symmetric_kernel(A, out_dtype=out_dtype)
+    return gemm(A, A.transpose(-1, -2).contiguous(), out_dtype=out_dtype, **kw)
 
 
 __all__ = ["gemm", "gemm_act", "gemm_gated", "gemm_symmetric"]
