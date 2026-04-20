@@ -105,8 +105,16 @@ def mxfp8_gemm(
     *,
     out_dtype: torch.dtype = torch.bfloat16,
     use_mfma_kernel: bool = False,
+    bias: Optional[Tensor] = None,
+    activation: Optional[str] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: Optional[Tensor] = None,
 ) -> Tensor:
-    """Block-scaled fp8 × fp8 → bf16/f32 GEMM.
+    """Block-scaled fp8 × fp8 → bf16/f32 GEMM with optional epilogue.
+
+    Computes ``D = activation(alpha * (A @ B) + beta * C + bias)`` with
+    per-block scaling on fp8 inputs.
 
     Shapes:
         A: ``(M, K)`` fp8_e4m3fn
@@ -114,18 +122,15 @@ def mxfp8_gemm(
         A_scale: ``(K // 128, M)`` f32 (transposed)
         B_scale: ``(N // 128, K // 128)`` f32
         out: ``(M, N)`` of ``out_dtype`` (allocated if None)
+        bias: 1-D f32 length N, optional
+        C: f32 (M, N), required when beta != 0
 
-    ``M, N, K`` must all be multiples of 128. Matches the layout of
-    ``FlyDSL/kernels/blockscale_preshuffle_gemm.py``.
+    ``M, N, K`` must all be multiples of 128.
 
     When ``use_mfma_kernel=True`` and the call is in the FlyDSL MFMA
-    kernel's supported scope, dispatches to
-    ``quack.amd.gemm_blockscaled_kernel.mxfp8_gemm_mfma`` (which expects
-    B in (N, K) layout — this wrapper transposes on the caller's behalf).
-    Otherwise computes via a torch dequantise → matmul reference.
-
-    The torch path is always available and is the contract the kernel
-    path is validated against.
+    kernel's supported scope, dispatches to the real MFMA kernel (which
+    now supports bias / activation / alpha / beta / C natively).
+    Otherwise falls back to torch dequantise → matmul → manual epilogue.
     """
     assert A.is_cuda and B.is_cuda
     assert A.dtype in _SUPPORTED_IN_DTYPES and B.dtype in _SUPPORTED_IN_DTYPES
@@ -141,16 +146,36 @@ def mxfp8_gemm(
     if use_mfma_kernel and _mfma_kernel_eligible(A, B, A_scale, B_scale, out_dtype):
         from quack.amd.gemm_blockscaled_kernel import mxfp8_gemm_mfma
         B_transposed = B.transpose(0, 1).contiguous()
-        result = mxfp8_gemm_mfma(A, B_transposed, A_scale, B_scale, out_dtype=out_dtype)
+        result = mxfp8_gemm_mfma(
+            A, B_transposed, A_scale, B_scale,
+            out_dtype=out_dtype,
+            bias=bias, activation=activation,
+            alpha=alpha, beta=beta, C=C,
+        )
         if out is None:
             return result
         out.copy_(result)
         return out
 
-    # Torch reference: dequantise inputs, matmul in f32, cast to out dtype.
+    # Torch fallback — apply the same epilogue to match kernel behaviour.
     A_f32 = _dequantize_mxfp8(A, A_scale, block_k=128, axis=1)
     B_f32 = _dequantize_mxfp8(B, B_scale, block_k=128, axis=0)
-    result = (A_f32 @ B_f32).to(out_dtype)
+    result_f32 = alpha * (A_f32 @ B_f32)
+    if C is not None and beta != 0.0:
+        result_f32 = result_f32 + beta * C.float()
+    if bias is not None:
+        result_f32 = result_f32 + bias.float()
+    if activation == "relu":
+        result_f32 = torch.relu(result_f32)
+    elif activation == "relu_sq":
+        result_f32 = torch.relu(result_f32) * result_f32
+    elif activation == "gelu_tanh_approx":
+        result_f32 = torch.nn.functional.gelu(result_f32, approximate="tanh")
+    elif activation == "silu":
+        result_f32 = torch.nn.functional.silu(result_f32)
+    elif activation is not None:
+        raise NotImplementedError(f"activation={activation!r}")
+    result = result_f32.to(out_dtype)
 
     if out is None:
         return result
