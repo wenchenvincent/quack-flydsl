@@ -90,6 +90,8 @@ def gemm(
     beta: float = 0.0,
     C: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
 ) -> Tensor:
     """GEMM: ``D = alpha * A @ B + beta * C + bias`` then optional activation.
 
@@ -105,8 +107,22 @@ def gemm(
         - alpha=1, beta=0, C=None
         - activations: relu / relu_sq / gelu_tanh_approx / silu
         - per-column f32 bias
+
+    Varlen (``cu_seqlens_m``): packed-batch input where A is
+    ``(total_M, K)`` with samples concatenated along M. For plain GEMM
+    (no per-sample bias / activation / masking) this is equivalent to a
+    regular ``(total_M, K) @ (K, N)`` matmul — the dispatcher just
+    routes through the standard path.
+
+    ``A_idx``: optional gather-A row index; when present ``A`` is
+    gathered via ``A[A_idx]`` before the matmul (host-side for the MVP).
     """
     assert A.is_cuda and B.is_cuda
+    if cu_seqlens_m is not None:
+        from quack.amd.varlen_utils import validate_varlen
+        validate_varlen(cu_seqlens_m, A.size(0))
+    if A_idx is not None:
+        A = A.index_select(0, A_idx.long())
     # Default output dtype: match input (torch.matmul convention), not f32.
     effective_out_dtype = out_dtype or A.dtype
     if _mfma_eligible(A, B, bias, activation, alpha, beta, C, effective_out_dtype):
