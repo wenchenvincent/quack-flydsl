@@ -54,13 +54,15 @@ _FRAG_C = 4  # f32 values per lane
 
 
 def _build_gemm_16x16(
-    *, M, N, K, dtype_str, arch,
+    *, M, N, K, dtype_str, out_dtype_str, arch,
     has_bias: bool = False,
     activation: Optional[str] = None,
 ):
     """Compile a 16x16-tile MFMA GEMM.
 
-    ``dtype_str`` ∈ {"f16", "bf16"} selects the MFMA variant. Optional
+    ``dtype_str`` ∈ {"f16", "bf16"} selects the MFMA variant and input
+    element type. ``out_dtype_str`` ∈ {"f32", "f16", "bf16"} picks the
+    output store dtype (downcast from the f32 accumulator). Optional
     ``has_bias`` adds a per-column f32 bias. Optional ``activation`` ∈
     {"relu", "relu_sq", "gelu_tanh_approx", "silu"} applies post-bias.
 
@@ -68,9 +70,10 @@ def _build_gemm_16x16(
     block = (64,1,1).
     """
     assert dtype_str in {"f16", "bf16"}
+    assert out_dtype_str in {"f32", "f16", "bf16"}
     assert activation in {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}
     assert M % _MFMA_M == 0 and N % _MFMA_N == 0 and K % _MFMA_K == 0
-    sym_suffix = f"_{'b' if has_bias else 'nb'}_{activation or 'none'}"
+    sym_suffix = f"_{'b' if has_bias else 'nb'}_{activation or 'none'}_out{out_dtype_str}"
     allocator = SmemAllocator(
         None, arch=arch,
         global_sym_name=f"quack_amd_gemm_{dtype_str}{sym_suffix}_smem",
@@ -110,10 +113,18 @@ def _build_gemm_16x16(
         # machinery used elsewhere — less optimal than buffer_load but
         # reliably correct.
         in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
+        out_elem_type = (
+            T.f32 if out_dtype_str == "f32"
+            else T.f16 if out_dtype_str == "f16"
+            else T.bf16
+        )
+        out_bufcopy = fx.rocdl.BufferCopy32b() if out_dtype_str == "f32" else fx.rocdl.BufferCopy16b()
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        ca_out = fx.make_copy_atom(out_bufcopy, out_elem_type)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        out_reg_ty = fx.MemRefType.get(out_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
         def _load_h_scalar(div, idx):
@@ -132,6 +143,20 @@ def _build_gemm_16x16(
             r = fx.memref_alloca(f_reg_ty, reg_lay)
             fx.copy_atom_call(ca_f, fx.slice(div, (None, idx)), r)
             return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store_out_scalar(div, idx, val_f32):
+            """Store ``val_f32`` (f32) to ``div`` at ``idx``, downcasting to
+            the output dtype if needed."""
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(out_reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
+            if out_dtype_str == "f32":
+                ts = _vfull(1, Float32(val_f32), Float32)
+            else:
+                val = ArithValue(val_f32).truncf(out_elem_type)
+                ts = _vfull(1, elem_py(val), elem_py)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca_out, r, fx.slice(div, (None, idx)))
 
         # Accumulator: f32x4 per lane, zero-init.
         acc_ty = T.vec(_FRAG_C, T.f32)
@@ -217,7 +242,7 @@ def _build_gemm_16x16(
             elif activation == "silu":
                 # silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
                 val = val / (Float32(1.0) + _fm.exp(-val, fastmath="fast"))
-            _store_f_scalar(c_div, out_col, val)
+            _store_out_scalar(c_div, out_col, val)
 
     @flyc.jit
     def launch(A: fx.Tensor, B: fx.Tensor, Bias: fx.Tensor, C: fx.Tensor,
@@ -238,12 +263,19 @@ def _build_gemm_16x16(
 _kernel_cache: dict = {}
 
 
-def _compile(M, N, K, dtype_str, has_bias, activation, arch):
-    key = (M, N, K, dtype_str, has_bias, activation, arch)
+_OUT_DTYPE_MAP = {
+    torch.float32: "f32",
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+}
+
+
+def _compile(M, N, K, dtype_str, out_dtype_str, has_bias, activation, arch):
+    key = (M, N, K, dtype_str, out_dtype_str, has_bias, activation, arch)
     got = _kernel_cache.get(key)
     if got is None:
         got = _build_gemm_16x16(
-            M=M, N=N, K=K, dtype_str=dtype_str, arch=arch,
+            M=M, N=N, K=K, dtype_str=dtype_str, out_dtype_str=out_dtype_str, arch=arch,
             has_bias=has_bias, activation=activation,
         )
         _kernel_cache[key] = got
@@ -261,7 +293,7 @@ def _gemm_mfma_out(
 ) -> None:
     assert A.dtype in (torch.float16, torch.bfloat16)
     assert A.dtype == B.dtype
-    assert out.dtype == torch.float32
+    assert out.dtype in _OUT_DTYPE_MAP
     M, K = A.shape
     K2, N = B.shape
     assert K == K2
@@ -272,7 +304,10 @@ def _gemm_mfma_out(
     if has_bias:
         assert bias.dim() == 1 and bias.size(0) == N and bias.dtype == torch.float32
     dtype_str = "f16" if A.dtype == torch.float16 else "bf16"
-    launcher = _compile(M, N, K, dtype_str, has_bias, activation, get_rocm_arch())
+    out_dtype_str = _OUT_DTYPE_MAP[out.dtype]
+    launcher = _compile(
+        M, N, K, dtype_str, out_dtype_str, has_bias, activation, get_rocm_arch(),
+    )
     B_arg = bias if has_bias else out  # stand-in when has_bias=False
     launcher(A, B, B_arg, out)
 
@@ -286,22 +321,25 @@ def gemm_mfma(
     A: Tensor, B: Tensor,
     bias: Optional[Tensor] = None,
     activation: Optional[str] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
-    """FlyDSL MFMA GEMM: f16/bf16 × f16/bf16 → f32, optional bias + activation.
+    """FlyDSL MFMA GEMM: f16/bf16 × f16/bf16 → f32/f16/bf16.
 
     - M, N, K all multiples of 16.
     - ``bias`` is a 1-D f32 tensor of length N (per-column bias).
     - ``activation`` ∈ {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}.
-
-    Returns f32 output. Callers who want f16/bf16 output should downcast
-    on the host — downstream-dtype store is a follow-up.
+    - ``out_dtype`` ∈ {f32 (default), f16, bf16}. Non-f32 outputs downcast
+      from the f32 accumulator inside the kernel (truncation to the target
+      dtype's representable range).
     """
     assert A.is_cuda and B.is_cuda
     M, K = A.shape
     _, N = B.shape
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    out = torch.empty(M, N, device=A.device, dtype=torch.float32)
+    if out_dtype is None:
+        out_dtype = torch.float32
+    out = torch.empty(M, N, device=A.device, dtype=out_dtype)
     _gemm_mfma_out(A, B, bias, out, activation)
     return out
 
