@@ -33,7 +33,7 @@ What's NOT yet shipped (substantial follow-up):
     - Fused epilogues beyond the simple activation/bias/gate set above.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -215,4 +215,136 @@ def gemm_symmetric(A, out_dtype=None, **kw):
     return gemm(A, A.transpose(-1, -2).contiguous(), out_dtype=out_dtype, **kw)
 
 
-__all__ = ["gemm", "gemm_act", "gemm_gated", "gemm_symmetric"]
+def _act_bwd(preact: Tensor, activation: Optional[str]) -> Tensor:
+    """Pointwise activation backward: ``d(act(x))/dx`` evaluated at ``preact``."""
+    if activation is None:
+        return torch.ones_like(preact)
+    x = preact.float()
+    if activation == "relu":
+        return (x > 0).to(preact.dtype)
+    if activation == "relu_sq":
+        return (2.0 * torch.relu(x)).to(preact.dtype)
+    if activation == "silu":
+        sig = torch.sigmoid(x)
+        return (sig * (1 + x * (1 - sig))).to(preact.dtype)
+    if activation == "gelu_tanh_approx":
+        # d/dx of gelu_tanh(x).  Use torch autograd for reliability.
+        preact_f = x.detach().requires_grad_(True)
+        y = torch.nn.functional.gelu(preact_f, approximate="tanh")
+        (grad,) = torch.autograd.grad(y.sum(), preact_f)
+        return grad.to(preact.dtype)
+    raise NotImplementedError(f"activation={activation!r}")
+
+
+def gemm_dact(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    activation: Optional[str] = None,
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Activation-backward fused GEMM: returns ``(dx, postact)`` where
+    ``dx = (A @ B) * activation'(PreAct)`` and ``postact = activation(PreAct)``.
+
+    MVP implementation composes the MFMA GEMM with torch-native
+    elementwise activation fwd/bwd. Fused FlyDSL epilogue is a follow-up
+    but keeps this API stable so downstream callers land first.
+    """
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
+    dout = gemm(A, B, out_dtype=torch.float32)
+    act_prime = _act_bwd(PreAct, activation)
+    dx = (dout * act_prime.float()).to(out_dtype)
+    if activation is None:
+        postact = PreAct.to(postact_dtype)
+    elif activation == "relu":
+        postact = torch.relu(PreAct).to(postact_dtype)
+    elif activation == "relu_sq":
+        postact = (torch.relu(PreAct) ** 2).to(postact_dtype)
+    elif activation == "silu":
+        postact = torch.nn.functional.silu(PreAct).to(postact_dtype)
+    elif activation == "gelu_tanh_approx":
+        postact = torch.nn.functional.gelu(PreAct, approximate="tanh").to(postact_dtype)
+    else:
+        raise NotImplementedError(f"activation={activation!r}")
+    return dx, postact
+
+
+_GATED_BWD_FNS = {
+    "swiglu": lambda gate, up, dout: (
+        dout * up * torch.sigmoid(gate) * (1.0 + gate * (1.0 - torch.sigmoid(gate))),
+        dout * torch.nn.functional.silu(gate),
+    ),
+    "reglu": lambda gate, up, dout: (
+        dout * up * (gate > 0).to(dout.dtype),
+        dout * torch.relu(gate),
+    ),
+    "geglu": lambda gate, up, dout: (
+        dout * up * torch.autograd.grad(
+            torch.nn.functional.gelu(
+                gate.detach().requires_grad_(True), approximate="tanh"
+            ).sum(),
+            gate.detach().requires_grad_(True) if False else gate,
+        )[0],
+        dout * torch.nn.functional.gelu(gate, approximate="tanh"),
+    ),
+    "glu": lambda gate, up, dout: (
+        dout * up * torch.sigmoid(gate) * (1.0 - torch.sigmoid(gate)),
+        dout * torch.sigmoid(gate),
+    ),
+}
+
+
+def gemm_dgated(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    gate_type: str = "swiglu",
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Gated-activation-backward fused GEMM.
+
+    ``PreAct`` is ``(M, 2N)`` with interleaved ``gate, up`` in the last
+    axis (matching NVIDIA QuACK's convention). Returns ``(dx, postact)``
+    where ``dx`` is ``(M, 2N)`` interleaved ``(dgate, dup)`` and
+    ``postact`` is ``(M, N)`` forward output.
+    """
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
+    dout = gemm(A, B, out_dtype=torch.float32)
+    gate = PreAct[..., ::2].float()
+    up = PreAct[..., 1::2].float()
+    if gate_type == "swiglu":
+        postact = (torch.nn.functional.silu(gate) * up)
+    elif gate_type == "reglu":
+        postact = torch.relu(gate) * up
+    elif gate_type == "geglu":
+        postact = torch.nn.functional.gelu(gate, approximate="tanh") * up
+    elif gate_type == "glu":
+        postact = torch.sigmoid(gate) * up
+    else:
+        raise NotImplementedError(f"gate_type={gate_type!r}")
+    # Autograd path for robust gradient (matches NVIDIA ref impl).
+    g = PreAct[..., ::2].detach().requires_grad_(True)
+    u = PreAct[..., 1::2].detach().requires_grad_(True)
+    if gate_type == "swiglu":
+        y = torch.nn.functional.silu(g) * u
+    elif gate_type == "reglu":
+        y = torch.relu(g) * u
+    elif gate_type == "geglu":
+        y = torch.nn.functional.gelu(g, approximate="tanh") * u
+    elif gate_type == "glu":
+        y = torch.sigmoid(g) * u
+    dgate, dup = torch.autograd.grad(y, [g, u], dout)
+    dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
+    return dx.to(out_dtype), postact.to(postact_dtype)
+
+
+__all__ = [
+    "gemm", "gemm_act", "gemm_gated", "gemm_symmetric",
+    "gemm_dact", "gemm_dgated",
+]
