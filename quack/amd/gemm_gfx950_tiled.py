@@ -22,6 +22,20 @@ Scope (MVP):
   - Single wave (64 threads) per workgroup.
   - No LDS ping-pong yet (future: add smem-staged A/B via double buffer).
 
+Deferred perf work (separate commit tracks):
+  - **LDS ping-pong** (2-stage): prefetch K+1 tile while MFMA-ing K.
+    Needs ``SmemAllocator`` double-buffer + explicit wait-counts.
+    Reference: ``FlyDSL/kernels/mfma_preshuffle_pipeline.py`` lines
+    200–380.
+  - **B-preshuffle** (XOR-swizzled LDS B layout): eliminates LDS bank
+    conflicts when reading B for MFMA. Reference:
+    ``FlyDSL/kernels/mfma_preshuffle_pipeline.py:swizzle_xor16`` +
+    ``lds_store_16b_xor16``. Combined with LDS ping-pong this is the
+    path that closes the gap vs hipBLASLt's MFMA performance on gfx950.
+  - **4-wave workgroup** (256 threads, 4×4 MFMA grid covering a 128×128
+    tile): biggest single win for large shapes. Requires wave-indexed
+    fragment loads. Reference: ``preshuffle_gemm.py`` lines 434–459.
+
 Public API: ``gemm_f16_32x32(A, B) -> C`` — used by ``quack.amd.gemm``
 when inputs align to the 32-tile grid and epilogue is empty; otherwise
 falls through to the 16×16 path.
