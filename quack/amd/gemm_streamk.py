@@ -29,12 +29,13 @@ from torch import Tensor
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr, vector, buffer_ops, rocdl
+from flydsl.expr import arith, gpu as _gpu, range_constexpr, vector, buffer_ops, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.numeric import Float32, Numeric
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm_d, fly as _fly_d
 
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.tile_scheduler import get_num_cus
@@ -44,6 +45,14 @@ _MFMA_M = 16
 _MFMA_N = 16
 _MFMA_K = 16
 _FRAG_C = 4
+
+
+def _align_smem(allocator, align):
+    return allocator._align(allocator.ptr, align)
+
+
+def _bump_smem(allocator, nbytes):
+    allocator.ptr = _align_smem(allocator, 4) + nbytes
 
 
 def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
@@ -58,6 +67,10 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
         None, arch=arch,
         global_sym_name=f"quack_amd_gemm_streamk_f16_{M}_{N}_{K}_{num_cus}_smem",
     )
+    # One f32 slot for broadcasting the atomic-fetched tile index to the
+    # whole workgroup.
+    tile_idx_offset = _align_smem(allocator, 4)
+    _bump_smem(allocator, 4)
 
     @flyc.kernel
     def kernel(A: fx.Tensor, B: fx.Tensor, Counter: fx.Tensor, C: fx.Tensor):
@@ -70,8 +83,17 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
         A_buf = fx.rocdl.make_buffer_tensor(A)
         B_buf = fx.rocdl.make_buffer_tensor(B)
         C_buf = fx.rocdl.make_buffer_tensor(C)
-        # Counter is a 1-element f32 tensor; use the rsrc API for atomics.
-        counter_rsrc = buffer_ops.create_buffer_resource(Counter)
+
+        # llvm.ptr<1> to the counter — feeds llvm.atomicrmw whose .result
+        # gives us the old value (AMD's rocdl.raw.ptr.buffer.atomic.fadd
+        # discards it in the current MLIR bindings).
+        counter_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+        counter_raw = Counter.__fly_values__()[0]
+        counter_ptr = _fly_d.extract_aligned_pointer_as_index(counter_ptr_ty, counter_raw)
+
+        smem_base = allocator.get_base()
+        s_tile = SmemPtr(smem_base, tile_idx_offset, T.f32, shape=(1,))
+        s_tile.get()
 
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
@@ -151,11 +173,24 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
                     val_i = vector.extract(acc, static_position=[i], dynamic_position=[])
                     _store_f(c_div, out_col, val_i)
 
-            # Advance tile_idx for the next iteration. Currently STATIC-style
-            # (+= num_cus). DYNAMIC with atomic readback is the follow-up
-            # — needs llvm.AtomicRMWOp + LDS broadcast of the returned
-            # old value (see quack/amd/tile_scheduler.py docstring).
-            tile_idx = tile_idx + c_num_cus
+            # DYNAMIC stream-K: lane 0 of the workgroup races with other
+            # workgroups for the next tile via an f32 atomic-fadd on the
+            # shared counter. Counter is host-initialised to ``num_cus``
+            # (accounting for the initial bid-indexed tiles), so the first
+            # atomic returns ``num_cus`` — the (num_cus)-th tile index.
+            # Other lanes in the wg read the broadcast via LDS.
+            if tid == fx.Int32(0):
+                rmw_op = _llvm_d.AtomicRMWOp(
+                    _llvm_d.AtomicBinOp.fadd,
+                    counter_ptr, one_f32,
+                    _llvm_d.AtomicOrdering.monotonic,
+                )
+                old_f = rmw_op.result
+                s_tile.store(old_f, [fx.Index(0)])
+            _gpu.barrier()
+            next_f = s_tile.load([fx.Index(0)])
+            next_iv = next_f.ir_value() if hasattr(next_f, "ir_value") else next_f
+            tile_idx = ArithValue(arith.fptosi(T.i32, next_iv))
 
     @flyc.jit
     def launch(A: fx.Tensor, B: fx.Tensor, Counter: fx.Tensor, C: fx.Tensor,
@@ -186,14 +221,12 @@ def _compile(M, N, K, num_cus, arch):
 def gemm_f16_streamk(A: Tensor, B: Tensor) -> Tensor:
     """Stream-K persistent GEMM: f16 × f16 → f32.
 
-    Currently emits the same STATIC-persistent work partition as
-    ``gemm_persistent.gemm_f16_persistent``; the atomic-counter DYNAMIC
-    path is scaffolded (counter tensor is allocated and plumbed) but the
-    atomic read-back + LDS-broadcast pattern is a documented follow-up.
-
-    Kept as a separate module to make the scheduler-mode comparison
-    explicit — callers wanting the DYNAMIC path can switch by flipping
-    a single call site once the upstream wiring lands.
+    DYNAMIC tile scheduling: each wg's initial tile is its bid; for each
+    subsequent iteration the wg atomic-fadds 1.0 to a shared f32 counter
+    and uses the returned old value as the next tile index. Lane 0 of
+    the wg performs the atomic and broadcasts via LDS. The counter is
+    host-initialised to ``num_cus`` so the first atomic returns exactly
+    the (num_cus)-th tile — each tile is processed once.
     """
     assert A.is_cuda and B.is_cuda
     assert A.dtype == torch.float16 and B.dtype == torch.float16
@@ -202,9 +235,9 @@ def gemm_f16_streamk(A: Tensor, B: Tensor) -> Tensor:
     arch = get_rocm_arch()
     num_cus = get_num_cus(arch)
     out = torch.empty(M, N, device=A.device, dtype=torch.float32)
-    # Host-side atomic counter. Each wg starts at its bid and advances via
-    # this counter when atomic-readback wiring lands.
-    counter = torch.zeros(1, device=A.device, dtype=torch.float32)
+    # Initialize the counter so the first atomic returns ``num_cus``
+    # (the first tile not claimed by the initial bid-indexed batch).
+    counter = torch.full((1,), float(num_cus), device=A.device, dtype=torch.float32)
     _compile(M, N, K, num_cus, arch)(A, B, counter, out)
     return out
 
