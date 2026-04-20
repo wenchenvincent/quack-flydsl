@@ -96,7 +96,13 @@ def test_rmsnorm_bwd(dtype, M, N):
 
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(dx, ref_dx, atol=atol, rtol=rtol)
-    torch.testing.assert_close(dw, ref_dw, atol=atol, rtol=rtol)
+    # dw accumulates M terms in f32 along a single thread (kernelised
+    # column-parallel reduce). Torch's reference uses a tree-reduced sum,
+    # so the two diverge at the ULP level as M grows — match QuACK's
+    # NVIDIA bands (atol=1e-4, rtol=1e-3) rather than the fwd-pointwise
+    # band used for dx.
+    dw_atol = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
+    torch.testing.assert_close(dw, ref_dw, atol=dw_atol, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------

@@ -11,8 +11,10 @@ MLIR so each compiled kernel only carries the code paths it needs.
     RMSNorm:   x_hat = x * rsqrt(mean(x²) + eps)
     LayerNorm: x_hat = (x - mean(x)) * rsqrt(var(x) + eps)
 
-Backward (``_build_rmsnorm_dx``): RMSNorm ``dx`` kernel; ``dw`` via torch on
-the host. LayerNorm backward + residual / per-head layouts are follow-ups.
+Backward: ``_build_rmsnorm_dx`` computes per-row ``dx``;
+``_build_rmsnorm_dw`` is column-parallel (one thread per weight element,
+f32 accumulation across M). LayerNorm backward + per-head layouts are
+follow-ups.
 """
 
 from typing import Optional, Tuple, Type
@@ -411,12 +413,126 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
 
 
 # ---------------------------------------------------------------------------
+# Backward — dw reduction kernel (column-parallel over M)
+# ---------------------------------------------------------------------------
+
+
+def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
+    """``dw[j] = sum_over_m(dout[m, j] * x[m, j] * rstd[m])``.
+
+    One thread per output column. Each workgroup covers ``block_threads``
+    contiguous columns; grid.x = ceil(N / block_threads). Each thread
+    accumulates in f32 over a compile-time-unrolled M loop (``range``),
+    then casts and stores one element. No cross-thread reduction needed
+    since each column is independent.
+    """
+    block_threads = 128
+    elem_bits = dtype.width
+    w_elem_bits = weight_dtype.width
+
+    sym = f"quack_amd_rmsnorm_bwd_dw_{N}_{dtype.__name__}_{weight_dtype.__name__}_smem"
+    allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
+    fm_fast = arith.FastMathFlags.fast
+    del fm_fast  # not needed — but keeping import shape symmetric
+
+    @flyc.kernel
+    def kernel(
+        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, DW: fx.Tensor,
+        M_dyn: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        j = bid * fx.Int32(block_threads) + tid
+
+        elem_type = _elem_type_for(dtype)
+        w_elem_type = _elem_type_for(weight_dtype)
+        compute_type = T.f32
+
+        X_buf = fx.rocdl.make_buffer_tensor(X)
+        DOut_buf = fx.rocdl.make_buffer_tensor(DOut)
+        Rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
+        DW_buf = fx.rocdl.make_buffer_tensor(DW)
+
+        rstd_div = fx.logical_divide(Rstd_buf, fx.make_layout(1, 1))
+        dw_div = fx.logical_divide(DW_buf, fx.make_layout(1, 1))
+
+        copy_atom_x = fx.make_copy_atom(_bufcopy_for(elem_bits), elem_type)
+        copy_atom_w = fx.make_copy_atom(_bufcopy_for(w_elem_bits), w_elem_type)
+        copy_atom_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        x_reg_ty = fx.MemRefType.get(elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        w_reg_ty = fx.MemRefType.get(w_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load(div, reg_ty, ca, idx):
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            fx.copy_atom_call(ca, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store(div, reg_ty, ca, idx, val):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(reg_ty.element_type)
+            ts = _vfull(1, elem_py(val), elem_py)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
+
+        c_zero_f = arith.constant(0.0, type=compute_type)
+        j_iv = j.ir_value() if hasattr(j, "ir_value") else j
+        n_i32 = arith.constant(N, type=T.i32)
+
+        # Threads with j >= N still enter the loop (we rely on the store
+        # guard below to drop them). Unguarded column loads are safe
+        # because ``make_buffer_tensor`` uses an AMD buffer resource whose
+        # out-of-bounds reads return 0 — no fault, just wasted issue slots.
+        # Plain `range(dynamic, init=[...])` gets rewritten to scf.for
+        # with iter_args; ``state`` carries the f32 accumulator across
+        # iterations.
+        for m, state in range(0, M_dyn, init=[c_zero_f]):
+            m_i32 = ArithValue(m).index_cast(T.i32)
+            row_x = fx.slice(X_buf, (m_i32, None))
+            row_dout = fx.slice(DOut_buf, (m_i32, None))
+            x_div = fx.logical_divide(row_x, fx.make_layout(1, 1))
+            dout_div = fx.logical_divide(row_dout, fx.make_layout(1, 1))
+            x_e = _load(x_div, x_reg_ty, copy_atom_x, j)
+            d_e = _load(dout_div, x_reg_ty, copy_atom_x, j)
+            r_e = _load(rstd_div, f_reg_ty, copy_atom_f, m_i32)
+            x = x_e if dtype is Float32 else x_e.extf(compute_type)
+            d = d_e if dtype is Float32 else d_e.extf(compute_type)
+            contrib = ArithValue(x) * ArithValue(r_e) * ArithValue(d)
+            results = yield [ArithValue(state[0]) + contrib]
+
+        acc = results
+
+        if arith.cmpi(arith.CmpIPredicate.slt, j_iv, n_i32):
+            out_val = acc if weight_dtype is Float32 else ArithValue(acc).truncf(w_elem_type)
+            _store(dw_div, w_reg_ty, copy_atom_w, j, out_val)
+
+    @flyc.jit
+    def launch(
+        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, DW: fx.Tensor,
+        M: fx.Int32, stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        grid_x = (N + block_threads - 1) // block_threads
+        kernel(X, DOut, Rstd, DW, M).launch(
+            grid=(grid_x, 1, 1), block=(block_threads, 1, 1), stream=stream,
+        )
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
 # Caches + torch custom ops + public API
 # ---------------------------------------------------------------------------
 
 
 _fwd_cache: dict = {}
 _bwd_cache: dict = {}
+_bwd_dw_cache: dict = {}
 
 
 def _compile_fwd(
@@ -458,6 +574,18 @@ def _compile_bwd(N, x_dt, w_dt, arch):
             weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
         )
         _bwd_cache[key] = got
+    return got
+
+
+def _compile_bwd_dw(N, x_dt, w_dt, arch):
+    key = (N, x_dt, w_dt, arch)
+    got = _bwd_dw_cache.get(key)
+    if got is None:
+        got = _build_rmsnorm_dw(
+            N=N, dtype=torch2flydsl_dtype_map[x_dt],
+            weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
+        )
+        _bwd_dw_cache[key] = got
     return got
 
 
@@ -542,6 +670,29 @@ def _rmsnorm_bwd_dx_fake(x, weight, dout, rstd, dx):
     return None
 
 
+@torch.library.custom_op(
+    "quack_amd::_rmsnorm_bwd_dw",
+    mutates_args=("dw",),
+    schema="(Tensor x, Tensor dout, Tensor rstd, Tensor(a0!) dw) -> ()",
+)
+def _rmsnorm_bwd_dw(
+    x: Tensor, dout: Tensor, rstd: Tensor, dw: Tensor,
+) -> None:
+    assert x.is_cuda and dout.is_cuda and rstd.is_cuda and dw.is_cuda
+    assert x.dim() == 2 and dout.shape == x.shape
+    assert dw.dim() == 1 and dw.size(0) == x.size(-1)
+    assert rstd.dim() == 1 and rstd.size(0) == x.size(0) and rstd.dtype == torch.float32
+    assert all(t.stride(-1) == 1 for t in (x, dout))
+    M, N = x.shape
+    launcher = _compile_bwd_dw(N, x.dtype, dw.dtype, get_rocm_arch())
+    launcher(x, dout, rstd, dw, M)
+
+
+@_rmsnorm_bwd_dw.register_fake
+def _rmsnorm_bwd_dw_fake(x, dout, rstd, dw):
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public Python API
 # ---------------------------------------------------------------------------
@@ -618,7 +769,14 @@ def rmsnorm_bwd(
     rstd: Tensor,
     eps: float = _EPS,
 ) -> Tuple[Tensor, Tensor]:
-    """RMSNorm backward. Returns ``(dx, dw)``."""
+    """RMSNorm backward. Returns ``(dx, dw)``.
+
+    Both ``dx`` and ``dw = sum_over_M(dout * x * rstd)`` run as FlyDSL
+    kernels. The dw kernel is column-parallel: one thread per output
+    column, each accumulates across all M rows in f32, then truncates
+    to ``weight.dtype`` — deterministic accumulation order matches the
+    NVIDIA reference.
+    """
     assert weight is not None, "rmsnorm_bwd requires a weight tensor"
     if eps != _EPS:
         raise NotImplementedError("runtime eps is a later pass")
@@ -626,12 +784,12 @@ def rmsnorm_bwd(
     dout = dout if dout.stride(-1) == 1 else dout.contiguous()
     dx = torch.empty_like(x)
     _rmsnorm_bwd_dx(x, weight, dout, rstd, dx)
-    x_hat = x.float() * rstd.unsqueeze(1)
-    dw = (dout.float() * x_hat).sum(dim=0).to(weight.dtype)
+    dw = torch.empty(x.size(-1), device=x.device, dtype=weight.dtype)
+    _rmsnorm_bwd_dw(x, dout, rstd, dw)
     return dx, dw
 
 
 __all__ = [
     "rmsnorm_fwd", "layernorm_fwd", "rmsnorm_bwd",
-    "_norm_fwd", "_rmsnorm_bwd_dx",
+    "_norm_fwd", "_rmsnorm_bwd_dx", "_rmsnorm_bwd_dw",
 ]
