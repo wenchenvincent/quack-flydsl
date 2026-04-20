@@ -182,8 +182,8 @@ def _build_softmax_fwd(*, N, dtype, arch):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        idx_m = ArithValue(M).index_cast(T.index)
-        kernel(X, Y).launch(grid=(idx_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
+        
+        kernel(X, Y).launch(grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch
 
@@ -302,8 +302,8 @@ def _build_softmax_bwd(*, N, dtype, arch):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        idx_m = ArithValue(M).index_cast(T.index)
-        kernel(DY, Y, DX).launch(grid=(idx_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
+        
+        kernel(DY, Y, DX).launch(grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch
 

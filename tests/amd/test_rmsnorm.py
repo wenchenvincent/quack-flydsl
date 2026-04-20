@@ -80,14 +80,9 @@ def test_rmsnorm_fwd_store_rstd(dtype, N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("M", [1, 4, 128])
-@pytest.mark.parametrize("N", [256, 1024, 4096])
+@pytest.mark.parametrize("M", [128, 4, 1])  # largest M first — see conftest.py
+@pytest.mark.parametrize("N", [64, 256, 1024, 4096])
 def test_rmsnorm_bwd(dtype, M, N):
-    # N=64 (< block_threads=128) currently exposes a compiler-ordering
-    # heisenbug in the inlined block-reduce that's being investigated
-    # separately; excluded for now. f32 path covers the regression well.
-    if dtype in (torch.float16, torch.bfloat16) and M > 1 and N >= 256:
-        pytest.skip("half/bf16 bwd precision follow-up (Task 6.1)")
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)

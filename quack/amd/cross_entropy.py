@@ -200,9 +200,9 @@ def _build_ce_fwd(*, N, dtype, target_dtype, arch):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        idx_m = ArithValue(M).index_cast(T.index)
+        
         kernel(X, TGT, Loss, Lse).launch(
-            grid=(idx_m, 1, 1), block=(block_threads, 1, 1), stream=stream,
+            grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream,
         )
 
     return launch

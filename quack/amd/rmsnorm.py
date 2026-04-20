@@ -166,9 +166,9 @@ def _build_rmsnorm_fwd(*, N, dtype, weight_dtype, store_rstd, arch):
             ctx = CompilationContext.get_current()
             with ir.InsertionPoint(ctx.gpu_module_body):
                 allocator.finalize()
-            idx_m = ArithValue(M).index_cast(T.index)
+            
             kernel(X, W, Y, Rstd).launch(
-                grid=(idx_m, 1, 1), block=(block_threads, 1, 1), stream=stream,
+                grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream,
             )
     else:
         @flyc.kernel
@@ -250,9 +250,9 @@ def _build_rmsnorm_fwd(*, N, dtype, weight_dtype, store_rstd, arch):
             ctx = CompilationContext.get_current()
             with ir.InsertionPoint(ctx.gpu_module_body):
                 allocator.finalize()
-            idx_m = ArithValue(M).index_cast(T.index)
+            
             kernel(X, W, Y).launch(
-                grid=(idx_m, 1, 1), block=(block_threads, 1, 1), stream=stream,
+                grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream,
             )
 
     return launch
@@ -410,9 +410,9 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        idx_m = ArithValue(M).index_cast(T.index)
+        
         kernel(X, W, DOut, Rstd, DX).launch(
-            grid=(idx_m, 1, 1), block=(block_threads, 1, 1), stream=stream,
+            grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream,
         )
 
     return launch

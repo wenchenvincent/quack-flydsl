@@ -16,14 +16,9 @@ def _tol(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tgt_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("M", [1])  # M>1 hits a FlyDSL codegen heisenbug (follow-up)
+@pytest.mark.parametrize("M", [128, 4, 1])  # largest M first — see conftest.py
 @pytest.mark.parametrize("N", [256, 1024, 4096])
 def test_cross_entropy_fwd(dtype, tgt_dtype, M, N):
-    # M>1 cross_entropy_fwd exercises the combination of two block reduces +
-    # per-workgroup scalar load + per-workgroup scalar store, which currently
-    # hits a FlyDSL codegen heisenbug where `bid` can resolve to 0 across
-    # workgroups at compile time. Tracked separately; M=1 covers correctness
-    # of the fused max/sum/loss/lse compute path.
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)
@@ -43,13 +38,13 @@ def test_cross_entropy_fwd(dtype, tgt_dtype, M, N):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("N", [256, 1024])
 def test_cross_entropy_bwd(dtype, N):
-    # Uses M=1 to avoid the fwd codegen heisenbug at M>1. Backward itself is a
-    # torch-host fallback (cheap cross-entropy gradient) — this exercises the
-    # end-to-end public API shape rather than a fresh kernel.
+    # Backward is a torch-host fallback; this exercises the end-to-end
+    # public API shape (fwd produces `lse`, bwd consumes it) rather than a
+    # fresh kernel. Kernelised dx is a perf follow-up.
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)
-    M = 1
+    M = 16
     x = torch.randn(M, N, device="cuda", dtype=dtype, requires_grad=True)
     target = torch.randint(0, N, (M,), device="cuda", dtype=torch.int64)
     loss_ref = torch.nn.functional.cross_entropy(x.float(), target, reduction="none")
