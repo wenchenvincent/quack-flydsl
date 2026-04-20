@@ -22,10 +22,14 @@ What's NOT yet shipped (substantial follow-up):
       ~850 lines, ``rdna_f16_gemm.py``).
     - Stream-K tile scheduler (plan: ``quack/amd/tile_scheduler.py`` using
       rocdl atomics — valuable specifically on gfx950/CDNA4).
-    - Blockscaled fp8/fp4 (reference: ``FlyDSL/kernels/gemm_fp8fp4_gfx1250.py``,
-      ``moe_blockscale_2stage.py``). hipBLASLt does not cover these so the
-      FlyDSL kernel is the only path and is higher-priority than the
-      standard-dtype GEMM port.
+    - Blockscaled fp8/fp4. **Supported on gfx950/CDNA4** (our hardware) via
+      ``rocdl.mfma_scale_f32_16x16x128_f8f6f4`` — reference:
+      ``FlyDSL/kernels/blockscale_preshuffle_gemm.py`` and
+      ``kernels/moe_blockscale_2stage.py`` (both have explicit ``_is_gfx950``
+      branches). ``kernels/gemm_fp8fp4_gfx1250.py`` is a separate WMMA-based
+      variant for gfx1250/MI450. hipBLASLt does not cover block-scaled
+      quantisation, so the FlyDSL kernel is the only path and is
+      higher-priority than the standard-dtype GEMM port.
     - Fused epilogues beyond the simple activation/bias/gate set above.
 """
 
