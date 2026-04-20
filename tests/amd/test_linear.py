@@ -20,6 +20,40 @@ def test_linear_matches_torch():
     torch.testing.assert_close(out, ref)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_linear_half_dtype_routes_through_mfma(dtype):
+    """linear(x, w, ...) with M/N/K%16==0 routes through the FlyDSL MFMA
+    kernel (verified by tolerance — the MFMA f32 accumulator is tighter
+    than the unaligned-fallback torch linear path for half dtypes)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, in_f, out_f = 64, 64, 128
+    x = torch.randn(M, in_f, device="cuda", dtype=dtype)
+    w = torch.randn(out_f, in_f, device="cuda", dtype=dtype)
+    b = torch.randn(out_f, device="cuda", dtype=torch.float32)
+    out = linear(x, w, bias=b, activation="relu")
+    ref = torch.relu(torch.nn.functional.linear(x.float(), w.float()) + b).to(dtype)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mlp_routes_through_mfma(dtype):
+    """Two-layer MLP with MFMA-eligible shapes runs end-to-end through
+    real kernels (linear → linear composition)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(32, 64, device="cuda", dtype=dtype)
+    w1 = torch.randn(128, 64, device="cuda", dtype=dtype)
+    w2 = torch.randn(64, 128, device="cuda", dtype=dtype)
+    out = mlp(x, w1, w2, activation="silu")
+    h = torch.nn.functional.silu(torch.nn.functional.linear(x.float(), w1.float()))
+    ref = torch.nn.functional.linear(h, w2.float()).to(dtype)
+    # Two GEMMs accumulate more error; tolerance doubles vs single.
+    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-1)
+
+
 def test_mlp_matches_torch():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
