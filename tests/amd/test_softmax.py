@@ -15,7 +15,7 @@ def _tol(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("M", [1, 4, 128])
+@pytest.mark.parametrize("M", [128, 4, 1])  # largest M first — conftest grid-bake note.
 @pytest.mark.parametrize("N", [256, 1024, 4096])
 def test_softmax_fwd(dtype, M, N):
     if not torch.cuda.is_available():
@@ -43,3 +43,18 @@ def test_softmax_bwd(dtype, M, N):
     dx = softmax_bwd(dy, y)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)
+
+
+# Multi-wave path — N > block_threads so the per-row reduction needs
+# cross-wave (LDS-backed) aggregation across the block.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("N", [8192, 16384, 32768])
+def test_softmax_fwd_multiwave(dtype, N):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(4, N, device="cuda", dtype=dtype)
+    y = softmax_fwd(x)
+    y_ref = torch.softmax(x.float(), dim=-1).to(dtype)
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
