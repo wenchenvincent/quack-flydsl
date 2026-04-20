@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.amd.linear import linear
+from quack.amd.linear import linear, linear_residual
 from quack.amd.mlp import mlp, gated_mlp
 from quack.amd.linear_cross_entropy import linear_cross_entropy
 
@@ -35,6 +35,33 @@ def test_linear_half_dtype_routes_through_mfma(dtype):
     out = linear(x, w, bias=b, activation="relu")
     ref = torch.relu(torch.nn.functional.linear(x.float(), w.float()) + b).to(dtype)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_linear_residual_fused(dtype):
+    """y = alpha * (x @ W.T) + residual_scale * residual + bias fused in one kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, in_f, out_f = 64, 64, 128
+    x = torch.randn(M, in_f, device="cuda", dtype=dtype)
+    w = torch.randn(out_f, in_f, device="cuda", dtype=dtype)
+    residual = torch.randn(M, out_f, device="cuda", dtype=torch.float32)
+    bias = torch.randn(out_f, device="cuda", dtype=torch.float32)
+    out = linear_residual(
+        x, w, residual,
+        bias=bias, activation="relu", alpha=0.5, residual_scale=2.0,
+    )
+    ref_f32 = (
+        torch.relu(
+            0.5 * torch.nn.functional.linear(x.float(), w.float())
+            + 2.0 * residual + bias
+        )
+    )
+    ref = ref_f32.to(out.dtype)
+    # Accumulates alpha/beta/bias/activation error; bump tolerance.
+    atol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=atol, rtol=atol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
