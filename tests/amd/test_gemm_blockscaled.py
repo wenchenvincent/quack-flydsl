@@ -114,9 +114,11 @@ def test_mxfp8_gemm_mfma_matches_torch_reference(M, N, K):
 
 
 @pytest.mark.parametrize("K", [128, 256])
-def test_mxfp8_gemm_uses_mfma_kernel_when_flagged(K):
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_mxfp8_gemm_uses_mfma_kernel_when_flagged(K, out_dtype):
     """use_mfma_kernel=True routes through the FlyDSL MFMA path via the
-    top-level mxfp8_gemm. Output must match the torch reference."""
+    top-level mxfp8_gemm. Output must match the torch reference for each
+    supported output dtype."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     if not hasattr(torch, "float8_e4m3fn"):
@@ -127,9 +129,13 @@ def test_mxfp8_gemm_uses_mfma_kernel_when_flagged(K):
     B = _random_fp8((K, N))
     A_scale = _random_scales((K // 128, M))
     B_scale = _random_scales((N // 128, K // 128))
-    C_kernel = mxfp8_gemm(A, B, A_scale, B_scale, use_mfma_kernel=True)
-    C_ref = mxfp8_gemm(A, B, A_scale, B_scale, use_mfma_kernel=False)
-    torch.testing.assert_close(C_kernel, C_ref, atol=0.05, rtol=0.05)
+    C_kernel = mxfp8_gemm(A, B, A_scale, B_scale, use_mfma_kernel=True, out_dtype=out_dtype)
+    C_ref = mxfp8_gemm(A, B, A_scale, B_scale, use_mfma_kernel=False, out_dtype=out_dtype)
+    assert C_kernel.dtype == out_dtype
+    # Widen tolerance for half-precision outputs (the truncation happens
+    # at the scalar store, accumulator is f32 in both paths).
+    atol = 0.05 if out_dtype == torch.float32 else 0.1
+    torch.testing.assert_close(C_kernel, C_ref, atol=atol, rtol=atol)
 
 
 def test_mxfp8_gemm_mfma_all_ones():

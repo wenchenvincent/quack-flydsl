@@ -65,11 +65,17 @@ _TILE_K = 128
 _FRAG_C = 4
 
 
-def _build_blockscaled_16x16x128(*, M, N, K, arch):
-    """One workgroup per 16×16 output tile, loops K-tiles of 128."""
+def _build_blockscaled_16x16x128(*, M, N, K, out_dtype_str, arch):
+    """One workgroup per 16×16 output tile, loops K-tiles of 128.
+
+    ``out_dtype_str`` ∈ {"f32", "bf16", "f16"} selects the output store dtype
+    (accumulator stays f32; downcast at the scalar store when not f32).
+    """
     assert M % _TILE_M == 0 and N % _TILE_N == 0 and K % _TILE_K == 0
+    assert out_dtype_str in {"f32", "bf16", "f16"}
     allocator = SmemAllocator(
-        None, arch=arch, global_sym_name=f"quack_amd_bs_gemm_{M}_{N}_{K}_smem",
+        None, arch=arch,
+        global_sym_name=f"quack_amd_bs_gemm_{M}_{N}_{K}_{out_dtype_str}_smem",
     )
 
     @flyc.kernel
@@ -93,17 +99,32 @@ def _build_blockscaled_16x16x128(*, M, N, K, arch):
         BS_rsrc = buffer_ops.create_buffer_resource(B_scale)
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
-        # C store helper (f32).
-        ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        # C store helper — downcasts f32 accumulator to the output dtype at
+        # the scalar store when out_dtype is bf16 / f16.
+        out_elem_type = (
+            T.f32 if out_dtype_str == "f32"
+            else T.bf16 if out_dtype_str == "bf16"
+            else T.f16
+        )
+        out_bufcopy = (
+            fx.rocdl.BufferCopy32b() if out_dtype_str == "f32"
+            else fx.rocdl.BufferCopy16b()
+        )
+        ca_out = fx.make_copy_atom(out_bufcopy, out_elem_type)
+        out_reg_ty = fx.MemRefType.get(out_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
-        def _store_f32(div, idx, val):
+        def _store_out(div, idx, val_f32):
             from flydsl.expr.vector import full as _vfull
-            r = fx.memref_alloca(f_reg_ty, reg_lay)
-            ts = _vfull(1, Float32(val), Float32)
+            r = fx.memref_alloca(out_reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
+            if out_dtype_str == "f32":
+                ts = _vfull(1, Float32(val_f32), Float32)
+            else:
+                val = ArithValue(val_f32).truncf(out_elem_type)
+                ts = _vfull(1, elem_py(val), elem_py)
             fx.memref_store_vec(ts, r)
-            fx.copy_atom_call(ca_f, r, fx.slice(div, (None, idx)))
+            fx.copy_atom_call(ca_out, r, fx.slice(div, (None, idx)))
 
         # Global accumulator: f32x4 per lane, zero-init.
         acc_ty = T.vec(_FRAG_C, T.f32)
@@ -199,7 +220,7 @@ def _build_blockscaled_16x16x128(*, M, N, K, arch):
             row_c = fx.slice(C_buf, (out_row, None))
             c_div = fx.logical_divide(row_c, fx.make_layout(1, 1))
             val_i = vector.extract(global_acc, static_position=[i], dynamic_position=[])
-            _store_f32(c_div, out_col, val_i)
+            _store_out(c_div, out_col, val_i)
 
     @flyc.jit
     def launch(
@@ -222,35 +243,49 @@ def _build_blockscaled_16x16x128(*, M, N, K, arch):
 
 _kernel_cache: dict = {}
 
+_OUT_DTYPE_MAP = {
+    torch.float32: "f32",
+    torch.bfloat16: "bf16",
+    torch.float16: "f16",
+}
 
-def _compile(M, N, K, arch):
-    key = (M, N, K, arch)
+
+def _compile(M, N, K, out_dtype_str, arch):
+    key = (M, N, K, out_dtype_str, arch)
     got = _kernel_cache.get(key)
     if got is None:
-        got = _build_blockscaled_16x16x128(M=M, N=N, K=K, arch=arch)
+        got = _build_blockscaled_16x16x128(
+            M=M, N=N, K=K, out_dtype_str=out_dtype_str, arch=arch,
+        )
         _kernel_cache[key] = got
     return got
 
 
 def mxfp8_gemm_mfma(
     A: Tensor, B: Tensor, A_scale: Tensor, B_scale: Tensor,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
-    """FlyDSL MFMA blockscaled fp8 GEMM. Returns f32 output.
+    """FlyDSL MFMA blockscaled fp8 GEMM.
 
-    Shape contract same as `quack.amd.gemm_blockscaled.mxfp8_gemm`;
-    this is the hand-written MFMA path (currently slow — no LDS — but
-    exercises the full scaled-MFMA codegen).
+    Shape contract matches `quack.amd.gemm_blockscaled.mxfp8_gemm` except
+    that B is expected in ``(N, K)`` layout (standard B transposed).
+    ``out_dtype`` ∈ {f32 (default), bf16, f16}; accumulator is f32,
+    downcast at the scalar store for the half-precision variants.
     """
     assert A.is_cuda and B.is_cuda
     assert A.dtype == torch.float8_e4m3fn
     assert B.dtype == torch.float8_e4m3fn
+    if out_dtype is None:
+        out_dtype = torch.float32
+    assert out_dtype in _OUT_DTYPE_MAP
     M, K = A.shape
-    # B is in (N, K) layout (= standard B transposed).
     N, K_b = B.shape
     assert K == K_b, f"A K={K} != B K={K_b}"
     assert M % _TILE_M == 0 and N % _TILE_N == 0 and K % _TILE_K == 0
-    out = torch.empty(M, N, device=A.device, dtype=torch.float32)
-    _compile(M, N, K, get_rocm_arch())(A, B, A_scale, B_scale, out)
+    out = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    _compile(M, N, K, _OUT_DTYPE_MAP[out_dtype], get_rocm_arch())(
+        A, B, A_scale, B_scale, out,
+    )
     return out
 
 

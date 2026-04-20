@@ -49,7 +49,7 @@ from torch import Tensor
 
 
 _SUPPORTED_IN_DTYPES = {torch.float8_e4m3fn}
-_SUPPORTED_OUT_DTYPES = {torch.bfloat16, torch.float32}
+_SUPPORTED_OUT_DTYPES = {torch.bfloat16, torch.float32, torch.float16}
 
 
 def _dequantize_mxfp8(x_fp8: Tensor, scale: Tensor, block_k: int, axis: int) -> Tensor:
@@ -141,8 +141,7 @@ def mxfp8_gemm(
     if use_mfma_kernel and _mfma_kernel_eligible(A, B, A_scale, B_scale, out_dtype):
         from quack.amd.gemm_blockscaled_kernel import mxfp8_gemm_mfma
         B_transposed = B.transpose(0, 1).contiguous()
-        C_f32 = mxfp8_gemm_mfma(A, B_transposed, A_scale, B_scale)
-        result = C_f32 if out_dtype == torch.float32 else C_f32.to(out_dtype)
+        result = mxfp8_gemm_mfma(A, B_transposed, A_scale, B_scale, out_dtype=out_dtype)
         if out is None:
             return result
         out.copy_(result)
