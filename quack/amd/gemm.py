@@ -39,6 +39,40 @@ import torch
 from torch import Tensor
 
 
+# Set of (input dtype, activation) combos the real FlyDSL MFMA kernel covers.
+_MFMA_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_MFMA_SUPPORTED_ACTIVATIONS = {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}
+_MFMA_SUPPORTED_OUT_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
+
+
+def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
+    """Can the FlyDSL MFMA kernel handle this call?
+
+    The kernel's current scope: f16/bf16 inputs, M/N/K multiples of 16,
+    no alpha/beta scaling (alpha=1, beta=0), no C add. Anything outside
+    that falls back to torch.
+    """
+    if A.dtype not in _MFMA_SUPPORTED_DTYPES or A.dtype != B.dtype:
+        return False
+    if A.dim() != 2 or B.dim() != 2:
+        return False
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2 or M % 16 or N % 16 or K % 16:
+        return False
+    if alpha != 1.0 or beta != 0.0 or C is not None:
+        return False
+    if activation not in _MFMA_SUPPORTED_ACTIVATIONS:
+        return False
+    if out_dtype not in _MFMA_SUPPORTED_OUT_DTYPES:
+        return False
+    # Bias: kernel expects f32, 1D, length N.
+    if bias is not None:
+        if bias.dim() != 1 or bias.size(0) != N:
+            return False
+    return True
+
+
 def gemm(
     A: Tensor,
     B: Tensor,
@@ -51,10 +85,32 @@ def gemm(
 ) -> Tensor:
     """GEMM: ``D = alpha * A @ B + beta * C + bias`` then optional activation.
 
-    Matches QuACK's NVIDIA ``gemm`` API. Current implementation is a torch
-    fallback; kernel port is Phase 2 follow-up.
+    Matches QuACK's NVIDIA ``gemm`` API. Dispatches to the FlyDSL MFMA
+    kernel (``quack.amd.gemm_gfx950.gemm_mfma``) when the call falls
+    inside the kernel's supported scope; otherwise falls back to a
+    torch-native path (which itself routes through hipBLASLt → MFMA on
+    CDNA, so the fallback is still MFMA-accelerated).
+
+    Supported by the FlyDSL kernel today (grows over time):
+        - dtypes: f16/bf16 inputs, f32/f16/bf16 output
+        - shapes: M, N, K all multiples of 16
+        - alpha=1, beta=0, C=None
+        - activations: relu / relu_sq / gelu_tanh_approx / silu
+        - per-column f32 bias
     """
     assert A.is_cuda and B.is_cuda
+    # Default output dtype: match input (torch.matmul convention), not f32.
+    effective_out_dtype = out_dtype or A.dtype
+    if _mfma_eligible(A, B, bias, activation, alpha, beta, C, effective_out_dtype):
+        from quack.amd.gemm_gfx950 import gemm_mfma
+        _bias = bias
+        if _bias is not None and _bias.dtype != torch.float32:
+            _bias = _bias.to(torch.float32)
+        return gemm_mfma(
+            A, B, bias=_bias, activation=activation,
+            out_dtype=effective_out_dtype,
+        )
+    # Torch fallback (hipBLASLt on AMD → MFMA under the hood).
     out = alpha * (A @ B)
     if C is not None and beta != 0.0:
         out = out + beta * C

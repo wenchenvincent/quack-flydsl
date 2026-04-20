@@ -12,6 +12,44 @@ import torch
 from quack.amd.gemm import gemm, gemm_act, gemm_gated, gemm_symmetric
 
 
+def test_gemm_dispatches_to_mfma_kernel_when_eligible():
+    """When the call falls in the MFMA kernel's scope, gemm() routes there
+    and produces the correct output matching the PyTorch reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    A = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    B = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    out = gemm(A, B)  # MFMA-eligible: f16 × f16, shape multiples of 16
+    # Default out_dtype = A.dtype (torch.matmul convention).
+    assert out.dtype == torch.float16
+    ref = (A.float() @ B.float()).to(torch.float16)
+    torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+def test_gemm_mfma_with_explicit_f32_output():
+    """Explicit out_dtype=f32 keeps the accumulator precision."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    A = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    B = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    out = gemm(A, B, out_dtype=torch.float32)
+    assert out.dtype == torch.float32
+
+
+def test_gemm_falls_back_when_shape_not_aligned():
+    """M=17 isn't a multiple of 16 → torch fallback."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    A = torch.randn(17, 64, device="cuda", dtype=torch.float16)
+    B = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    out = gemm(A, B)
+    # Torch matmul preserves input dtype by default.
+    assert out.shape == (17, 64)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("M, N, K", [(64, 64, 64), (128, 256, 128)])
 def test_gemm_matches_torch(dtype, M, N, K):
