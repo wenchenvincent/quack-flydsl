@@ -90,8 +90,8 @@ def test_mxfp8_gemm_rejects_bad_shapes():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("M", [256, 128])  # largest M first — see conftest.py
-@pytest.mark.parametrize("N", [128])       # real kernel currently N=128 (single n_block)
+@pytest.mark.parametrize("M", [256, 128])   # largest M first — see conftest.py
+@pytest.mark.parametrize("N", [256, 128])   # multiple n-blocks supported
 @pytest.mark.parametrize("K", [128, 256, 512])
 def test_mxfp8_gemm_mfma_matches_torch_reference(M, N, K):
     if not torch.cuda.is_available():
