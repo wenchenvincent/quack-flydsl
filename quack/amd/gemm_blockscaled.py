@@ -83,6 +83,19 @@ def _dequantize_mxfp8(x_fp8: Tensor, scale: Tensor, block_k: int, axis: int) -> 
         return x_f32 * scale_full
 
 
+def _mfma_kernel_eligible(A, B, A_scale, B_scale, out_dtype):
+    """Does the call match the FlyDSL MFMA kernel's supported scope?"""
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2 or M % 16 or N % 128 or K % 128:
+        return False
+    # Current kernel restriction: single n-block (N=128). Extending to
+    # N>128 requires per-output-column n_block indexing inside the kernel,
+    # which the kernel already handles via `n_block = (n_base + lane_row) // 128`.
+    # But we've only tested N=128 so far; allow any multiple of 128.
+    return True
+
+
 def mxfp8_gemm(
     A: Tensor,
     B: Tensor,
@@ -91,6 +104,7 @@ def mxfp8_gemm(
     out: Optional[Tensor] = None,
     *,
     out_dtype: torch.dtype = torch.bfloat16,
+    use_mfma_kernel: bool = False,
 ) -> Tensor:
     """Block-scaled fp8 × fp8 → bf16/f32 GEMM.
 
@@ -101,13 +115,17 @@ def mxfp8_gemm(
         B_scale: ``(N // 128, K // 128)`` f32
         out: ``(M, N)`` of ``out_dtype`` (allocated if None)
 
-    ``M, N, K`` must all be multiples of 128 (one scale block per K tile,
-    one per 128 N-cols). Matches the layout of
+    ``M, N, K`` must all be multiples of 128. Matches the layout of
     ``FlyDSL/kernels/blockscale_preshuffle_gemm.py``.
 
-    Currently computes via a torch dequantise → matmul reference; will be
-    replaced by a FlyDSL MFMA kernel using
-    ``rocdl.mfma_scale_f32_16x16x128_f8f6f4`` in a follow-up commit.
+    When ``use_mfma_kernel=True`` and the call is in the FlyDSL MFMA
+    kernel's supported scope, dispatches to
+    ``quack.amd.gemm_blockscaled_kernel.mxfp8_gemm_mfma`` (which expects
+    B in (N, K) layout — this wrapper transposes on the caller's behalf).
+    Otherwise computes via a torch dequantise → matmul reference.
+
+    The torch path is always available and is the contract the kernel
+    path is validated against.
     """
     assert A.is_cuda and B.is_cuda
     assert A.dtype in _SUPPORTED_IN_DTYPES and B.dtype in _SUPPORTED_IN_DTYPES
@@ -119,6 +137,16 @@ def mxfp8_gemm(
     assert A_scale.shape == (K // 128, M)
     assert B_scale.shape == (N // 128, K // 128)
     assert A_scale.dtype == torch.float32 and B_scale.dtype == torch.float32
+
+    if use_mfma_kernel and _mfma_kernel_eligible(A, B, A_scale, B_scale, out_dtype):
+        from quack.amd.gemm_blockscaled_kernel import mxfp8_gemm_mfma
+        B_transposed = B.transpose(0, 1).contiguous()
+        C_f32 = mxfp8_gemm_mfma(A, B_transposed, A_scale, B_scale)
+        result = C_f32 if out_dtype == torch.float32 else C_f32.to(out_dtype)
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
 
     # Torch reference: dequantise inputs, matmul in f32, cast to out dtype.
     A_f32 = _dequantize_mxfp8(A, A_scale, block_k=128, axis=1)

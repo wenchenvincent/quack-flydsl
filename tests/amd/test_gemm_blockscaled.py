@@ -113,6 +113,25 @@ def test_mxfp8_gemm_mfma_matches_torch_reference(M, N, K):
     torch.testing.assert_close(C, C_ref, atol=atol, rtol=2e-3)
 
 
+@pytest.mark.parametrize("K", [128, 256])
+def test_mxfp8_gemm_uses_mfma_kernel_when_flagged(K):
+    """use_mfma_kernel=True routes through the FlyDSL MFMA path via the
+    top-level mxfp8_gemm. Output must match the torch reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch fp8 not available")
+    torch.manual_seed(0)
+    M, N = 128, 128
+    A = _random_fp8((M, K))
+    B = _random_fp8((K, N))
+    A_scale = _random_scales((K // 128, M))
+    B_scale = _random_scales((N // 128, K // 128))
+    C_kernel = mxfp8_gemm(A, B, A_scale, B_scale, use_mfma_kernel=True)
+    C_ref = mxfp8_gemm(A, B, A_scale, B_scale, use_mfma_kernel=False)
+    torch.testing.assert_close(C_kernel, C_ref, atol=0.05, rtol=0.05)
+
+
 def test_mxfp8_gemm_mfma_all_ones():
     """All-1s fp8 × all-1s fp8 × all-1 scale → each output element = K (accumulation)."""
     if not torch.cuda.is_available():
