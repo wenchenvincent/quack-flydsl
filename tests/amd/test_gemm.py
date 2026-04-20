@@ -50,6 +50,20 @@ def test_gemm_falls_back_when_shape_not_aligned():
     assert out.shape == (17, 64)
 
 
+def test_gemm_dispatch_alpha_beta_c_through_mfma():
+    """alpha/beta/C now routes through the MFMA kernel when eligible."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, N, K = 64, 64, 64
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C_in = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    out = gemm(A, B, alpha=0.5, beta=1.5, C=C_in, out_dtype=torch.float32)
+    ref = 0.5 * (A.float() @ B.float()) + 1.5 * C_in
+    torch.testing.assert_close(out, ref, atol=5e-5, rtol=5e-5)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("M, N, K", [(64, 64, 64), (128, 256, 128)])
 def test_gemm_matches_torch(dtype, M, N, K):

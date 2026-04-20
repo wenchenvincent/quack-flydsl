@@ -48,9 +48,12 @@ _MFMA_SUPPORTED_OUT_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
 def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
     """Can the FlyDSL MFMA kernel handle this call?
 
-    The kernel's current scope: f16/bf16 inputs, M/N/K multiples of 16,
-    no alpha/beta scaling (alpha=1, beta=0), no C add. Anything outside
-    that falls back to torch.
+    The kernel's supported scope:
+      - f16/bf16 inputs, M/N/K multiples of 16
+      - alpha any float, beta any float (C required when beta != 0)
+      - C: optional f32 tensor, same shape as output
+      - activations: relu / relu_sq / gelu_tanh_approx / silu
+      - out_dtype: f32 / f16 / bf16
     """
     if A.dtype not in _MFMA_SUPPORTED_DTYPES or A.dtype != B.dtype:
         return False
@@ -60,13 +63,14 @@ def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
     K2, N = B.shape
     if K != K2 or M % 16 or N % 16 or K % 16:
         return False
-    if alpha != 1.0 or beta != 0.0 or C is not None:
-        return False
     if activation not in _MFMA_SUPPORTED_ACTIVATIONS:
         return False
     if out_dtype not in _MFMA_SUPPORTED_OUT_DTYPES:
         return False
-    # Bias: kernel expects f32, 1D, length N.
+    if C is not None and (C.shape != (M, N) or C.dtype != torch.float32):
+        return False
+    if beta != 0.0 and C is None:
+        return False
     if bias is not None:
         if bias.dim() != 1 or bias.size(0) != N:
             return False
@@ -106,9 +110,14 @@ def gemm(
         _bias = bias
         if _bias is not None and _bias.dtype != torch.float32:
             _bias = _bias.to(torch.float32)
+        _C = C
+        if _C is not None and _C.dtype != torch.float32:
+            _C = _C.to(torch.float32)
         return gemm_mfma(
-            A, B, bias=_bias, activation=activation,
+            A, B,
+            bias=_bias, activation=activation,
             out_dtype=effective_out_dtype,
+            alpha=alpha, beta=beta, C=_C,
         )
     # Torch fallback (hipBLASLt on AMD → MFMA under the hood).
     out = alpha * (A @ B)
