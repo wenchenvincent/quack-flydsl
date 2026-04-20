@@ -83,3 +83,47 @@ def test_mxfp8_gemm_rejects_bad_shapes():
     A2 = _random_fp8((128, 127))  # K=127 breaks K % 128 == 0
     with pytest.raises(AssertionError):
         mxfp8_gemm(A2, B, A_scale, B_scale)
+
+
+# ---------------------------------------------------------------------------
+# Real FlyDSL MFMA blockscaled kernel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("M", [256, 128])  # largest M first — see conftest.py
+@pytest.mark.parametrize("N", [128])       # real kernel currently N=128 (single n_block)
+@pytest.mark.parametrize("K", [128, 256, 512])
+def test_mxfp8_gemm_mfma_matches_torch_reference(M, N, K):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch fp8 not available")
+    from quack.amd.gemm_blockscaled_kernel import mxfp8_gemm_mfma
+    torch.manual_seed(0)
+    A = _random_fp8((M, K))
+    B_std = _random_fp8((K, N))
+    B = B_std.T.contiguous()  # kernel expects (N, K) layout
+    A_scale = _random_scales((K // 128, M))
+    B_scale = _random_scales((N // 128, K // 128))
+
+    C = mxfp8_gemm_mfma(A, B, A_scale, B_scale)
+    C_ref = mxfp8_gemm(A, B_std, A_scale, B_scale, out_dtype=torch.float32)
+    # Rounding tolerance scales with K (accumulation length) for fp8 inputs.
+    atol = max(2e-3, K * 3e-6)
+    torch.testing.assert_close(C, C_ref, atol=atol, rtol=2e-3)
+
+
+def test_mxfp8_gemm_mfma_all_ones():
+    """All-1s fp8 × all-1s fp8 × all-1 scale → each output element = K (accumulation)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch fp8 not available")
+    from quack.amd.gemm_blockscaled_kernel import mxfp8_gemm_mfma
+    M, N, K = 128, 128, 128
+    A = torch.ones(M, K, device="cuda").to(torch.float8_e4m3fn)
+    B = torch.ones(N, K, device="cuda").to(torch.float8_e4m3fn)  # (N, K) layout
+    sa = torch.ones(1, M, device="cuda", dtype=torch.float32)
+    sb = torch.ones(1, 1, device="cuda", dtype=torch.float32)
+    C = mxfp8_gemm_mfma(A, B, sa, sb)
+    assert torch.all(C == float(K)), f"expected all {K}, got unique {torch.unique(C)}"
