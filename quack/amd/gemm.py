@@ -344,7 +344,52 @@ def gemm_dgated(
     return dx.to(out_dtype), postact.to(postact_dtype)
 
 
+def gemm_norm_act(
+    A: Tensor,
+    B: Tensor,
+    colvec: Optional[Tensor] = None,
+    rowvec: Optional[Tensor] = None,
+    *,
+    bias: Optional[Tensor] = None,
+    C: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    activation: Optional[str] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    """Fused (A @ B + bias + beta*C) × colvec × rowvec → activation.
+
+    ``colvec`` is a per-row (M,) scale (typically ``rstd`` from a prior
+    norm); ``rowvec`` is a per-column (N,) scale (typically a learned
+    weight). Matches QuACK's ``gemm_norm_act`` surface.
+
+    MVP composes the MFMA GEMM with torch-native elementwise scaling —
+    full FlyDSL epilogue fusion is a follow-up.
+    """
+    out_dtype = out_dtype or A.dtype
+    # Compute GEMM + bias + alpha/beta/C in f32 for numerical headroom
+    # before the row/col scaling.
+    d = gemm(A, B, bias=bias, alpha=alpha, beta=beta, C=C, out_dtype=torch.float32)
+    if colvec is not None:
+        d = d * colvec.float().unsqueeze(-1)
+    if rowvec is not None:
+        d = d * rowvec.float().unsqueeze(-2)
+    if activation is None:
+        pass
+    elif activation == "relu":
+        d = torch.relu(d)
+    elif activation == "relu_sq":
+        d = torch.relu(d) ** 2
+    elif activation == "silu":
+        d = torch.nn.functional.silu(d)
+    elif activation == "gelu_tanh_approx":
+        d = torch.nn.functional.gelu(d, approximate="tanh")
+    else:
+        raise NotImplementedError(f"activation={activation!r}")
+    return d.to(out_dtype)
+
+
 __all__ = [
     "gemm", "gemm_act", "gemm_gated", "gemm_symmetric",
-    "gemm_dact", "gemm_dgated",
+    "gemm_dact", "gemm_dgated", "gemm_norm_act",
 ]
