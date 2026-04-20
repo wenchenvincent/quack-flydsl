@@ -138,6 +138,43 @@ def test_mxfp8_gemm_uses_mfma_kernel_when_flagged(K, out_dtype):
     torch.testing.assert_close(C_kernel, C_ref, atol=atol, rtol=atol)
 
 
+@pytest.mark.parametrize("activation", [None, "relu", "relu_sq", "gelu_tanh_approx", "silu"])
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_mxfp8_gemm_mfma_bias_activation(activation, out_dtype):
+    """Blockscaled kernel with bias + activation epilogue."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch fp8 not available")
+    from quack.amd.gemm_blockscaled_kernel import mxfp8_gemm_mfma
+    torch.manual_seed(0)
+    M, N, K = 128, 128, 128
+    A = _random_fp8((M, K))
+    B_std = _random_fp8((K, N))
+    B = B_std.T.contiguous()
+    sa = _random_scales((K // 128, M))
+    sb = _random_scales((N // 128, K // 128))
+    bias = torch.randn(N, device="cuda", dtype=torch.float32)
+    C = mxfp8_gemm_mfma(A, B, sa, sb, out_dtype=out_dtype, bias=bias, activation=activation)
+
+    # Reference: torch dequantise + matmul + bias + activation.
+    C_base = mxfp8_gemm(A, B_std, sa, sb, out_dtype=torch.float32)
+    ref = C_base + bias
+    if activation == "relu":
+        ref = torch.relu(ref)
+    elif activation == "relu_sq":
+        ref = torch.relu(ref) * ref
+    elif activation == "gelu_tanh_approx":
+        ref = torch.nn.functional.gelu(ref, approximate="tanh")
+    elif activation == "silu":
+        ref = torch.nn.functional.silu(ref)
+    ref = ref.to(out_dtype)
+    atol = 0.05 if out_dtype == torch.float32 else 0.1
+    if activation == "relu_sq":
+        atol *= 2  # squaring amplifies ULP noise
+    torch.testing.assert_close(C, ref, atol=atol, rtol=atol)
+
+
 def test_mxfp8_gemm_mfma_all_ones():
     """All-1s fp8 × all-1s fp8 × all-1 scale → each output element = K (accumulation)."""
     if not torch.cuda.is_available():
