@@ -47,7 +47,7 @@ def test_rmsnorm_fwd(dtype, M, N):
     torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=dtype)
-    out, _ = rmsnorm_fwd(x, w)
+    out, _, _ = rmsnorm_fwd(x, w)
     ref_out, _ = _ref_rmsnorm(x, w)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
@@ -58,7 +58,7 @@ def test_rmsnorm_fwd_matches_without_weight():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)
     x = torch.randn(8, 256, device="cuda", dtype=torch.float32)
-    out, _ = rmsnorm_fwd(x)
+    out, _, _ = rmsnorm_fwd(x)
     w_ones = torch.ones(256, device="cuda", dtype=torch.float32)
     ref_out, _ = _ref_rmsnorm(x, w_ones)
     torch.testing.assert_close(out, ref_out, atol=5e-6, rtol=5e-6)
@@ -72,7 +72,7 @@ def test_rmsnorm_fwd_store_rstd(dtype, N):
     torch.manual_seed(0)
     x = torch.randn(16, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=dtype)
-    out, rstd = rmsnorm_fwd(x, w, store_rstd=True)
+    out, rstd, _ = rmsnorm_fwd(x, w, store_rstd=True)
     ref_out, ref_rstd = _ref_rmsnorm(x, w)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
@@ -90,7 +90,7 @@ def test_rmsnorm_bwd(dtype, M, N):
     w = torch.randn(N, device="cuda", dtype=dtype)
     dout = torch.randn(M, N, device="cuda", dtype=dtype)
 
-    _, rstd = rmsnorm_fwd(x, w, store_rstd=True)
+    _, rstd, _ = rmsnorm_fwd(x, w, store_rstd=True)
     dx, dw = rmsnorm_bwd(x, w, dout, rstd)
     ref_dx, ref_dw = _ref_rmsnorm_bwd(x, w, dout, rstd)
 
@@ -132,7 +132,7 @@ def test_rmsnorm_fwd_with_bias(dtype, M, N):
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=dtype)
     b = torch.randn(N, device="cuda", dtype=dtype)
-    out, _ = rmsnorm_fwd(x, w, bias=b)
+    out, _, _ = rmsnorm_fwd(x, w, bias=b)
     ref = _ref_rmsnorm_bias(x, w, b)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
@@ -147,7 +147,7 @@ def test_layernorm_fwd(dtype, M, N):
     torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=dtype)
-    out, _, _ = layernorm_fwd(x, w)
+    out, _, _, _ = layernorm_fwd(x, w)
     ref_out, _, _ = _ref_layernorm(x, w, None)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
@@ -163,7 +163,7 @@ def test_layernorm_fwd_with_bias(dtype, M, N):
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=dtype)
     b = torch.randn(N, device="cuda", dtype=dtype)
-    out, _, _ = layernorm_fwd(x, w, bias=b)
+    out, _, _, _ = layernorm_fwd(x, w, bias=b)
     ref_out, _, _ = _ref_layernorm(x, w, b)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
@@ -178,9 +178,52 @@ def test_layernorm_fwd_store_stats(dtype, N):
     M = 16
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=dtype)
-    out, rstd, mean = layernorm_fwd(x, w, store_stats=True)
+    out, rstd, mean, _ = layernorm_fwd(x, w, store_stats=True)
     ref_out, ref_rstd, ref_mean = _ref_layernorm(x, w, None)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(rstd, ref_rstd, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(mean, ref_mean, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Residual (x + residual) → norm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M", [128, 4, 1])
+@pytest.mark.parametrize("N", [256, 1024])
+def test_rmsnorm_fwd_with_residual(dtype, M, N):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    r = torch.randn(M, N, device="cuda", dtype=dtype)
+    w = torch.randn(N, device="cuda", dtype=dtype)
+    out, _, res_out = rmsnorm_fwd(x, w, residual=r, store_residual_out=True)
+    ref_out, _ = _ref_rmsnorm(x + r, w)
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(res_out, (x + r).to(dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M", [128, 4])
+@pytest.mark.parametrize("N", [256, 1024])
+def test_layernorm_fwd_with_residual_and_bias(dtype, M, N):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    r = torch.randn(M, N, device="cuda", dtype=dtype)
+    w = torch.randn(N, device="cuda", dtype=dtype)
+    b = torch.randn(N, device="cuda", dtype=dtype)
+    out, _, _, _ = layernorm_fwd(x, w, bias=b, residual=r)
+    ref_out, _, _ = _ref_layernorm(x + r, w, b)
+    # Combined residual + bias accumulates more ULP noise than a single op —
+    # bump tolerance slightly over the base _tol() band for f16/bf16.
+    base_atol, base_rtol = _tol(dtype)
+    atol = base_atol if dtype is torch.float32 else base_atol * 3
+    rtol = base_rtol if dtype is torch.float32 else base_rtol * 3
+    torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
