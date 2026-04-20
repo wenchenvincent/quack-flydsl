@@ -8,35 +8,55 @@ and swizzle; this module provides the AMD equivalent, minus ``CLC`` (NVIDIA
 cluster launch control — no analogue pre-gfx1250).
 
 **Current state:** Python-side helpers (CU count query, raster-order
-classification, grid sizing). The in-kernel atomic work-counter loop is
-documented here and meant to be emitted inline by the client kernel using
-``flydsl.expr.rocdl.BufferAtomicAdd`` — the reusable helpers in
-``quack/amd/reduce.py`` demonstrate the general FlyDSL closure-in-kernel
-pattern.
+classification, grid sizing) — these are production-ready and tested
+(``tests/amd/test_tile_scheduler.py``). The in-kernel atomic work-counter
+loop is documented below but not yet emitted; wire it into a client kernel
+when the perf gain vs. one-wg-per-tile is motivated by profiling.
 
-Usage sketch for a future GEMM kernel::
+Usage sketch for STATIC persistent (no atomics, even work split)::
 
     from quack.amd.tile_scheduler import (
-        PersistenceMode, RasterOrder, get_num_cus, grid_for_persistent,
+        PersistenceMode, get_num_cus, grid_for_persistent,
     )
 
     num_cus = get_num_cus("gfx950")
-    grid = grid_for_persistent(total_tiles, num_cus, mode=PersistenceMode.DYNAMIC)
+    total_tiles = num_tiles_m * num_tiles_n
+    plan = grid_for_persistent(total_tiles, num_cus, mode=PersistenceMode.STATIC)
 
     @flyc.kernel
-    def gemm_persistent(A, B, C, work_counter, total_tiles):
-        tile_idx = bid
-        # stream-K loop:
-        while tile_idx < total_tiles:
-            # compute partial or full tile
-            ...
-            # grab next tile via atomic increment
-            tile_idx = BufferAtomicAdd(work_counter, 0, 1)  # emit rocdl atomic
+    def gemm_static_persistent(A, B, C, total_tiles_runtime):
+        bid = fx.block_idx.x  # 0..plan.grid-1
+        # Each workgroup covers a strided set of tiles.
+        for step in range(0, ceil_div(total_tiles_compile_time, plan.grid)):
+            tile_idx = bid + step * plan.grid
+            if tile_idx < total_tiles_runtime:
+                # decode tile_idx -> (tile_m, tile_n) per `plan.raster_order`
+                # ... MFMA body ...
 
-Stream-K partial-tile work (splitting a tile's K dimension across multiple
-workgroups and combining partial accumulators via atomic add to a global
-buffer) is a follow-up — it composes with this scheduler but requires the
-GEMM kernel body to be written against that pattern.
+Usage sketch for DYNAMIC stream-K (atomic work counter)::
+
+    from flydsl._mlir.dialects import llvm
+    # In the kernel body:
+    tile_idx = bid   # initial tile
+    while tile_idx < total_tiles_runtime:
+        # ... process tile at tile_idx ...
+        # Grab next tile atomically. `work_counter` is an i32 scalar in
+        # GMEM, zero-initialised on the host before launch. The result of
+        # AtomicRMWOp is the *old* value, so we add `num_cus` to get the
+        # tile index beyond the initial grid.
+        new_idx = llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.add,
+            work_counter_ptr, const_one_i32,
+            llvm.AtomicOrdering.monotonic,
+            syncscope="agent", alignment=4,
+        ).result
+        tile_idx = new_idx + num_cus
+
+Partial-tile stream-K (splitting K across workgroups, combining partial
+accumulators via atomic fadd on f32 output) is a further extension: the
+output tensor must be zero-init on the host, each workgroup writes its
+K-slice's partial C via ``rocdl.raw_ptr_buffer_atomic_fadd``, and the
+reduction is associative-but-not-deterministic across workgroup order.
 """
 
 from dataclasses import dataclass
