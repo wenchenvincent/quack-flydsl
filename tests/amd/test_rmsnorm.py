@@ -9,7 +9,7 @@ computed in PyTorch, per AGENTS.md.
 import pytest
 import torch
 
-from quack.amd.rmsnorm import rmsnorm_fwd, layernorm_fwd, rmsnorm_bwd
+from quack.amd.rmsnorm import rmsnorm_fwd, layernorm_fwd, rmsnorm_bwd, layernorm_bwd
 
 
 def _ref_rmsnorm(x, weight, eps=1e-6):
@@ -103,6 +103,47 @@ def test_rmsnorm_bwd(dtype, M, N):
     # band used for dx.
     dw_atol = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
     torch.testing.assert_close(dw, ref_dw, atol=dw_atol, rtol=1e-3)
+
+
+def _ref_layernorm_bwd(x, weight, dout, rstd, mean, bias=None, eps=1e-6):
+    x_f = x.float()
+    w_f = weight.float()
+    x_hat = (x_f - mean.unsqueeze(1)) * rstd.unsqueeze(1)
+    wdy = dout.float() * w_f
+    c0 = wdy.mean(dim=-1, keepdim=True)
+    c1 = (wdy * x_hat).mean(dim=-1, keepdim=True)
+    dx = (wdy - c0 - x_hat * c1) * rstd.unsqueeze(1)
+    dw = (dout.float() * x_hat).sum(dim=0)
+    db = dout.float().sum(dim=0) if bias is not None else None
+    return (
+        dx.to(x.dtype),
+        dw.to(weight.dtype),
+        db.to(bias.dtype) if db is not None else None,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M", [128, 4, 1])
+@pytest.mark.parametrize("N", [64, 256, 1024, 4096])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_layernorm_bwd(dtype, M, N, with_bias):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    w = torch.randn(N, device="cuda", dtype=dtype)
+    b = torch.randn(N, device="cuda", dtype=dtype) if with_bias else None
+    dout = torch.randn(M, N, device="cuda", dtype=dtype)
+    _, rstd, mean, _ = layernorm_fwd(x, w, bias=b, store_stats=True)
+    dx, dw, db = layernorm_bwd(x, w, dout, rstd, mean, bias=b)
+    ref_dx, ref_dw, ref_db = _ref_layernorm_bwd(x, w, dout, rstd, mean, bias=b)
+
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(dx, ref_dx, atol=atol, rtol=rtol)
+    dw_atol = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
+    torch.testing.assert_close(dw, ref_dw, atol=dw_atol, rtol=1e-3)
+    if with_bias:
+        torch.testing.assert_close(db, ref_db, atol=dw_atol, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------

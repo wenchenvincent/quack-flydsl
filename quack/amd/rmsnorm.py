@@ -293,21 +293,29 @@ def _build_norm_fwd(
 # ---------------------------------------------------------------------------
 
 
-def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
+def _build_norm_dx(*, N, dtype, weight_dtype, is_layernorm, arch):
+    """Per-row dx kernel for RMSNorm (``is_layernorm=False``) or LayerNorm.
+
+    RMSNorm:   dx = rstd * (wdy - x_hat * mean(wdy * x_hat))
+    LayerNorm: dx = rstd * (wdy - mean(wdy) - x_hat * mean(wdy * x_hat))
+                where x_hat = (x - mean) * rstd
+    """
     wave_size = get_wave_size(arch)
     block_threads = 128 if N <= 16384 else 256
     num_waves = block_threads // wave_size
     elem_bits = dtype.width
     w_elem_bits = weight_dtype.width
 
-    sym = "quack_amd_rmsnorm_bwd_dx_smem"
+    # Two reduction slots for layernorm (sum_wdy + sum_wdy_xhat), one for rmsnorm.
+    n_red_slots = num_waves * (2 if is_layernorm else 1)
+    sym = f"quack_amd_{'layernorm' if is_layernorm else 'rmsnorm'}_bwd_dx_smem"
     allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
-    red_offset = _reserve_scratch(allocator, num_waves, 4)
-    fm_fast = arith.FastMathFlags.fast
+    red_offset = _reserve_scratch(allocator, n_red_slots, 4)
 
     @flyc.kernel
     def kernel(
-        X: fx.Tensor, W: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, DX: fx.Tensor,
+        X: fx.Tensor, W: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor,
+        Mean: fx.Tensor, DX: fx.Tensor,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -320,11 +328,16 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
         base_ptr = allocator.get_base()
         s_red = SmemPtr(base_ptr, red_offset, T.f32, shape=(num_waves,))
         s_red.get()
+        if is_layernorm:
+            s_red2 = SmemPtr(base_ptr, red_offset + num_waves * 4, T.f32,
+                             shape=(num_waves,))
+            s_red2.get()
 
         X_buf = fx.rocdl.make_buffer_tensor(X)
         W_buf = fx.rocdl.make_buffer_tensor(W)
         DOut_buf = fx.rocdl.make_buffer_tensor(DOut)
         Rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
+        Mean_buf = fx.rocdl.make_buffer_tensor(Mean)
         DX_buf = fx.rocdl.make_buffer_tensor(DX)
 
         row_x = fx.slice(X_buf, (bid, None))
@@ -335,6 +348,7 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
         dx_div = fx.logical_divide(row_dx, fx.make_layout(1, 1))
         w_div = fx.logical_divide(W_buf, fx.make_layout(1, 1))
         rstd_div = fx.logical_divide(Rstd_buf, fx.make_layout(1, 1))
+        mean_div = fx.logical_divide(Mean_buf, fx.make_layout(1, 1))
 
         copy_atom_x = fx.make_copy_atom(_bufcopy_for(elem_bits), elem_type)
         copy_atom_w = fx.make_copy_atom(_bufcopy_for(w_elem_bits), w_elem_type)
@@ -358,9 +372,12 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
             fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
 
         rstd_val = ArithValue(_load(rstd_div, f_reg_ty, copy_atom_f, bid))
+        if is_layernorm:
+            mean_val = ArithValue(_load(mean_div, f_reg_ty, copy_atom_f, bid))
 
         c_zero_f = arith.constant(0.0, type=compute_type)
-        thread_acc = c_zero_f
+        thread_acc_xhat_wdy = c_zero_f
+        thread_acc_wdy = c_zero_f
         for base_idx in range_constexpr(0, N, block_threads):
             idx = tid + fx.Int32(base_idx)
             is_valid = idx < fx.Int32(N)
@@ -371,15 +388,25 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             d = d_e if dtype is Float32 else d_e.extf(compute_type)
             w = w_e if weight_dtype is Float32 else w_e.extf(compute_type)
-            x_hat = ArithValue(x) * rstd_val
+            if is_layernorm:
+                x_hat = (ArithValue(x) - mean_val) * rstd_val
+            else:
+                x_hat = ArithValue(x) * rstd_val
             wdy = ArithValue(d) * w
             contrib = x_hat * wdy
             contrib_safe = is_valid.select(contrib, c_zero_f)
-            thread_acc = ArithValue(thread_acc) + contrib_safe
+            thread_acc_xhat_wdy = ArithValue(thread_acc_xhat_wdy) + contrib_safe
+            if is_layernorm:
+                wdy_safe = is_valid.select(wdy, c_zero_f)
+                thread_acc_wdy = ArithValue(thread_acc_wdy) + wdy_safe
 
-        sum_xhat_wdy = block_reduce_add(thread_acc, s_red, num_waves,
+        sum_xhat_wdy = block_reduce_add(thread_acc_xhat_wdy, s_red, num_waves,
                                         wave_size=wave_size, tid=tid)
         c1 = ArithValue(sum_xhat_wdy) / n_float
+        if is_layernorm:
+            sum_wdy = block_reduce_add(thread_acc_wdy, s_red2, num_waves,
+                                       wave_size=wave_size, tid=tid)
+            c0 = ArithValue(sum_wdy) / n_float
 
         for base_idx in range_constexpr(0, N, block_threads):
             idx = tid + fx.Int32(base_idx)
@@ -390,26 +417,45 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
                 x = x_e if dtype is Float32 else x_e.extf(compute_type)
                 d = d_e if dtype is Float32 else d_e.extf(compute_type)
                 w = w_e if weight_dtype is Float32 else w_e.extf(compute_type)
-                x_hat = ArithValue(x) * rstd_val
+                if is_layernorm:
+                    x_hat = (ArithValue(x) - mean_val) * rstd_val
+                else:
+                    x_hat = ArithValue(x) * rstd_val
                 wdy = ArithValue(d) * w
-                dx_f32 = (wdy - x_hat * c1) * rstd_val
+                if is_layernorm:
+                    dx_f32 = (wdy - c0 - x_hat * c1) * rstd_val
+                else:
+                    dx_f32 = (wdy - x_hat * c1) * rstd_val
                 dx_e = dx_f32 if dtype is Float32 else dx_f32.truncf(elem_type)
                 _store(dx_div, x_reg_ty, copy_atom_x, idx, dx_e)
 
     @flyc.jit
     def launch(
-        X: fx.Tensor, W: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, DX: fx.Tensor,
+        X: fx.Tensor, W: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor,
+        Mean: fx.Tensor, DX: fx.Tensor,
         M: fx.Int32, stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        kernel(X, W, DOut, Rstd, DX).launch(
+        kernel(X, W, DOut, Rstd, Mean, DX).launch(
             grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream,
         )
 
     return launch
+
+
+def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
+    return _build_norm_dx(
+        N=N, dtype=dtype, weight_dtype=weight_dtype, is_layernorm=False, arch=arch,
+    )
+
+
+def _build_layernorm_dx(*, N, dtype, weight_dtype, arch):
+    return _build_norm_dx(
+        N=N, dtype=dtype, weight_dtype=weight_dtype, is_layernorm=True, arch=arch,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -417,12 +463,15 @@ def _build_rmsnorm_dx(*, N, dtype, weight_dtype, arch):
 # ---------------------------------------------------------------------------
 
 
-def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
-    """``dw[j] = sum_over_m(dout[m, j] * x[m, j] * rstd[m])``.
+def _build_norm_dw(*, N, dtype, weight_dtype, is_layernorm, arch):
+    """``dw[j] = sum_over_m(dout[m, j] * x_hat[m, j])``.
+
+    RMSNorm:   x_hat = x * rstd
+    LayerNorm: x_hat = (x - mean) * rstd
 
     One thread per output column. Each workgroup covers ``block_threads``
     contiguous columns; grid.x = ceil(N / block_threads). Each thread
-    accumulates in f32 over a compile-time-unrolled M loop (``range``),
+    accumulates in f32 over a dynamic M loop (scf.for via init=/yield),
     then casts and stores one element. No cross-thread reduction needed
     since each column is independent.
     """
@@ -430,15 +479,14 @@ def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
     elem_bits = dtype.width
     w_elem_bits = weight_dtype.width
 
-    sym = f"quack_amd_rmsnorm_bwd_dw_{N}_{dtype.__name__}_{weight_dtype.__name__}_smem"
+    tag = "layernorm" if is_layernorm else "rmsnorm"
+    sym = f"quack_amd_{tag}_bwd_dw_{N}_{dtype.__name__}_{weight_dtype.__name__}_smem"
     allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
-    fm_fast = arith.FastMathFlags.fast
-    del fm_fast  # not needed — but keeping import shape symmetric
 
     @flyc.kernel
     def kernel(
-        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, DW: fx.Tensor,
-        M_dyn: fx.Int32,
+        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, Mean: fx.Tensor,
+        DW: fx.Tensor, M_dyn: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -451,9 +499,11 @@ def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
         X_buf = fx.rocdl.make_buffer_tensor(X)
         DOut_buf = fx.rocdl.make_buffer_tensor(DOut)
         Rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
+        Mean_buf = fx.rocdl.make_buffer_tensor(Mean)
         DW_buf = fx.rocdl.make_buffer_tensor(DW)
 
         rstd_div = fx.logical_divide(Rstd_buf, fx.make_layout(1, 1))
+        mean_div = fx.logical_divide(Mean_buf, fx.make_layout(1, 1))
         dw_div = fx.logical_divide(DW_buf, fx.make_layout(1, 1))
 
         copy_atom_x = fx.make_copy_atom(_bufcopy_for(elem_bits), elem_type)
@@ -499,7 +549,12 @@ def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
             r_e = _load(rstd_div, f_reg_ty, copy_atom_f, m_i32)
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             d = d_e if dtype is Float32 else d_e.extf(compute_type)
-            contrib = ArithValue(x) * ArithValue(r_e) * ArithValue(d)
+            if is_layernorm:
+                mean_e = _load(mean_div, f_reg_ty, copy_atom_f, m_i32)
+                x_hat = (ArithValue(x) - ArithValue(mean_e)) * ArithValue(r_e)
+            else:
+                x_hat = ArithValue(x) * ArithValue(r_e)
+            contrib = x_hat * ArithValue(d)
             results = yield [ArithValue(state[0]) + contrib]
 
         acc = results
@@ -510,15 +565,107 @@ def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
 
     @flyc.jit
     def launch(
-        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, DW: fx.Tensor,
-        M: fx.Int32, stream: fx.Stream = fx.Stream(None),
+        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, Mean: fx.Tensor,
+        DW: fx.Tensor, M: fx.Int32, stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
         grid_x = (N + block_threads - 1) // block_threads
-        kernel(X, DOut, Rstd, DW, M).launch(
+        kernel(X, DOut, Rstd, Mean, DW, M).launch(
+            grid=(grid_x, 1, 1), block=(block_threads, 1, 1), stream=stream,
+        )
+
+    return launch
+
+
+def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
+    return _build_norm_dw(
+        N=N, dtype=dtype, weight_dtype=weight_dtype, is_layernorm=False, arch=arch,
+    )
+
+
+def _build_layernorm_dw(*, N, dtype, weight_dtype, arch):
+    return _build_norm_dw(
+        N=N, dtype=dtype, weight_dtype=weight_dtype, is_layernorm=True, arch=arch,
+    )
+
+
+def _build_layernorm_db(*, N, dtype, bias_dtype, arch):
+    """``db[j] = sum_over_m(dout[m, j])`` — column-parallel like dw, no rstd/mean."""
+    block_threads = 128
+    elem_bits = dtype.width
+    b_elem_bits = bias_dtype.width
+
+    sym = (
+        f"quack_amd_layernorm_bwd_db_"
+        f"{N}_{dtype.__name__}_{bias_dtype.__name__}_smem"
+    )
+    allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
+
+    @flyc.kernel
+    def kernel(DOut: fx.Tensor, DB: fx.Tensor, M_dyn: fx.Int32):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        j = bid * fx.Int32(block_threads) + tid
+
+        elem_type = _elem_type_for(dtype)
+        b_elem_type = _elem_type_for(bias_dtype)
+        compute_type = T.f32
+
+        DOut_buf = fx.rocdl.make_buffer_tensor(DOut)
+        DB_buf = fx.rocdl.make_buffer_tensor(DB)
+        db_div = fx.logical_divide(DB_buf, fx.make_layout(1, 1))
+
+        copy_atom_x = fx.make_copy_atom(_bufcopy_for(elem_bits), elem_type)
+        copy_atom_b = fx.make_copy_atom(_bufcopy_for(b_elem_bits), b_elem_type)
+        x_reg_ty = fx.MemRefType.get(elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        b_reg_ty = fx.MemRefType.get(b_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load(div, reg_ty, ca, idx):
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            fx.copy_atom_call(ca, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store(div, reg_ty, ca, idx, val):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(reg_ty.element_type)
+            ts = _vfull(1, elem_py(val), elem_py)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
+
+        c_zero_f = arith.constant(0.0, type=compute_type)
+        j_iv = j.ir_value() if hasattr(j, "ir_value") else j
+        n_i32 = arith.constant(N, type=T.i32)
+
+        for m, state in range(0, M_dyn, init=[c_zero_f]):
+            m_i32 = ArithValue(m).index_cast(T.i32)
+            row_dout = fx.slice(DOut_buf, (m_i32, None))
+            dout_div = fx.logical_divide(row_dout, fx.make_layout(1, 1))
+            d_e = _load(dout_div, x_reg_ty, copy_atom_x, j)
+            d = d_e if dtype is Float32 else d_e.extf(compute_type)
+            results = yield [ArithValue(state[0]) + ArithValue(d)]
+
+        acc = results
+
+        if arith.cmpi(arith.CmpIPredicate.slt, j_iv, n_i32):
+            out_val = acc if bias_dtype is Float32 else ArithValue(acc).truncf(b_elem_type)
+            _store(db_div, b_reg_ty, copy_atom_b, j, out_val)
+
+    @flyc.jit
+    def launch(
+        DOut: fx.Tensor, DB: fx.Tensor, M: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        grid_x = (N + block_threads - 1) // block_threads
+        kernel(DOut, DB, M).launch(
             grid=(grid_x, 1, 1), block=(block_threads, 1, 1), stream=stream,
         )
 
@@ -533,6 +680,9 @@ def _build_rmsnorm_dw(*, N, dtype, weight_dtype, arch):
 _fwd_cache: dict = {}
 _bwd_cache: dict = {}
 _bwd_dw_cache: dict = {}
+_ln_bwd_cache: dict = {}
+_ln_bwd_dw_cache: dict = {}
+_ln_bwd_db_cache: dict = {}
 
 
 def _compile_fwd(
@@ -586,6 +736,42 @@ def _compile_bwd_dw(N, x_dt, w_dt, arch):
             weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
         )
         _bwd_dw_cache[key] = got
+    return got
+
+
+def _compile_ln_bwd(N, x_dt, w_dt, arch):
+    key = (N, x_dt, w_dt, arch)
+    got = _ln_bwd_cache.get(key)
+    if got is None:
+        got = _build_layernorm_dx(
+            N=N, dtype=torch2flydsl_dtype_map[x_dt],
+            weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
+        )
+        _ln_bwd_cache[key] = got
+    return got
+
+
+def _compile_ln_bwd_dw(N, x_dt, w_dt, arch):
+    key = (N, x_dt, w_dt, arch)
+    got = _ln_bwd_dw_cache.get(key)
+    if got is None:
+        got = _build_layernorm_dw(
+            N=N, dtype=torch2flydsl_dtype_map[x_dt],
+            weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
+        )
+        _ln_bwd_dw_cache[key] = got
+    return got
+
+
+def _compile_ln_bwd_db(N, x_dt, b_dt, arch):
+    key = (N, x_dt, b_dt, arch)
+    got = _ln_bwd_db_cache.get(key)
+    if got is None:
+        got = _build_layernorm_db(
+            N=N, dtype=torch2flydsl_dtype_map[x_dt],
+            bias_dtype=torch2flydsl_dtype_map[b_dt], arch=arch,
+        )
+        _ln_bwd_db_cache[key] = got
     return got
 
 
@@ -662,7 +848,9 @@ def _rmsnorm_bwd_dx(
     assert all(t.stride(-1) == 1 for t in (x, dout, dx))
     M, N = x.shape
     launcher = _compile_bwd(N, x.dtype, weight.dtype, get_rocm_arch())
-    launcher(x, weight, dout, rstd, dx, M)
+    # rmsnorm dx kernel carries a Mean slot (unused when is_layernorm=False);
+    # pass rstd as a same-shape stand-in — the kernel never dereferences it.
+    launcher(x, weight, dout, rstd, rstd, dx, M)
 
 
 @_rmsnorm_bwd_dx.register_fake
@@ -685,11 +873,83 @@ def _rmsnorm_bwd_dw(
     assert all(t.stride(-1) == 1 for t in (x, dout))
     M, N = x.shape
     launcher = _compile_bwd_dw(N, x.dtype, dw.dtype, get_rocm_arch())
-    launcher(x, dout, rstd, dw, M)
+    # Same stand-in trick as _rmsnorm_bwd_dx — Mean slot unused here.
+    launcher(x, dout, rstd, rstd, dw, M)
 
 
 @_rmsnorm_bwd_dw.register_fake
 def _rmsnorm_bwd_dw_fake(x, dout, rstd, dw):
+    return None
+
+
+@torch.library.custom_op(
+    "quack_amd::_layernorm_bwd_dx",
+    mutates_args=("dx",),
+    schema=(
+        "(Tensor x, Tensor weight, Tensor dout, Tensor rstd, Tensor mean, "
+        "Tensor(a0!) dx) -> ()"
+    ),
+)
+def _layernorm_bwd_dx(
+    x: Tensor, weight: Tensor, dout: Tensor, rstd: Tensor, mean: Tensor, dx: Tensor,
+) -> None:
+    assert x.is_cuda and weight.is_cuda and dout.is_cuda
+    assert rstd.is_cuda and mean.is_cuda and dx.is_cuda
+    assert x.dim() == 2 and dout.shape == x.shape and dx.shape == x.shape
+    assert weight.dim() == 1 and weight.size(0) == x.size(-1)
+    assert rstd.dim() == 1 and rstd.size(0) == x.size(0) and rstd.dtype == torch.float32
+    assert mean.dim() == 1 and mean.size(0) == x.size(0) and mean.dtype == torch.float32
+    assert all(t.stride(-1) == 1 for t in (x, dout, dx))
+    M, N = x.shape
+    launcher = _compile_ln_bwd(N, x.dtype, weight.dtype, get_rocm_arch())
+    launcher(x, weight, dout, rstd, mean, dx, M)
+
+
+@_layernorm_bwd_dx.register_fake
+def _layernorm_bwd_dx_fake(x, weight, dout, rstd, mean, dx):
+    return None
+
+
+@torch.library.custom_op(
+    "quack_amd::_layernorm_bwd_dw",
+    mutates_args=("dw",),
+    schema="(Tensor x, Tensor dout, Tensor rstd, Tensor mean, Tensor(a0!) dw) -> ()",
+)
+def _layernorm_bwd_dw(
+    x: Tensor, dout: Tensor, rstd: Tensor, mean: Tensor, dw: Tensor,
+) -> None:
+    assert x.is_cuda and dout.is_cuda and rstd.is_cuda and mean.is_cuda and dw.is_cuda
+    assert x.dim() == 2 and dout.shape == x.shape
+    assert dw.dim() == 1 and dw.size(0) == x.size(-1)
+    assert rstd.dim() == 1 and rstd.size(0) == x.size(0) and rstd.dtype == torch.float32
+    assert mean.dim() == 1 and mean.size(0) == x.size(0) and mean.dtype == torch.float32
+    assert all(t.stride(-1) == 1 for t in (x, dout))
+    M, N = x.shape
+    launcher = _compile_ln_bwd_dw(N, x.dtype, dw.dtype, get_rocm_arch())
+    launcher(x, dout, rstd, mean, dw, M)
+
+
+@_layernorm_bwd_dw.register_fake
+def _layernorm_bwd_dw_fake(x, dout, rstd, mean, dw):
+    return None
+
+
+@torch.library.custom_op(
+    "quack_amd::_layernorm_bwd_db",
+    mutates_args=("db",),
+    schema="(Tensor dout, Tensor(a0!) db) -> ()",
+)
+def _layernorm_bwd_db(dout: Tensor, db: Tensor) -> None:
+    assert dout.is_cuda and db.is_cuda
+    assert dout.dim() == 2 and db.dim() == 1 and db.size(0) == dout.size(-1)
+    assert dout.stride(-1) == 1
+    M, N = dout.shape
+    launcher = _compile_ln_bwd_db(N, dout.dtype, db.dtype, get_rocm_arch())
+    launcher(dout, db, M)
+
+
+@_layernorm_bwd_db.register_fake
+def _layernorm_bwd_db_fake(dout, db):
     return None
 
 
@@ -789,7 +1049,40 @@ def rmsnorm_bwd(
     return dx, dw
 
 
+def layernorm_bwd(
+    x: Tensor,
+    weight: Tensor,
+    dout: Tensor,
+    rstd: Tensor,
+    mean: Tensor,
+    bias: Optional[Tensor] = None,
+    eps: float = _EPS,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """LayerNorm backward. Returns ``(dx, dw, db_or_None)``.
+
+    ``dx`` and ``dw`` use the unified norm_dx / norm_dw kernels with the
+    ``is_layernorm=True`` path (``x_hat = (x - mean) * rstd``,
+    ``dx = rstd * (wdy - mean(wdy) - x_hat * mean(wdy * x_hat))``).
+    ``db = sum_over_M(dout)`` runs as a separate column-parallel kernel.
+    """
+    assert weight is not None, "layernorm_bwd requires a weight tensor"
+    if eps != _EPS:
+        raise NotImplementedError("runtime eps is a later pass")
+    x = x if x.stride(-1) == 1 else x.contiguous()
+    dout = dout if dout.stride(-1) == 1 else dout.contiguous()
+    dx = torch.empty_like(x)
+    _layernorm_bwd_dx(x, weight, dout, rstd, mean, dx)
+    dw = torch.empty(x.size(-1), device=x.device, dtype=weight.dtype)
+    _layernorm_bwd_dw(x, dout, rstd, mean, dw)
+    db = None
+    if bias is not None:
+        db = torch.empty(x.size(-1), device=x.device, dtype=bias.dtype)
+        _layernorm_bwd_db(dout, db)
+    return dx, dw, db
+
+
 __all__ = [
-    "rmsnorm_fwd", "layernorm_fwd", "rmsnorm_bwd",
+    "rmsnorm_fwd", "layernorm_fwd", "rmsnorm_bwd", "layernorm_bwd",
     "_norm_fwd", "_rmsnorm_bwd_dx", "_rmsnorm_bwd_dw",
+    "_layernorm_bwd_dx", "_layernorm_bwd_dw", "_layernorm_bwd_db",
 ]
