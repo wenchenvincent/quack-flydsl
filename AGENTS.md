@@ -86,3 +86,27 @@ After finding a fix, verify that the minimized repro passes, the original repro 
 - Favor concise, self-explanatory code
 - Line length: 100 (ruff)
 - Ruff allows: lambda assignment (E731), single-char vars I/O/l (E741), unused locals (F841)
+
+## AMD port (`quack/amd/`)
+
+`quack/amd/` is the AMDGPU port of the NVIDIA kernels, authored in [FlyDSL](https://github.com/ROCm/FlyDSL) instead of CuTe-DSL. The NVIDIA `quack/*.py` kernels remain untouched; the two backends live side-by-side and can be imported independently (e.g., `from quack.amd import rmsnorm_fwd`).
+
+**Install**: `pip install -e '.[amd]'` (pulls FlyDSL from the `[project.optional-dependencies].amd` group).
+
+**Run the AMD test suite**: `pytest tests/amd/` — gated by the presence of an AMD device via `torch.cuda.is_available()` (ROCm exposes AMDGPUs through the `torch.cuda` surface).
+
+**Supported archs** (see `quack/amd/flydsl_utils.py:get_wave_size`):
+- **gfx942** (CDNA3 / MI300X, wave64) — shares the gfx950 MFMA builder.
+- **gfx950** (CDNA4 / MI350 / MI355X, wave64) — primary validation target; standard MFMA + scaled MFMA for blockscaled fp8/fp4.
+- **gfx1201** (RDNA4, wave32) — reduction kernels work; WMMA GEMM kernel is a stub pending the port.
+- **gfx1250** (MI450, wave32) — same WMMA-stub status.
+
+**Key gotchas**:
+- `@flyc.kernel` bodies are AST-rewritten: plain `if dynamic_cond:` becomes `scf.if`, `for i in range(dyn)` becomes `scf.for`. External helpers must call `ReplaceIfWithDispatch.scf_if_dispatch` explicitly.
+- The AST rewriter only converts `if <expr>:` to `scf.if` when `<expr>` is an `arith.cmpi` result or a flydsl `Boolean`. `if arith.andi(i1, i1):` **silently** lets all lanes through — nest `if arith.cmpi(...)` blocks instead.
+- `for i, state in range(start, stop, init=[...])` + `yield [new_state]` is the loop-carried scf.for pattern. When the yield list has length 1, `results` comes back as a bare `ArithValue` (not a list).
+- FlyDSL's JIT caches launchers by argument **type**; the first call's `M` for `grid=(M, 1, 1)` freezes in the compiled binary. `tests/amd/conftest.py` wipes `~/.flydsl/cache` at session start and test files parametrize `M` with the largest value first (`[128, 4, 1]`).
+
+**Debugging**: `fx.printf("tid={} val={}", tid, x)` inside `@flyc.kernel`; set `FLYDSL_DUMP_IR=1` for MLIR dumps and `FLYDSL_RUNTIME_ENABLE_CACHE=0` during active iteration.
+
+**FlyDSL reference kernels**: `/workspace/FlyDSL/kernels/` — `preshuffle_gemm.py` (CDNA MFMA pipeline), `blockscale_preshuffle_gemm.py` (gfx950 scaled MFMA), `wmma_gemm_gfx1250.py` (RDNA WMMA). Vendor adapted copies under `quack/amd/` rather than runtime-importing since FlyDSL's `kernels/` isn't wheel-installed.
