@@ -50,6 +50,24 @@ def test_gemm_falls_back_when_shape_not_aligned():
     assert out.shape == (17, 64)
 
 
+def test_gemm_gated_dispatch_uses_fused_kernel():
+    """Top-level gemm_gated routes to the fused FlyDSL kernel when eligible."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, N, K = 64, 128, 64
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    out = gemm_gated(A, B, gate_type="swiglu")
+    assert out.shape == (M, N // 2)
+    # Compare vs manual
+    B_gate, B_up = B[:, :N // 2], B[:, N // 2:]
+    ref_f32 = (torch.nn.functional.silu((A.float() @ B_gate.float()))
+               * (A.float() @ B_up.float()))
+    ref = ref_f32.to(out.dtype)
+    torch.testing.assert_close(out, ref, atol=0.2, rtol=0.02)
+
+
 def test_gemm_dispatch_alpha_beta_c_through_mfma():
     """alpha/beta/C now routes through the MFMA kernel when eligible."""
     if not torch.cuda.is_available():

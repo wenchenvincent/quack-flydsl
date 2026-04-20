@@ -145,10 +145,38 @@ def gemm_act(A, B, activation: str, bias=None, **kw):
     return gemm(A, B, bias=bias, activation=activation, **kw)
 
 
+def _gated_mfma_eligible(A, B, gate_type, out_dtype):
+    if A.dtype not in _MFMA_SUPPORTED_DTYPES or A.dtype != B.dtype:
+        return False
+    if A.dim() != 2 or B.dim() != 2:
+        return False
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2 or M % 16 or N % 32 or K % 16:
+        return False
+    if gate_type not in {"swiglu", "reglu", "geglu", "glu"}:
+        return False
+    if out_dtype not in _MFMA_SUPPORTED_OUT_DTYPES:
+        return False
+    return True
+
+
 def gemm_gated(A, B, gate_type: str = "swiglu", **kw):
     """Gated GEMM: split the output along the last dim into ``(gate, up)``
     and apply the gating function. Matches QuACK's ``gemm_gated`` semantics.
+
+    Dispatches to the fused ``quack.amd.gemm_gated.gemm_gated`` FlyDSL
+    kernel when inputs are eligible (f16/bf16 × f16/bf16, M multiple of
+    16, N multiple of 32, K multiple of 16). Otherwise falls back to
+    a torch gemm + elementwise pipeline.
     """
+    out_dtype = kw.get("out_dtype") or A.dtype
+    if _gated_mfma_eligible(A, B, gate_type, out_dtype):
+        # The fused kernel saves the round-trip that the torch path takes.
+        from quack.amd.gemm_gated import gemm_gated as _gemm_gated_kernel
+        return _gemm_gated_kernel(A, B, gate_type=gate_type, out_dtype=out_dtype)
+
+    # Torch fallback.
     out = gemm(A, B, **kw)
     gate, up = out.chunk(2, dim=-1)
     if gate_type == "swiglu":
