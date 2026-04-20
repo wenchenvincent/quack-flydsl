@@ -39,10 +39,44 @@ import torch
 from torch import Tensor
 
 
+def _arch_dispatch_mfma():
+    """Return the arch-specific ``gemm_mfma`` function for the current device.
+
+    gfx942 (CDNA3) and gfx950 (CDNA4) share the same MFMA atoms so both
+    route through ``gemm_gfx950.gemm_mfma``. RDNA4 (gfx1201) and
+    gfx1250 use WMMA — those stubs raise NotImplementedError until the
+    WMMA kernels land, so eligibility checks in _mfma_eligible should
+    gate them out before reaching here (they don't yet — see
+    NotImplementedError path below).
+    """
+    from quack.amd.flydsl_utils import get_rocm_arch
+    arch = get_rocm_arch()
+    if arch in ("gfx942", "gfx950"):
+        from quack.amd.gemm_gfx950 import gemm_mfma
+        return gemm_mfma
+    if arch == "gfx1201":
+        from quack.amd.gemm_gfx1201 import gemm_mfma
+        return gemm_mfma
+    if arch == "gfx1250":
+        from quack.amd.gemm_gfx1250 import gemm_mfma
+        return gemm_mfma
+    raise NotImplementedError(f"No MFMA/WMMA GEMM kernel for arch {arch!r}")
+
+
 # Set of (input dtype, activation) combos the real FlyDSL MFMA kernel covers.
 _MFMA_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _MFMA_SUPPORTED_ACTIVATIONS = {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}
 _MFMA_SUPPORTED_OUT_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
+
+
+def _arch_supports_mfma():
+    """Does the current arch have an MFMA kernel landed (not a stub)?"""
+    try:
+        from quack.amd.flydsl_utils import get_rocm_arch
+        arch = get_rocm_arch()
+    except Exception:
+        return False
+    return arch in ("gfx942", "gfx950")
 
 
 def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
@@ -55,6 +89,8 @@ def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
       - activations: relu / relu_sq / gelu_tanh_approx / silu
       - out_dtype: f32 / f16 / bf16
     """
+    if not _arch_supports_mfma():
+        return False
     if A.dtype not in _MFMA_SUPPORTED_DTYPES or A.dtype != B.dtype:
         return False
     if A.dim() != 2 or B.dim() != 2:
@@ -126,7 +162,7 @@ def gemm(
     # Default output dtype: match input (torch.matmul convention), not f32.
     effective_out_dtype = out_dtype or A.dtype
     if _mfma_eligible(A, B, bias, activation, alpha, beta, C, effective_out_dtype):
-        from quack.amd.gemm_gfx950 import gemm_mfma
+        gemm_mfma = _arch_dispatch_mfma()
         _bias = bias
         if _bias is not None and _bias.dtype != torch.float32:
             _bias = _bias.to(torch.float32)
