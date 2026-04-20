@@ -2,26 +2,31 @@
 
 """GEMM family — AMDGPU port of `quack/gemm.py` and friends.
 
-**Current state: API surface + torch fallback.** The full kernel ports —
-preshuffle MFMA pipeline for CDNA3/CDNA4, WMMA for RDNA4, stream-K scheduler,
-and the epilogue zoo (bias, act, dact, gated, dgated, norm_act, symmetric,
-blockscaled) — are a substantial follow-up matching QuACK's CUTe-DSL scale.
+**Current state: API surface routing through torch / ROCm BLAS.** For
+f16/bf16/f32 matmuls, ``torch.mm`` on AMD goes through hipBLASLt which
+uses MFMA on gfx942/gfx950 — so the fast path is already MFMA-accelerated,
+just not authored in FlyDSL. A dedicated FlyDSL MFMA kernel here would
+ship tile/pipeline/stream-K tuning on top, which is where custom GEMMs
+win over hipBLASLt. That's Phase 2 follow-up work matching QuACK's scale.
 
-What's shipped here:
-    - ``gemm(A, B, bias=None, activation=None)`` — standard GEMM matching
-      QuACK's NVIDIA API, delegating to ``torch.mm``/``torch.addmm`` +
-      ``quack.amd.activation``.
-    - Wrapper scaffolding for the variants (``gemm_act``, ``gemm_gated``, …)
-      so downstream callers (linear, mlp) import the same names.
+What's shipped:
+    - ``gemm(A, B, bias=None, activation=None, alpha, beta, C, out_dtype)``
+    - ``gemm_act(A, B, activation, bias=None, …)``
+    - ``gemm_gated(A, B, gate_type='swiglu', …)``
+    - ``gemm_symmetric(A, …)`` — C = A @ A.T
+    - ``linear`` / ``mlp`` / ``linear_cross_entropy`` via ``quack/amd/linear.py``
 
-What's NOT yet shipped (tracked for Phase 2 follow-up):
-    - FlyDSL MFMA/WMMA kernels (reference: ``FlyDSL/kernels/preshuffle_gemm.py``,
-      ``FlyDSL/kernels/hgemm_splitk.py``, ``FlyDSL/kernels/rdna_f16_gemm.py``).
+What's NOT yet shipped (substantial follow-up):
+    - Hand-tuned FlyDSL MFMA/WMMA kernels (reference:
+      ``FlyDSL/kernels/preshuffle_gemm.py`` ~1500 lines, ``hgemm_splitk.py``
+      ~850 lines, ``rdna_f16_gemm.py``).
     - Stream-K tile scheduler (plan: ``quack/amd/tile_scheduler.py`` using
-      rocdl atomics).
-    - blockscaled fp8/fp4 (reference: ``FlyDSL/kernels/gemm_fp8fp4_gfx1250.py``,
-      ``FlyDSL/kernels/moe_blockscale_2stage.py``).
-    - Fused epilogues.
+      rocdl atomics — valuable specifically on gfx950/CDNA4).
+    - Blockscaled fp8/fp4 (reference: ``FlyDSL/kernels/gemm_fp8fp4_gfx1250.py``,
+      ``moe_blockscale_2stage.py``). hipBLASLt does not cover these so the
+      FlyDSL kernel is the only path and is higher-priority than the
+      standard-dtype GEMM port.
+    - Fused epilogues beyond the simple activation/bias/gate set above.
 """
 
 from typing import Optional
