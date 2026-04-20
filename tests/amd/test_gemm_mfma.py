@@ -51,3 +51,42 @@ def test_gemm_mfma_rejects_wrong_dtype():
     B = torch.randn(16, 16, device="cuda", dtype=torch.float32)
     with pytest.raises(AssertionError):
         gemm_mfma(A, B)
+
+
+# ---------------------------------------------------------------------------
+# Bias + activation epilogues
+# ---------------------------------------------------------------------------
+
+
+def _ref_gemm_with_epi(A, B, bias=None, activation=None):
+    ref = A.float() @ B.float()
+    if bias is not None:
+        ref = ref + bias.float()
+    if activation == "relu":
+        ref = torch.relu(ref)
+    elif activation == "relu_sq":
+        ref = torch.relu(ref) * ref  # d(relu(x) * x) / dx = 2*x if x>0 else 0
+    elif activation == "gelu_tanh_approx":
+        ref = torch.nn.functional.gelu(ref, approximate="tanh")
+    elif activation == "silu":
+        ref = torch.nn.functional.silu(ref)
+    return ref
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M", [128, 16])
+@pytest.mark.parametrize("N", [16, 64])
+@pytest.mark.parametrize("activation", [None, "relu", "relu_sq", "gelu_tanh_approx", "silu"])
+def test_gemm_mfma_bias_activation(dtype, M, N, activation):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    K = 64
+    A = torch.randn(M, K, device="cuda", dtype=dtype)
+    B = torch.randn(K, N, device="cuda", dtype=dtype)
+    bias = torch.randn(N, device="cuda", dtype=torch.float32)
+    C = gemm_mfma(A, B, bias=bias, activation=activation)
+    ref = _ref_gemm_with_epi(A, B, bias, activation)
+    # relu_sq amplifies ULP error by the magnitude of x; loosen slightly.
+    atol = 5e-3 if activation == "relu_sq" else 3e-3
+    torch.testing.assert_close(C, ref, atol=atol, rtol=3e-3)
