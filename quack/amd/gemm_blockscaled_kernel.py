@@ -68,17 +68,21 @@ _FRAG_C = 4
 def _build_blockscaled_16x16x128(
     *, M, N, K, out_dtype_str, arch,
     has_bias: bool = False, activation: Optional[str] = None,
+    has_alpha: bool = False, has_c: bool = False,
 ):
     """One workgroup per 16×16 output tile, loops K-tiles of 128.
 
     ``out_dtype_str`` ∈ {"f32", "bf16", "f16"} — output store dtype.
     ``has_bias`` — per-column f32 bias added to the accumulator.
     ``activation`` ∈ {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}.
+    ``has_alpha`` — multiply the accumulator by an f32 runtime scalar.
+    ``has_c`` — add ``beta * C[row, col]`` from an f32 C tensor.
     """
     assert M % _TILE_M == 0 and N % _TILE_N == 0 and K % _TILE_K == 0
     assert out_dtype_str in {"f32", "bf16", "f16"}
     assert activation in {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}
-    sym_suffix = f"_{out_dtype_str}_{'b' if has_bias else 'nb'}_{activation or 'none'}"
+    ab = f"_{'a' if has_alpha else 'na'}{'c' if has_c else 'nc'}"
+    sym_suffix = f"_{out_dtype_str}_{'b' if has_bias else 'nb'}_{activation or 'none'}{ab}"
     allocator = SmemAllocator(
         None, arch=arch,
         global_sym_name=f"quack_amd_bs_gemm_{M}_{N}_{K}{sym_suffix}_smem",
@@ -90,7 +94,10 @@ def _build_blockscaled_16x16x128(
         B: fx.Tensor,       # (K, N) fp8
         A_scale: fx.Tensor, # (K/128, M) f32
         B_scale: fx.Tensor, # (N/128, K/128) f32
-        Bias: fx.Tensor,    # (N,) f32 — stand-in tensor when has_bias=False
+        Bias: fx.Tensor,    # (N,) f32 — stand-in when has_bias=False
+        Cin: fx.Tensor,     # (M, N) f32 — stand-in when has_c=False
+        alpha: fx.Float32,  # ignored when has_alpha=False
+        beta: fx.Float32,   # ignored when has_c=False
         C: fx.Tensor,       # (M, N) out_dtype
     ):
         bid_m = fx.block_idx.x
@@ -107,6 +114,8 @@ def _build_blockscaled_16x16x128(
         if has_bias:
             Bias_buf = fx.rocdl.make_buffer_tensor(Bias)
             bias_div = fx.logical_divide(Bias_buf, fx.make_layout(1, 1))
+        if has_c:
+            Cin_buf = fx.rocdl.make_buffer_tensor(Cin)
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
         # C store helper — downcasts f32 accumulator to the output dtype at
@@ -223,14 +232,21 @@ def _build_blockscaled_16x16x128(
                     static_position=[i], dynamic_position=[],
                 )
 
-        # --- Epilogue: optional bias + activation.
+        # --- Epilogue: optional alpha + beta*C + bias + activation.
+        ca_f_aux = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        f_reg_ty_aux = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+
+        def _load_f32_aux(div, idx):
+            r = fx.memref_alloca(f_reg_ty_aux, fx.make_layout(1, 1))
+            fx.copy_atom_call(ca_f_aux, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
         if has_bias:
-            # bias[col] — all 4 accumulators of this lane share the same column.
-            ca_f_bias = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-            f_reg_ty_bias = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
-            r_bias = fx.memref_alloca(f_reg_ty_bias, fx.make_layout(1, 1))
-            fx.copy_atom_call(ca_f_bias, fx.slice(bias_div, (None, n_base + lane_row)), r_bias)
-            bias_val = ArithValue(fx.memref_load_vec(r_bias)[0].ir_value())
+            bias_val = ArithValue(_load_f32_aux(bias_div, n_base + lane_row))
+        if has_alpha:
+            alpha_av = ArithValue(alpha)
+        if has_c:
+            beta_av = ArithValue(beta)
 
         # --- Store C. Each lane: 4 rows at column lane_row.
         for i in range_constexpr(_FRAG_C):
@@ -240,6 +256,13 @@ def _build_blockscaled_16x16x128(
             c_div = fx.logical_divide(row_c, fx.make_layout(1, 1))
             val_i = vector.extract(global_acc, static_position=[i], dynamic_position=[])
             val = ArithValue(val_i)
+            if has_alpha:
+                val = val * alpha_av
+            if has_c:
+                row_cin = fx.slice(Cin_buf, (out_row, None))
+                cin_div = fx.logical_divide(row_cin, fx.make_layout(1, 1))
+                cin_val = ArithValue(_load_f32_aux(cin_div, out_col))
+                val = val + beta_av * cin_val
             if has_bias:
                 val = val + bias_val
             # Inlined activations — matches gemm_gfx950.py's math.
@@ -268,14 +291,16 @@ def _build_blockscaled_16x16x128(
     def launch(
         A: fx.Tensor, B: fx.Tensor,
         A_scale: fx.Tensor, B_scale: fx.Tensor,
-        Bias: fx.Tensor, C: fx.Tensor,
+        Bias: fx.Tensor, Cin: fx.Tensor,
+        alpha: fx.Float32, beta: fx.Float32,
+        C: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        kernel(A, B, A_scale, B_scale, Bias, C).launch(
+        kernel(A, B, A_scale, B_scale, Bias, Cin, alpha, beta, C).launch(
             grid=(M // _TILE_M, N // _TILE_N, 1),
             block=(64, 1, 1),
             stream=stream,
@@ -293,13 +318,14 @@ _OUT_DTYPE_MAP = {
 }
 
 
-def _compile(M, N, K, out_dtype_str, has_bias, activation, arch):
-    key = (M, N, K, out_dtype_str, has_bias, activation, arch)
+def _compile(M, N, K, out_dtype_str, has_bias, activation, has_alpha, has_c, arch):
+    key = (M, N, K, out_dtype_str, has_bias, activation, has_alpha, has_c, arch)
     got = _kernel_cache.get(key)
     if got is None:
         got = _build_blockscaled_16x16x128(
             M=M, N=N, K=K, out_dtype_str=out_dtype_str,
-            has_bias=has_bias, activation=activation, arch=arch,
+            has_bias=has_bias, activation=activation,
+            has_alpha=has_alpha, has_c=has_c, arch=arch,
         )
         _kernel_cache[key] = got
     return got
@@ -310,15 +336,22 @@ def mxfp8_gemm_mfma(
     out_dtype: Optional[torch.dtype] = None,
     bias: Optional[Tensor] = None,
     activation: Optional[str] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: Optional[Tensor] = None,
 ) -> Tensor:
     """FlyDSL MFMA blockscaled fp8 GEMM.
 
     Shape contract matches `quack.amd.gemm_blockscaled.mxfp8_gemm` except
     that B is expected in ``(N, K)`` layout (standard B transposed).
 
+    Computes ``D = activation(alpha * (A @ B) + beta * C + bias)``.
+
     - ``out_dtype`` ∈ {f32 (default), bf16, f16}.
-    - ``bias`` 1-D f32 tensor of length N (added post-scale, pre-activation).
+    - ``bias`` 1-D f32 tensor of length N (per-column, added post-alpha).
     - ``activation`` ∈ {None, "relu", "relu_sq", "gelu_tanh_approx", "silu"}.
+    - ``alpha``, ``beta``, ``C``: full-GEMM terms. ``C`` must be f32 same
+      shape as output. beta != 0 requires C.
     """
     assert A.is_cuda and B.is_cuda
     assert A.dtype == torch.float8_e4m3fn
@@ -333,12 +366,21 @@ def mxfp8_gemm_mfma(
     has_bias = bias is not None
     if has_bias:
         assert bias.dim() == 1 and bias.size(0) == N and bias.dtype == torch.float32
+    has_alpha = alpha != 1.0
+    has_c = C is not None
+    if beta != 0.0 and C is None:
+        raise AssertionError("beta != 0 requires a C tensor")
+    if C is not None:
+        assert C.shape == (M, N) and C.dtype == torch.float32 and C.stride(-1) == 1
     out = torch.empty(M, N, device=A.device, dtype=out_dtype)
     launcher = _compile(
-        M, N, K, _OUT_DTYPE_MAP[out_dtype], has_bias, activation, get_rocm_arch(),
+        M, N, K, _OUT_DTYPE_MAP[out_dtype], has_bias, activation,
+        has_alpha, has_c, get_rocm_arch(),
     )
-    Bias_arg = bias if has_bias else out   # stand-in when no bias
-    launcher(A, B, A_scale, B_scale, Bias_arg, out)
+    Bias_arg = bias if has_bias else out
+    Cin_arg = C if has_c else out
+    launcher(A, B, A_scale, B_scale, Bias_arg, Cin_arg,
+             float(alpha), float(beta), out)
     return out
 
 
