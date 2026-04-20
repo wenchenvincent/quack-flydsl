@@ -36,15 +36,15 @@ def test_cross_entropy_fwd(dtype, tgt_dtype, M, N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("N", [256, 1024])
-def test_cross_entropy_bwd(dtype, N):
-    # Backward is a torch-host fallback; this exercises the end-to-end
-    # public API shape (fwd produces `lse`, bwd consumes it) rather than a
-    # fresh kernel. Kernelised dx is a perf follow-up.
+@pytest.mark.parametrize("M", [128, 4, 1])  # largest M first — see conftest.py
+@pytest.mark.parametrize("N", [256, 1024, 4096])
+def test_cross_entropy_bwd(dtype, M, N):
+    # Real FlyDSL dx kernel now (replaces the torch-host fallback). The fwd
+    # kernel produces `lse`, and the bwd kernel derives
+    # `dx[m,j] = (exp(x[m,j] - lse[m]) - (j==target[m])) * dloss[m]`.
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)
-    M = 16
     x = torch.randn(M, N, device="cuda", dtype=dtype, requires_grad=True)
     target = torch.randint(0, N, (M,), device="cuda", dtype=torch.int64)
     loss_ref = torch.nn.functional.cross_entropy(x.float(), target, reduction="none")

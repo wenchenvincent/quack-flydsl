@@ -214,6 +214,7 @@ def _build_ce_fwd(*, N, dtype, target_dtype, arch):
 
 
 _fwd_cache: dict = {}
+_bwd_cache: dict = {}
 
 
 def _compile_fwd(N, dt, tgt_dt, arch):
@@ -226,6 +227,121 @@ def _compile_fwd(N, dt, tgt_dt, arch):
         )
         _fwd_cache[key] = got
     return got
+
+
+def _compile_bwd(N, dt, tgt_dt, arch):
+    key = (N, dt, tgt_dt, arch)
+    got = _bwd_cache.get(key)
+    if got is None:
+        got = _build_ce_bwd_dx(
+            N=N, dtype=torch2flydsl_dtype_map[dt],
+            target_dtype=torch2flydsl_dtype_map[tgt_dt], arch=arch,
+        )
+        _bwd_cache[key] = got
+    return got
+
+
+# ---------------------------------------------------------------------------
+# Backward kernel — per-row `dx = (exp(x - lse) - one_hot(target)) * dloss`.
+# ---------------------------------------------------------------------------
+
+
+def _build_ce_bwd_dx(*, N, dtype, target_dtype, arch):
+    wave_size = get_wave_size(arch)
+    block_threads = 128 if N <= 16384 else 256
+    elem_bits = dtype.width
+
+    sym = "quack_amd_ce_bwd_dx_smem"
+    allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
+    # No reduction needed — dx is per-element, driven only by lse[bid] + target[bid].
+
+    @flyc.kernel
+    def kernel(
+        X: fx.Tensor, TGT: fx.Tensor, Lse: fx.Tensor, DLoss: fx.Tensor, DX: fx.Tensor,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        elem_type = _elem_type_for(dtype)
+        tgt_type = _elem_type_for(target_dtype)
+        compute_type = T.f32
+        n_i32 = fx.Int32(N)
+
+        base_ptr = allocator.get_base()
+        # allocator.finalize() handles the trivial empty-LDS case.
+
+        X_buf = fx.rocdl.make_buffer_tensor(X)
+        TGT_buf = fx.rocdl.make_buffer_tensor(TGT)
+        Lse_buf = fx.rocdl.make_buffer_tensor(Lse)
+        DLoss_buf = fx.rocdl.make_buffer_tensor(DLoss)
+        DX_buf = fx.rocdl.make_buffer_tensor(DX)
+
+        row_x = fx.slice(X_buf, (bid, None))
+        row_dx = fx.slice(DX_buf, (bid, None))
+        x_div = fx.logical_divide(row_x, fx.make_layout(1, 1))
+        dx_div = fx.logical_divide(row_dx, fx.make_layout(1, 1))
+        tgt_div = fx.logical_divide(TGT_buf, fx.make_layout(1, 1))
+        lse_div = fx.logical_divide(Lse_buf, fx.make_layout(1, 1))
+        dloss_div = fx.logical_divide(DLoss_buf, fx.make_layout(1, 1))
+
+        ca_x = fx.make_copy_atom(_bufcopy(elem_bits), elem_type)
+        ca_tgt = fx.make_copy_atom(
+            fx.rocdl.BufferCopy32b() if target_dtype is Int32 else fx.rocdl.BufferCopy64b(),
+            tgt_type,
+        )
+        ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        x_reg_ty = fx.MemRefType.get(elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        tgt_reg_ty = fx.MemRefType.get(tgt_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load(div, reg_ty, ca, idx):
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            fx.copy_atom_call(ca, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store(div, reg_ty, ca, idx, val):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(reg_ty.element_type)
+            ts = _vfull(1, elem_py(val), elem_py)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
+
+        # Each thread loads row-level scalars once: lse, dloss, target.
+        lse_val = ArithValue(_load(lse_div, f_reg_ty, ca_f, bid))
+        dloss_val = ArithValue(_load(dloss_div, f_reg_ty, ca_f, bid))
+        t_e = _load(tgt_div, tgt_reg_ty, ca_tgt, bid)
+        t_i32 = t_e.trunci(T.i32) if target_dtype is Int64 else t_e
+
+        # Per-column: dx[m, j] = (softmax(x)[m, j] - (j == target[m])) * dloss[m]
+        #           = (exp(x[m, j] - lse[m]) - (j == target[m])) * dloss[m]
+        for base_idx in range_constexpr(0, N, block_threads):
+            idx = tid + fx.Int32(base_idx)
+            if arith.cmpi(arith.CmpIPredicate.ult, idx, n_i32):
+                x_e = _load(x_div, x_reg_ty, ca_x, idx)
+                x = x_e if dtype is Float32 else x_e.extf(compute_type)
+                softmax_val = _fm.exp(ArithValue(x) - lse_val, fastmath="fast")
+                is_target = arith.cmpi(arith.CmpIPredicate.eq, idx, t_i32)
+                one_or_zero = is_target.select(ArithValue(Float32(1.0)), ArithValue(Float32(0.0)))
+                dx_f32 = (softmax_val - one_or_zero) * dloss_val
+                dx_e = dx_f32 if dtype is Float32 else dx_f32.truncf(elem_type)
+                _store(dx_div, x_reg_ty, ca_x, idx, dx_e)
+
+    @flyc.jit
+    def launch(
+        X: fx.Tensor, TGT: fx.Tensor, Lse: fx.Tensor, DLoss: fx.Tensor, DX: fx.Tensor,
+        M: fx.Int32, stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        kernel(X, TGT, Lse, DLoss, DX).launch(
+            grid=(M, 1, 1), block=(block_threads, 1, 1), stream=stream,
+        )
+
+    return launch
 
 
 @torch.library.custom_op(
@@ -266,6 +382,29 @@ def cross_entropy_fwd(
     return loss, (lse if return_lse else None)
 
 
+@torch.library.custom_op(
+    "quack_amd::_cross_entropy_bwd_dx",
+    mutates_args=("dx",),
+    schema="(Tensor x, Tensor target, Tensor lse, Tensor dloss, Tensor(a0!) dx) -> ()",
+)
+def _cross_entropy_bwd_dx(
+    x: Tensor, target: Tensor, lse: Tensor, dloss: Tensor, dx: Tensor,
+) -> None:
+    assert x.is_cuda and target.is_cuda and lse.is_cuda and dloss.is_cuda and dx.is_cuda
+    assert x.dim() == 2 and dx.shape == x.shape
+    assert target.dim() == 1 and target.size(0) == x.size(0)
+    assert lse.dim() == 1 and lse.size(0) == x.size(0) and lse.dtype == torch.float32
+    assert dloss.dim() == 1 and dloss.size(0) == x.size(0) and dloss.dtype == torch.float32
+    assert x.stride(-1) == 1 and dx.stride(-1) == 1
+    M, N = x.shape
+    _compile_bwd(N, x.dtype, target.dtype, get_rocm_arch())(x, target, lse, dloss, dx, M)
+
+
+@_cross_entropy_bwd_dx.register_fake
+def _cross_entropy_bwd_dx_fake(x, target, lse, dloss, dx):
+    return None
+
+
 def cross_entropy_bwd(
     x: Tensor,
     target: Tensor,
@@ -276,16 +415,20 @@ def cross_entropy_bwd(
 
     ``dx[m, j] = (softmax(x)[m, j] - (j == target[m])) * dloss[m]``
 
-    Computed with torch ops on top of the stored ``lse`` since cross-entropy
-    bwd is already cheap vs fwd. Kernelised version is a perf follow-up.
+    If ``dloss`` is None, defaults to 1 (unscaled gradient).
     """
-    x_f32 = x.float()
-    sm = torch.exp(x_f32 - lse.unsqueeze(-1))
-    one_hot = torch.nn.functional.one_hot(target.long(), num_classes=x.size(-1)).to(x_f32.dtype)
-    dx = sm - one_hot
-    if dloss is not None:
-        dx = dx * dloss.unsqueeze(-1)
-    return dx.to(x.dtype)
+    assert x.is_cuda and x.dim() == 2
+    x = x if x.stride(-1) == 1 else x.contiguous()
+    if dloss is None:
+        dloss = torch.ones(x.size(0), device=x.device, dtype=torch.float32)
+    elif dloss.dtype != torch.float32:
+        dloss = dloss.to(torch.float32)
+    dx = torch.empty_like(x)
+    _cross_entropy_bwd_dx(x, target, lse, dloss, dx)
+    return dx
 
 
-__all__ = ["cross_entropy_fwd", "cross_entropy_bwd", "_cross_entropy_fwd"]
+__all__ = [
+    "cross_entropy_fwd", "cross_entropy_bwd",
+    "_cross_entropy_fwd", "_cross_entropy_bwd_dx",
+]
