@@ -111,3 +111,57 @@ def test_gemm_mfma_output_dtype(in_dtype, out_dtype):
         torch.bfloat16: (5e-2, 5e-2),
     }[out_dtype]
     torch.testing.assert_close(C, ref, atol=band[0], rtol=band[1])
+
+
+# ---------------------------------------------------------------------------
+# alpha / beta / C — full D = alpha * A @ B + beta * C + bias + activation
+# ---------------------------------------------------------------------------
+
+
+def test_gemm_mfma_alpha_only():
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    A = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    B = torch.randn(64, 64, device="cuda", dtype=torch.float16)
+    C = gemm_mfma(A, B, alpha=2.5)
+    ref = 2.5 * (A.float() @ B.float())
+    torch.testing.assert_close(C, ref, atol=5e-5, rtol=5e-5)
+
+
+def test_gemm_mfma_alpha_beta_c():
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, N, K = 64, 64, 64
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C_in = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    D = gemm_mfma(A, B, alpha=2.0, beta=1.5, C=C_in)
+    ref = 2.0 * (A.float() @ B.float()) + 1.5 * C_in
+    torch.testing.assert_close(D, ref, atol=5e-5, rtol=5e-5)
+
+
+def test_gemm_mfma_full_gemm():
+    """alpha * A @ B + beta * C + bias then relu."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, N, K = 64, 64, 64
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C_in = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    bias = torch.randn(N, device="cuda", dtype=torch.float32)
+    D = gemm_mfma(A, B, alpha=0.5, beta=2.0, C=C_in, bias=bias, activation="relu")
+    ref = torch.relu(0.5 * (A.float() @ B.float()) + 2.0 * C_in + bias)
+    torch.testing.assert_close(D, ref, atol=5e-5, rtol=5e-5)
+
+
+def test_gemm_mfma_beta_without_c_raises():
+    """beta != 0 without a C tensor is an error."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    A = torch.randn(16, 16, device="cuda", dtype=torch.float16)
+    B = torch.randn(16, 16, device="cuda", dtype=torch.float16)
+    with pytest.raises(AssertionError):
+        gemm_mfma(A, B, beta=0.5)
