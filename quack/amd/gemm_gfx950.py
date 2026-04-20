@@ -53,14 +53,18 @@ _FRAG_B = 4
 _FRAG_C = 4  # f32 values per lane
 
 
-def _build_gemm_16x16_f16(*, M, N, K, arch):
-    """Compile a 16x16-tile MFMA GEMM for ``M, N, K`` as compile-time constants.
+def _build_gemm_16x16(*, M, N, K, dtype_str, arch):
+    """Compile a 16x16-tile MFMA GEMM.
 
-    Requires M % 16 == 0, N % 16 == 0, K % 16 == 0. Grid = ``(M/16, N/16, 1)``.
-    Block = (64, 1, 1) — one wave per tile.
+    ``dtype_str`` ∈ {"f16", "bf16"} selects the MFMA variant. Requires
+    M, N, K all multiples of 16. Grid = ``(M/16, N/16, 1)``, block = (64,1,1).
     """
+    assert dtype_str in {"f16", "bf16"}
     assert M % _MFMA_M == 0 and N % _MFMA_N == 0 and K % _MFMA_K == 0
-    allocator = SmemAllocator(None, arch=arch, global_sym_name="quack_amd_gemm_f16_smem")
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=f"quack_amd_gemm_{dtype_str}_smem",
+    )
     # No LDS usage in the MVP; SmemAllocator still needs finalize() to emit the
     # (empty) shared-memory symbol.
 
@@ -92,9 +96,10 @@ def _build_gemm_16x16_f16(*, M, N, K, arch):
         # Scalar-load helper wrappers. We fall back to the copy_atom_call
         # machinery used elsewhere — less optimal than buffer_load but
         # reliably correct.
-        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
+        in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
+        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-        h_reg_ty = fx.MemRefType.get(T.f16, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
@@ -131,7 +136,7 @@ def _build_gemm_16x16_f16(*, M, N, K, arch):
             a_vals = []
             for i in range_constexpr(_FRAG_A):
                 a_vals.append(_load_h_scalar(a_div, lane_k_base + fx.Int32(i)))
-            a_frag = vector.from_elements(T.vec(_FRAG_A, T.f16), a_vals)
+            a_frag = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_vals)
 
             # Load this lane's B fragment (f16x4): B[lane_k_base + 0..3, b_col]
             # B is row-major (K, N); we pick one row per k and the b_col-th column.
@@ -140,10 +145,22 @@ def _build_gemm_16x16_f16(*, M, N, K, arch):
                 row_b_k = fx.slice(B_buf, (lane_k_base + fx.Int32(i), None))
                 b_div = fx.logical_divide(row_b_k, fx.make_layout(1, 1))
                 b_vals.append(_load_h_scalar(b_div, b_col))
-            b_frag = vector.from_elements(T.vec(_FRAG_B, T.f16), b_vals)
+            b_frag = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_vals)
 
-            # MFMA: acc_new = a_frag @ b_frag + acc
-            acc = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_frag, b_frag, acc, 0, 0, 0])
+            # MFMA: acc_new = a_frag @ b_frag + acc. bf16 variant uses the
+            # `_1k` instruction; inputs stay in native dtype (the instruction
+            # takes i16-viewed operands internally, handled by FlyDSL's
+            # rocdl wrapper).
+            if dtype_str == "bf16":
+                a_frag_i16 = vector.bitcast(T.vec(_FRAG_A, T.i16), a_frag)
+                b_frag_i16 = vector.bitcast(T.vec(_FRAG_B, T.i16), b_frag)
+                acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                    acc_ty, [a_frag_i16, b_frag_i16, acc, 0, 0, 0],
+                )
+            else:
+                acc = fx.rocdl.mfma_f32_16x16x16f16(
+                    acc_ty, [a_frag, b_frag, acc, 0, 0, 0],
+                )
 
         # Store C: 4 rows per lane at column `lane_row` in the output tile.
         # C[(bid_m*16) + (lane_k_group*4 + i), (bid_n*16) + lane_row] = acc[i]
@@ -174,22 +191,23 @@ def _build_gemm_16x16_f16(*, M, N, K, arch):
 _kernel_cache: dict = {}
 
 
-def _compile(M, N, K, arch):
-    key = (M, N, K, arch)
+def _compile(M, N, K, dtype_str, arch):
+    key = (M, N, K, dtype_str, arch)
     got = _kernel_cache.get(key)
     if got is None:
-        got = _build_gemm_16x16_f16(M=M, N=N, K=K, arch=arch)
+        got = _build_gemm_16x16(M=M, N=N, K=K, dtype_str=dtype_str, arch=arch)
         _kernel_cache[key] = got
     return got
 
 
 @torch.library.custom_op(
-    "quack_amd::_gemm_f16_16x16_out",
+    "quack_amd::_gemm_mfma_16x16_out",
     mutates_args=("out",),
     schema="(Tensor A, Tensor B, Tensor(a0!) out) -> ()",
 )
-def _gemm_f16_16x16_out(A: Tensor, B: Tensor, out: Tensor) -> None:
-    assert A.dtype == torch.float16 and B.dtype == torch.float16
+def _gemm_mfma_16x16_out(A: Tensor, B: Tensor, out: Tensor) -> None:
+    assert A.dtype in (torch.float16, torch.bfloat16)
+    assert A.dtype == B.dtype
     assert out.dtype == torch.float32
     M, K = A.shape
     K2, N = B.shape
@@ -197,27 +215,32 @@ def _gemm_f16_16x16_out(A: Tensor, B: Tensor, out: Tensor) -> None:
     assert out.shape == (M, N)
     assert M % 16 == 0 and N % 16 == 0 and K % 16 == 0
     assert all(t.stride(-1) == 1 for t in (A, B, out))
-    _compile(M, N, K, get_rocm_arch())(A, B, out)
+    dtype_str = "f16" if A.dtype == torch.float16 else "bf16"
+    _compile(M, N, K, dtype_str, get_rocm_arch())(A, B, out)
 
 
-@_gemm_f16_16x16_out.register_fake
-def _gemm_f16_16x16_out_fake(A, B, out):
+@_gemm_mfma_16x16_out.register_fake
+def _gemm_mfma_16x16_out_fake(A, B, out):
     return None
 
 
-def gemm_f16_mfma(A: Tensor, B: Tensor) -> Tensor:
-    """Proof-of-life FlyDSL MFMA GEMM: f16 × f16 → f32.
+def gemm_mfma(A: Tensor, B: Tensor) -> Tensor:
+    """Proof-of-life FlyDSL MFMA GEMM: f16/bf16 × f16/bf16 → f32.
 
-    Requires M, N, K all multiples of 16. One workgroup per 16x16 output
-    tile. This is a minimal demonstration of the MFMA path; for real
-    workloads use ``quack.amd.gemm`` (currently the torch fallback).
+    Requires M, N, K all multiples of 16 and A.dtype == B.dtype. One
+    workgroup per 16x16 output tile.
     """
     assert A.is_cuda and B.is_cuda
     M, K = A.shape
     _, N = B.shape
     out = torch.empty(M, N, device=A.device, dtype=torch.float32)
-    _gemm_f16_16x16_out(A, B, out)
+    _gemm_mfma_16x16_out(A, B, out)
     return out
 
 
-__all__ = ["gemm_f16_mfma", "_gemm_f16_16x16_out"]
+def gemm_f16_mfma(A: Tensor, B: Tensor) -> Tensor:
+    """Kept for backwards compatibility; delegates to ``gemm_mfma``."""
+    return gemm_mfma(A, B)
+
+
+__all__ = ["gemm_mfma", "gemm_f16_mfma", "_gemm_mfma_16x16_out"]
