@@ -79,6 +79,8 @@ def _build_norm_fwd(
     store_rstd: bool,
     store_mean: bool,
     store_residual_out: bool,
+    per_head: bool,
+    num_heads: int,
     arch: str,
 ):
     wave_size = get_wave_size(arch)
@@ -93,7 +95,8 @@ def _build_norm_fwd(
         f"quack_amd_{'ln' if is_layernorm else 'rms'}_fwd_"
         f"{'b' if has_bias else 'nb'}_{'r' if store_rstd else 'nr'}_"
         f"{'m' if store_mean else 'nm'}_{'res' if has_residual else 'nres'}_"
-        f"{'ro' if store_residual_out else 'nro'}_smem"
+        f"{'ro' if store_residual_out else 'nro'}_"
+        f"{'ph' + str(num_heads) if per_head else 'nph'}_smem"
     )
     allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
     # LayerNorm needs 2 reduction slabs (sum, sum_sq); RMSNorm needs 1 (sum_sq).
@@ -152,9 +155,19 @@ def _build_norm_fwd(
         row_y = fx.slice(Y_buf, (bid, None))
         x_div = fx.logical_divide(row_x, fx.make_layout(1, 1))
         y_div = fx.logical_divide(row_y, fx.make_layout(1, 1))
-        w_div = fx.logical_divide(W_buf, fx.make_layout(1, 1))
-        if has_bias:
-            b_div = fx.logical_divide(B_buf, fx.make_layout(1, 1))
+        if per_head:
+            # Input is reshaped to (M*H, N); weight is (H, N). Head index
+            # for this workgroup is bid % H.
+            head_idx = bid % fx.Int32(num_heads)
+            row_w = fx.slice(W_buf, (head_idx, None))
+            w_div = fx.logical_divide(row_w, fx.make_layout(1, 1))
+            if has_bias:
+                row_b = fx.slice(B_buf, (head_idx, None))
+                b_div = fx.logical_divide(row_b, fx.make_layout(1, 1))
+        else:
+            w_div = fx.logical_divide(W_buf, fx.make_layout(1, 1))
+            if has_bias:
+                b_div = fx.logical_divide(B_buf, fx.make_layout(1, 1))
         if has_residual:
             row_res = fx.slice(Res_buf, (bid, None))
             res_div = fx.logical_divide(row_res, fx.make_layout(1, 1))
@@ -688,12 +701,14 @@ _ln_bwd_db_cache: dict = {}
 def _compile_fwd(
     N, x_dt, w_dt, b_dt, r_dt,
     is_layernorm, has_bias, has_residual,
-    store_rstd, store_mean, store_residual_out, arch,
+    store_rstd, store_mean, store_residual_out,
+    per_head, num_heads, arch,
 ):
     key = (
         N, x_dt, w_dt, b_dt, r_dt,
         is_layernorm, has_bias, has_residual,
-        store_rstd, store_mean, store_residual_out, arch,
+        store_rstd, store_mean, store_residual_out,
+        per_head, num_heads, arch,
     )
     got = _fwd_cache.get(key)
     if got is None:
@@ -709,6 +724,8 @@ def _compile_fwd(
             store_rstd=store_rstd,
             store_mean=store_mean,
             store_residual_out=store_residual_out,
+            per_head=per_head,
+            num_heads=num_heads,
             arch=arch,
         )
         _fwd_cache[key] = got
@@ -781,7 +798,7 @@ def _compile_ln_bwd_db(N, x_dt, b_dt, arch):
     schema=(
         "(Tensor x, Tensor weight, Tensor? bias, Tensor? residual, "
         "Tensor(a0!) out, Tensor(a1!)? rstd, Tensor(a2!)? mean, "
-        "Tensor(a3!)? residual_out, bool is_layernorm) -> ()"
+        "Tensor(a3!)? residual_out, bool is_layernorm, int num_heads) -> ()"
     ),
 )
 def _norm_fwd(
@@ -791,13 +808,21 @@ def _norm_fwd(
     rstd: Optional[Tensor], mean: Optional[Tensor],
     residual_out: Optional[Tensor],
     is_layernorm: bool,
+    num_heads: int,
 ) -> None:
     assert x.is_cuda and weight.is_cuda and out.is_cuda
     assert x.dim() == 2 and out.shape == x.shape
-    assert weight.dim() == 1 and weight.size(0) == x.size(-1)
     assert x.stride(-1) == 1 and out.stride(-1) == 1
+    per_head = num_heads > 0
+    if per_head:
+        assert weight.dim() == 2 and weight.size(0) == num_heads and weight.size(1) == x.size(-1)
+    else:
+        assert weight.dim() == 1 and weight.size(0) == x.size(-1)
     if bias is not None:
-        assert bias.dim() == 1 and bias.size(0) == x.size(-1)
+        if per_head:
+            assert bias.dim() == 2 and bias.size(0) == num_heads and bias.size(1) == x.size(-1)
+        else:
+            assert bias.dim() == 1 and bias.size(0) == x.size(-1)
     if residual is not None:
         assert residual.shape == x.shape and residual.stride(-1) == 1
     if residual_out is not None:
@@ -816,6 +841,7 @@ def _norm_fwd(
         residual.dtype if has_residual else None,
         is_layernorm, has_bias, has_residual,
         rstd is not None, mean is not None, store_residual_out,
+        per_head, num_heads,
         get_rocm_arch(),
     )
     # Kernel takes 8 tensors; pass stand-ins for unused optional slots — the
@@ -829,7 +855,7 @@ def _norm_fwd(
 
 
 @_norm_fwd.register_fake
-def _norm_fwd_fake(x, weight, bias, residual, out, rstd, mean, residual_out, is_layernorm):
+def _norm_fwd_fake(x, weight, bias, residual, out, rstd, mean, residual_out, is_layernorm, num_heads):
     return None
 
 
@@ -958,6 +984,33 @@ def _layernorm_bwd_db_fake(dout, db):
 # ---------------------------------------------------------------------------
 
 
+def _prep_norm_fwd_inputs(x, weight, bias, residual, residual_out):
+    """Shared input-normalisation for rmsnorm/layernorm fwd.
+
+    Detects per-head mode (x is 3D ``(B, H, N)`` and weight is 2D
+    ``(H, N)``), flattens to ``(B*H, N)`` for the kernel, and returns
+    ``(x_flat, weight, bias, residual_flat, residual_out_flat,
+    num_heads, out_shape)``. When ``num_heads == 0`` the kernel runs in
+    the 1D-weight (non-per-head) path.
+    """
+    per_head = x.dim() == 3 or (weight is not None and weight.dim() == 2)
+    if per_head:
+        assert x.dim() == 3, f"per-head rmsnorm needs 3D x; got dim {x.dim()}"
+        assert weight.dim() == 2, f"per-head weight must be 2D (H, N); got dim {weight.dim()}"
+        B, H, N = x.shape
+        assert weight.size(0) == H and weight.size(1) == N
+        if bias is not None:
+            assert bias.dim() == 2 and bias.size(0) == H and bias.size(1) == N
+        out_shape = x.shape
+        x_flat = x.reshape(B * H, N)
+        res_flat = residual.reshape(B * H, N) if residual is not None else None
+        rout_flat = residual_out.reshape(B * H, N) if residual_out is not None else None
+        return x_flat, weight, bias, res_flat, rout_flat, H, out_shape
+    else:
+        assert x.dim() == 2, f"non-per-head rmsnorm needs 2D x; got dim {x.dim()}"
+        return x, weight, bias, residual, residual_out, 0, x.shape
+
+
 def rmsnorm_fwd(
     x: Tensor,
     weight: Optional[Tensor] = None,
@@ -975,21 +1028,31 @@ def rmsnorm_fwd(
     new tensor with the same dtype as ``residual`` (or ``x`` when residual is
     None) — useful for residual-add→norm chains that need the pre-norm value
     for the next layer's residual.
+
+    Per-head mode: if ``x.dim() == 3`` (shape ``(B, H, N)``) and ``weight``
+    is ``(H, N)``, the kernel normalises each ``(b, h)`` slice independently
+    and applies the per-head ``(h, :)`` weight/bias — useful for multi-head
+    attention's Q/K norms.
     """
-    assert x.is_cuda and x.dim() == 2
+    assert x.is_cuda
     if eps != _EPS:
         raise NotImplementedError("runtime eps is a later pass")
-    x = x if x.stride(-1) == 1 else x.contiguous()
+    x_contig = x if x.stride(-1) == 1 else x.contiguous()
     if weight is None:
         weight = torch.ones(x.size(-1), device=x.device, dtype=x.dtype)
     if residual is not None and residual.stride(-1) != 1:
         residual = residual.contiguous()
-    out = torch.empty_like(x)
-    rstd = torch.empty(x.size(0), device=x.device, dtype=torch.float32) if store_rstd else None
+    out = torch.empty_like(x_contig)
     res_out_dtype = residual.dtype if residual is not None else x.dtype
-    residual_out = torch.empty_like(x, dtype=res_out_dtype) if store_residual_out else None
-    _norm_fwd(x, weight, bias, residual, out, rstd, None, residual_out, False)
-    return out, rstd, residual_out
+    residual_out = torch.empty_like(x_contig, dtype=res_out_dtype) if store_residual_out else None
+    x_flat, w2, b2, res_flat, rout_flat, num_heads, out_shape = _prep_norm_fwd_inputs(
+        x_contig, weight, bias, residual, residual_out
+    )
+    M_flat = x_flat.size(0)
+    rstd = torch.empty(M_flat, device=x.device, dtype=torch.float32) if store_rstd else None
+    out_flat = out.reshape(M_flat, -1)
+    _norm_fwd(x_flat, w2, b2, res_flat, out_flat, rstd, None, rout_flat, False, num_heads)
+    return out.reshape(out_shape), rstd, residual_out
 
 
 def layernorm_fwd(
@@ -1003,23 +1066,29 @@ def layernorm_fwd(
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """LayerNorm forward. Returns ``(out, rstd, mean, residual_out)``.
 
-    ``residual`` semantics match ``rmsnorm_fwd``.
+    ``residual`` semantics match ``rmsnorm_fwd``; per-head mode also
+    matches (3D x + 2D weight triggers it).
     """
-    assert x.is_cuda and x.dim() == 2
+    assert x.is_cuda
     if eps != _EPS:
         raise NotImplementedError("runtime eps is a later pass")
-    x = x if x.stride(-1) == 1 else x.contiguous()
+    x_contig = x if x.stride(-1) == 1 else x.contiguous()
     if weight is None:
         weight = torch.ones(x.size(-1), device=x.device, dtype=x.dtype)
     if residual is not None and residual.stride(-1) != 1:
         residual = residual.contiguous()
-    out = torch.empty_like(x)
-    rstd = torch.empty(x.size(0), device=x.device, dtype=torch.float32) if store_stats else None
-    mean = torch.empty(x.size(0), device=x.device, dtype=torch.float32) if store_stats else None
+    out = torch.empty_like(x_contig)
     res_out_dtype = residual.dtype if residual is not None else x.dtype
-    residual_out = torch.empty_like(x, dtype=res_out_dtype) if store_residual_out else None
-    _norm_fwd(x, weight, bias, residual, out, rstd, mean, residual_out, True)
-    return out, rstd, mean, residual_out
+    residual_out = torch.empty_like(x_contig, dtype=res_out_dtype) if store_residual_out else None
+    x_flat, w2, b2, res_flat, rout_flat, num_heads, out_shape = _prep_norm_fwd_inputs(
+        x_contig, weight, bias, residual, residual_out
+    )
+    M_flat = x_flat.size(0)
+    rstd = torch.empty(M_flat, device=x.device, dtype=torch.float32) if store_stats else None
+    mean = torch.empty(M_flat, device=x.device, dtype=torch.float32) if store_stats else None
+    out_flat = out.reshape(M_flat, -1)
+    _norm_fwd(x_flat, w2, b2, res_flat, out_flat, rstd, mean, rout_flat, True, num_heads)
+    return out.reshape(out_shape), rstd, mean, residual_out
 
 
 def rmsnorm_bwd(

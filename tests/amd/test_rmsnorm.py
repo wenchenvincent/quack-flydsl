@@ -147,6 +147,50 @@ def test_layernorm_bwd(dtype, M, N, with_bias):
 
 
 # ---------------------------------------------------------------------------
+# Per-head (3D) layouts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("B, H, N", [(4, 8, 128), (1, 16, 256), (2, 4, 1024)])
+def test_rmsnorm_fwd_per_head(dtype, B, H, N):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(B, H, N, device="cuda", dtype=dtype)
+    w = torch.randn(H, N, device="cuda", dtype=dtype)
+    out, _, _ = rmsnorm_fwd(x, w)
+    x_f = x.float()
+    rstd = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + 1e-6)
+    ref = (x_f * rstd * w.float()).to(dtype)
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("B, H, N", [(4, 8, 128), (2, 4, 1024)])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_layernorm_fwd_per_head(dtype, B, H, N, with_bias):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(B, H, N, device="cuda", dtype=dtype)
+    w = torch.randn(H, N, device="cuda", dtype=dtype)
+    b = torch.randn(H, N, device="cuda", dtype=dtype) if with_bias else None
+    out, _, _, _ = layernorm_fwd(x, w, bias=b)
+    x_f = x.float()
+    mean = x_f.mean(-1, keepdim=True)
+    var = x_f.var(-1, keepdim=True, unbiased=False)
+    rstd = torch.rsqrt(var + 1e-6)
+    ref = (x_f - mean) * rstd * w.float()
+    if with_bias:
+        ref = ref + b.float()
+    ref = ref.to(dtype)
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
+# ---------------------------------------------------------------------------
 # Bias + LayerNorm
 # ---------------------------------------------------------------------------
 
