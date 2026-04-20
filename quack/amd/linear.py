@@ -23,8 +23,12 @@ def linear(
     """``y = x @ weight.T + bias`` then optional activation.
 
     ``weight`` is ``(out_features, in_features)`` matching ``torch.nn.Linear``.
+    Materialises ``weight.T`` so the GEMM's last-dim-contiguous requirement
+    is met — for repeated calls with the same weight, pass a pre-transposed
+    tensor directly to ``quack.amd.gemm.gemm`` to skip the copy.
     """
-    return gemm(x, weight.transpose(-1, -2), bias=bias, activation=activation)
+    w_t = weight.transpose(-1, -2).contiguous()
+    return gemm(x, w_t, bias=bias, activation=activation)
 
 
 __all__ = ["linear"]

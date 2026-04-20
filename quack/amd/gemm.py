@@ -59,6 +59,10 @@ def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
         return False
     if A.dim() != 2 or B.dim() != 2:
         return False
+    # Kernel requires both inputs' last-dim stride to be 1. Callers that
+    # pass transposed tensors (e.g. linear(x, w.T)) need to materialise.
+    if A.stride(-1) != 1 or B.stride(-1) != 1:
+        return False
     M, K = A.shape
     K2, N = B.shape
     if K != K2 or M % 16 or N % 16 or K % 16:
@@ -67,7 +71,7 @@ def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
         return False
     if out_dtype not in _MFMA_SUPPORTED_OUT_DTYPES:
         return False
-    if C is not None and (C.shape != (M, N) or C.dtype != torch.float32):
+    if C is not None and (C.shape != (M, N) or C.dtype != torch.float32 or C.stride(-1) != 1):
         return False
     if beta != 0.0 and C is None:
         return False
