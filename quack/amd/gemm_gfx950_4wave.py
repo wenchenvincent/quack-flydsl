@@ -85,11 +85,19 @@ def _build_gemm_64x64_4wave(*, M, N, K, dtype_str, arch):
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
         in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
+        ca_h4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), in_elem_type)
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        h4_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h4_lay = fx.make_layout(4, 1)
         reg_lay = fx.make_layout(1, 1)
+
+        def _load_h4(div_vec, vec_idx):
+            r = fx.memref_alloca(h4_reg_ty, h4_lay)
+            fx.copy_atom_call(ca_h4, fx.slice(div_vec, (None, vec_idx)), r)
+            return fx.memref_load_vec(r)
 
         def _load_h(div, idx):
             r = fx.memref_alloca(h_reg_ty, reg_lay)
@@ -127,22 +135,21 @@ def _build_gemm_64x64_4wave(*, M, N, K, dtype_str, arch):
         acc10 = _zero_acc()
         acc11 = _zero_acc()
 
+        # Vectorized A loads — precompute vec4-divided rows, per k-tile
+        # we just shift the vec index.
+        row_a_top = fx.slice(A_buf, (a_row_top, None))
+        row_a_bot = fx.slice(A_buf, (a_row_bot, None))
+        a_div_top_v = fx.logical_divide(row_a_top, h4_lay)
+        a_div_bot_v = fx.logical_divide(row_a_bot, h4_lay)
+
         k_tiles = K // _MFMA_K
         for k_tile in range_constexpr(k_tiles):
             k_tile_base = fx.Int32(k_tile * _MFMA_K)
-            lane_k_base = lane_k_group * fx.Int32(_FRAG_A) + k_tile_base
+            lane_k_base = lane_k_group * fx.Int32(_FRAG_B) + k_tile_base
+            vec_idx_A = lane_k_group + fx.Int32(k_tile * 4)
 
-            row_a_top = fx.slice(A_buf, (a_row_top, None))
-            row_a_bot = fx.slice(A_buf, (a_row_bot, None))
-            a_div_top = fx.logical_divide(row_a_top, fx.make_layout(1, 1))
-            a_div_bot = fx.logical_divide(row_a_bot, fx.make_layout(1, 1))
-            a_top_vals = []
-            a_bot_vals = []
-            for i in range_constexpr(_FRAG_A):
-                a_top_vals.append(_load_h(a_div_top, lane_k_base + fx.Int32(i)))
-                a_bot_vals.append(_load_h(a_div_bot, lane_k_base + fx.Int32(i)))
-            a_top = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_top_vals)
-            a_bot = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_bot_vals)
+            a_top = _load_h4(a_div_top_v, vec_idx_A)
+            a_bot = _load_h4(a_div_bot_v, vec_idx_A)
 
             b_left_vals = []
             b_right_vals = []

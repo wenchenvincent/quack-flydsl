@@ -89,15 +89,30 @@ def _build_gemm_32x32(*, M, N, K, dtype_str, arch):
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
         in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
-        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
+        # Vectorized 64-bit loads for the A/B MFMA fragments: each
+        # BufferCopy64b pulls in exactly the 4 f16/bf16 elements a lane
+        # needs per A-fragment, replacing four scalar BufferCopy16b
+        # issues. B-fragments can't be vectorized the same way because
+        # B rows (K dim) aren't contiguous in HBM — the 4 K values live
+        # on 4 different rows, so they still go through scalar loads.
+        ca_h4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), in_elem_type)
+        ca_h_scalar = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        h4_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h4_lay = fx.make_layout(4, 1)
         reg_lay = fx.make_layout(1, 1)
 
-        def _load_h(div, idx):
+        def _load_h4(div_vec, vec_idx):
+            """Load 4 consecutive f16/bf16 elements via buffer_load_b64."""
+            r = fx.memref_alloca(h4_reg_ty, h4_lay)
+            fx.copy_atom_call(ca_h4, fx.slice(div_vec, (None, vec_idx)), r)
+            return fx.memref_load_vec(r)
+
+        def _load_h_scalar(div, idx):
             r = fx.memref_alloca(h_reg_ty, reg_lay)
-            fx.copy_atom_call(ca_h, fx.slice(div, (None, idx)), r)
+            fx.copy_atom_call(ca_h_scalar, fx.slice(div, (None, idx)), r)
             return fx.memref_load_vec(r)[0].ir_value()
 
         def _store_f(div, idx, val):
@@ -132,31 +147,37 @@ def _build_gemm_32x32(*, M, N, K, dtype_str, arch):
         acc11 = _zero_acc()
 
         k_tiles = K // _MFMA_K
+
+        # Precompute vec4-divided row tensors once — per k-tile we only
+        # shift the vec index.
+        row_a_top = fx.slice(A_buf, (a_row_top, None))
+        row_a_bot = fx.slice(A_buf, (a_row_bot, None))
+        a_div_top_v = fx.logical_divide(row_a_top, h4_lay)
+        a_div_bot_v = fx.logical_divide(row_a_bot, h4_lay)
+
         for k_tile in range_constexpr(k_tiles):
-            k_tile_base = fx.Int32(k_tile * _MFMA_K)
-            lane_k_base = lane_k_group * fx.Int32(_FRAG_A) + k_tile_base
+            # vec4 K-index for this lane: lane_k_group ∈ [0,4), plus k_tile*4.
+            vec_idx_A = lane_k_group + fx.Int32(k_tile * 4)
 
-            # --- A fragments (top, bot row halves) ---
-            row_a_top = fx.slice(A_buf, (a_row_top, None))
-            row_a_bot = fx.slice(A_buf, (a_row_bot, None))
-            a_div_top = fx.logical_divide(row_a_top, fx.make_layout(1, 1))
-            a_div_bot = fx.logical_divide(row_a_bot, fx.make_layout(1, 1))
-            a_top_vals = []
-            a_bot_vals = []
-            for i in range_constexpr(_FRAG_A):
-                a_top_vals.append(_load_h(a_div_top, lane_k_base + fx.Int32(i)))
-                a_bot_vals.append(_load_h(a_div_bot, lane_k_base + fx.Int32(i)))
-            a_top = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_top_vals)
-            a_bot = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_bot_vals)
+            # A fragments: one BufferCopy64b per fragment, 4 elements each.
+            a_top = _load_h4(a_div_top_v, vec_idx_A)
+            a_bot = _load_h4(a_div_bot_v, vec_idx_A)
 
-            # --- B fragments (left, right col halves) ---
+            # B: per-k-row slice. B[lane_k_base + i, b_col] for i ∈ [0,4).
+            # Each of the 4 K-rows is a separate row of B, so we still do
+            # 4 scalar loads per B fragment — the Ks aren't contiguous in
+            # HBM. (B in (K, N) layout: each K row-stride apart.) Issue
+            # them as 4 × BufferCopy16b but load 2 columns from each row
+            # per call via... actually B rows are the unit; keep scalar.
+            k_tile_base_i32 = fx.Int32(k_tile * _MFMA_K)
+            lane_k_base = lane_k_group * fx.Int32(_FRAG_B) + k_tile_base_i32
             b_left_vals = []
             b_right_vals = []
             for i in range_constexpr(_FRAG_B):
                 row_b_k = fx.slice(B_buf, (lane_k_base + fx.Int32(i), None))
-                b_div = fx.logical_divide(row_b_k, fx.make_layout(1, 1))
-                b_left_vals.append(_load_h(b_div, b_col_left))
-                b_right_vals.append(_load_h(b_div, b_col_right))
+                b_div = fx.logical_divide(row_b_k, reg_lay)
+                b_left_vals.append(_load_h_scalar(b_div, b_col_left))
+                b_right_vals.append(_load_h_scalar(b_div, b_col_right))
             b_left = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_left_vals)
             b_right = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_right_vals)
 

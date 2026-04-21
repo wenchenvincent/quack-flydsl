@@ -134,13 +134,22 @@ def _build_gemm_16x16(
             else T.bf16
         )
         out_bufcopy = fx.rocdl.BufferCopy32b() if out_dtype_str == "f32" else fx.rocdl.BufferCopy16b()
+        ca_h4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), in_elem_type)
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
         ca_out = fx.make_copy_atom(out_bufcopy, out_elem_type)
+        h4_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         out_reg_ty = fx.MemRefType.get(out_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h4_lay = fx.make_layout(4, 1)
         reg_lay = fx.make_layout(1, 1)
+
+        def _load_h4(div_vec, vec_idx):
+            """BufferCopy64b: 4 contiguous f16/bf16 in one HBM instruction."""
+            r = fx.memref_alloca(h4_reg_ty, h4_lay)
+            fx.copy_atom_call(ca_h4, fx.slice(div_vec, (None, vec_idx)), r)
+            return fx.memref_load_vec(r)
 
         def _load_h_scalar(div, idx):
             r = fx.memref_alloca(h_reg_ty, reg_lay)
@@ -181,20 +190,19 @@ def _build_gemm_16x16(
         acc = vector.from_elements(acc_ty, _zero_list)
 
         # Iterate over K tiles (each tile = 16 K elements → one MFMA call).
+        # A fragment (f16x4 contiguous along K): vectorized BufferCopy64b.
+        row_a = fx.slice(A_buf, (a_row, None))
+        a_div_v = fx.logical_divide(row_a, h4_lay)
+
         k_tiles = K // _MFMA_K
         for k_tile in range_constexpr(k_tiles):
             k_tile_base = fx.Int32(k_tile * _MFMA_K)
             # This lane's K offset within the tile: group 0 → 0..3, group 1 → 4..7, ...
             lane_k_base = lane_k_group * fx.Int32(_FRAG_A) + k_tile_base
+            # vec4-unit index for the A fragment.
+            vec_idx_A = lane_k_group + fx.Int32(k_tile * 4)
 
-            # Load this lane's A fragment (f16x4): A[a_row, lane_k_base + 0..3]
-            # A is row-major (M, K); row_a is the bid_m*16 + lane_row-th row of A.
-            row_a = fx.slice(A_buf, (a_row, None))
-            a_div = fx.logical_divide(row_a, fx.make_layout(1, 1))
-            a_vals = []
-            for i in range_constexpr(_FRAG_A):
-                a_vals.append(_load_h_scalar(a_div, lane_k_base + fx.Int32(i)))
-            a_frag = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_vals)
+            a_frag = _load_h4(a_div_v, vec_idx_A)
 
             # Load this lane's B fragment (f16x4): B[lane_k_base + 0..3, b_col]
             # B is row-major (K, N); we pick one row per k and the b_col-th column.

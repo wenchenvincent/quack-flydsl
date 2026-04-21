@@ -110,15 +110,23 @@ def _build_gated_16x16(*, M, N, K, dtype_str, out_dtype_str, gate_type, arch):
             else T.bf16
         )
         out_bufcopy = fx.rocdl.BufferCopy32b() if out_dtype_str == "f32" else fx.rocdl.BufferCopy16b()
+        ca_h4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), in_elem_type)
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_out = fx.make_copy_atom(out_bufcopy, out_elem_type)
+        h4_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         out_reg_ty = fx.MemRefType.get(out_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h4_lay = fx.make_layout(4, 1)
         reg_lay = fx.make_layout(1, 1)
 
         A_buf = fx.rocdl.make_buffer_tensor(A)
         B_buf = fx.rocdl.make_buffer_tensor(B)
         C_buf = fx.rocdl.make_buffer_tensor(C)
+
+        def _load_h4(div_vec, vec_idx):
+            r = fx.memref_alloca(h4_reg_ty, h4_lay)
+            fx.copy_atom_call(ca_h4, fx.slice(div_vec, (None, vec_idx)), r)
+            return fx.memref_load_vec(r)
 
         def _load_h(div, idx):
             r = fx.memref_alloca(h_reg_ty, reg_lay)
@@ -153,19 +161,19 @@ def _build_gated_16x16(*, M, N, K, dtype_str, out_dtype_str, gate_type, arch):
         up_col = h_base + lane_row + fx.Int32(H)  # B col for up half
         a_row = m_base + lane_row
 
+        # A row is shared across the whole K loop — precompute vec4 divide.
+        row_a = fx.slice(A_buf, (a_row, None))
+        a_div_v = fx.logical_divide(row_a, h4_lay)
+
         # K-tile loop: compute gate and up accumulators in parallel.
         k_tiles = K // _MFMA_K
         for k_tile in range_constexpr(k_tiles):
             k_tile_base = fx.Int32(k_tile * _MFMA_K)
             lane_k_base = lane_k_group * fx.Int32(_FRAG_C) + k_tile_base
+            vec_idx_A = lane_k_group + fx.Int32(k_tile * 4)
 
-            # A fragment (shared by gate and up — same rows).
-            row_a = fx.slice(A_buf, (a_row, None))
-            a_div = fx.logical_divide(row_a, fx.make_layout(1, 1))
-            a_vals = []
-            for i in range_constexpr(_FRAG_C):
-                a_vals.append(_load_h(a_div, lane_k_base + fx.Int32(i)))
-            a_frag = vector.from_elements(T.vec(_FRAG_C, in_elem_type), a_vals)
+            # A fragment (shared by gate and up): one BufferCopy64b.
+            a_frag = _load_h4(a_div_v, vec_idx_A)
 
             # B fragments for gate and up halves.
             b_gate_vals = []

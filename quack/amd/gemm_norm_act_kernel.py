@@ -101,16 +101,24 @@ def _build_gemm_norm_act_f16(
         in_elem_type = T.f16
         out_elem_type = {"f32": T.f32, "f16": T.f16, "bf16": T.bf16}[out_dtype_str]
 
+        ca_h4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), in_elem_type)
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
         ca_out = fx.make_copy_atom(
             fx.rocdl.BufferCopy32b() if out_dtype_str == "f32" else fx.rocdl.BufferCopy16b(),
             out_elem_type,
         )
+        h4_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         out_reg_ty = fx.MemRefType.get(out_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h4_lay = fx.make_layout(4, 1)
         reg_lay = fx.make_layout(1, 1)
+
+        def _load_h4(div_vec, vec_idx):
+            r = fx.memref_alloca(h4_reg_ty, h4_lay)
+            fx.copy_atom_call(ca_h4, fx.slice(div_vec, (None, vec_idx)), r)
+            return fx.memref_load_vec(r)
 
         def _load_h(div, idx):
             r = fx.memref_alloca(h_reg_ty, reg_lay)
@@ -145,17 +153,16 @@ def _build_gemm_norm_act_f16(
             _zero_list.append(arith.constant(0.0, type=T.f32))
         acc = vector.from_elements(acc_ty, _zero_list)
 
+        row_a = fx.slice(A_buf, (a_row, None))
+        a_div_v = fx.logical_divide(row_a, h4_lay)
+
         k_tiles = K // _MFMA_K
         for k_tile in range_constexpr(k_tiles):
             k_tile_base = fx.Int32(k_tile * _MFMA_K)
             lane_k_base = lane_k_group * fx.Int32(_FRAG_A) + k_tile_base
+            vec_idx_A = lane_k_group + fx.Int32(k_tile * 4)
 
-            row_a = fx.slice(A_buf, (a_row, None))
-            a_div = fx.logical_divide(row_a, fx.make_layout(1, 1))
-            a_vals = []
-            for i in range_constexpr(_FRAG_A):
-                a_vals.append(_load_h(a_div, lane_k_base + fx.Int32(i)))
-            a_frag = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_vals)
+            a_frag = _load_h4(a_div_v, vec_idx_A)
 
             b_vals = []
             for i in range_constexpr(_FRAG_B):

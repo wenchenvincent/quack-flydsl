@@ -114,11 +114,19 @@ def _build_gemm_32x32_lds(*, M, N, K, dtype_str, arch):
         for sp in (*s_a, *s_b):
             sp.get()
 
+        ca_h4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), in_elem_type)
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        h4_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
         h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h4_lay = fx.make_layout(4, 1)
         reg_lay = fx.make_layout(1, 1)
+
+        def _load_h4_global(div_vec, vec_idx):
+            r = fx.memref_alloca(h4_reg_ty, h4_lay)
+            fx.copy_atom_call(ca_h4, fx.slice(div_vec, (None, vec_idx)), r)
+            return fx.memref_load_vec(r)
 
         def _load_h_global(div, idx):
             r = fx.memref_alloca(h_reg_ty, reg_lay)
@@ -149,26 +157,30 @@ def _build_gemm_32x32_lds(*, M, N, K, dtype_str, arch):
             Each of 64 lanes carries 4 A values (top row-half) + 4 A
             (bot) + 4 B (left col-half) + 4 B (right). 64×16 = 1024
             f16 per tile (A and B separately).
+
+            A loads use BufferCopy64b (4 contiguous K elements per
+            fragment → 1 HBM instruction per fragment). B stays scalar
+            because B's 4 K elements come from different rows.
             """
             k_tile_base = fx.Int32(k_tile_scalar * _MFMA_K)
             lane_k_base = lane_k_group * fx.Int32(_FRAG_A) + k_tile_base
+            vec_idx_A = lane_k_group + fx.Int32(k_tile_scalar * 4)
 
-            # A top half: rows 0..15 of 32×16 LDS tile.
+            # A top+bot halves: one vec4 HBM load per 4 LDS stores.
             row_a_top = fx.slice(A_buf, (a_row_top, None))
             row_a_bot = fx.slice(A_buf, (a_row_bot, None))
-            a_div_top = fx.logical_divide(row_a_top, fx.make_layout(1, 1))
-            a_div_bot = fx.logical_divide(row_a_bot, fx.make_layout(1, 1))
+            a_div_top_v = fx.logical_divide(row_a_top, h4_lay)
+            a_div_bot_v = fx.logical_divide(row_a_bot, h4_lay)
+            a_top_vec = _load_h4_global(a_div_top_v, vec_idx_A)
+            a_bot_vec = _load_h4_global(a_div_bot_v, vec_idx_A)
             for i in range_constexpr(_FRAG_A):
-                v = _load_h_global(a_div_top, lane_k_base + fx.Int32(i))
                 s_a[stage].store(
-                    v,
+                    a_top_vec[i].ir_value(),
                     [_idx(lane_row),
                      _idx(lane_k_group * fx.Int32(_FRAG_A) + fx.Int32(i))],
                 )
-            for i in range_constexpr(_FRAG_A):
-                v = _load_h_global(a_div_bot, lane_k_base + fx.Int32(i))
                 s_a[stage].store(
-                    v,
+                    a_bot_vec[i].ir_value(),
                     [_idx(fx.Int32(16) + lane_row),
                      _idx(lane_k_group * fx.Int32(_FRAG_A) + fx.Int32(i))],
                 )
