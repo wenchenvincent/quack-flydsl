@@ -67,6 +67,9 @@ KERNEL_REGISTRY = {
     "128x128_ldma": lambda: _lazy_import(
         "quack.amd.gemm_gfx950_128x128_ldma", "gemm_128x128_ldma"
     ),
+    "128x128_k32_ldma": lambda: _lazy_import(
+        "quack.amd.gemm_gfx950_128x128_k32_ldma", "gemm_128x128_k32_ldma"
+    ),
 }
 
 
@@ -154,7 +157,31 @@ class TuneEntry:
 #   4096²    412             340    1.21× faster   ← finally closes some of HBM gap
 # LDMA wins everywhere 128x128 runs; replaces the K=16 128x128 entry
 # for 4096² since it strictly dominates there.
+#
+# 2026-04-21 K=32 + LDMA (``128x128_k32_ldma``): combines K=32 MFMA's
+# 2× per-op throughput with LDMA's skipped register roundtrip. DMA
+# thread mapping is rearranged so that lane L in each wave writes LDS
+# byte L*16 (matching buffer_load_lds auto-indexing), independent of
+# the MFMA fragment layout. Composes strongly on both wins:
+#   shape    k16   k32    ldma   k32_ldma   best
+#   1024²    37    29     30     28.7       k32_ldma
+#   2048²    104   66     83     56         k32_ldma  (1.86× vs k16)
+#   4096²    328   371    276    228        k32_ldma  (1.44× vs k16, 1.21× vs ldma)
+# Wins at every K÷32 shape; replaces k32 and ldma entries for those.
 _TUNED_TABLE: List[TuneEntry] = [
+    TuneEntry(
+        predicate=lambda M, N, K, dt: (
+            dt in (torch.float16, torch.bfloat16)
+            and M >= 1024 and N >= 1024
+            and M % 128 == 0 and N % 128 == 0 and K % 32 == 0
+        ),
+        kernel="128x128_k32_ldma",
+        notes=(
+            "Medium-plus shapes (≥ 1024² with K÷32): K=32 MFMA + HBM→LDS DMA "
+            "composes both per-op throughput and wait-counter wins; 1.44× vs "
+            "K=16 baseline, 1.21× vs LDMA alone at 4096² on MI355X."
+        ),
+    ),
     TuneEntry(
         predicate=lambda M, N, K, dt: (
             dt in (torch.float16, torch.bfloat16)
@@ -163,8 +190,8 @@ _TUNED_TABLE: List[TuneEntry] = [
         ),
         kernel="128x128_ldma",
         notes=(
-            "Very large shapes (≥ 4096²): 128×128 with direct HBM→LDS DMA; "
-            "1.21× vs the scalar-stage 128×128, 2.14× vs lds_pp at 4096²."
+            "Very large shapes (≥ 4096², K÷16 but not ÷32): 128×128 with "
+            "direct HBM→LDS DMA; 1.21× vs the scalar-stage 128×128."
         ),
     ),
     TuneEntry(

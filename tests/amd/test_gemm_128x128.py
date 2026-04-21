@@ -41,11 +41,12 @@ def test_autotune_picks_128x128_for_huge():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     from quack.amd.gemm_autotune import select_best_kernel
-    # ≥ 4096² → 128x128_ldma (direct HBM→LDS DMA; 1.21× vs scalar-stage baseline).
-    assert select_best_kernel(4096, 4096, 4096, torch.float16, plain=True) == "128x128_ldma"
-    assert select_best_kernel(8192, 8192, 4096, torch.bfloat16, plain=True) == "128x128_ldma"
-    # 1024-3999² → K=32 MFMA variant (1.2-1.5× win over K=16).
-    assert select_best_kernel(2048, 2048, 2048, torch.float16, plain=True) == "128x128_k32"
-    assert select_best_kernel(1024, 1024, 1024, torch.bfloat16, plain=True) == "128x128_k32"
-    # K not divisible by 32 → fall back to 64×64 lds_pp (still wins over non-LDS).
+    # ≥ 1024² with K÷32 → K=32 + LDMA combo (strictly dominates others at these sizes).
+    assert select_best_kernel(4096, 4096, 4096, torch.float16, plain=True) == "128x128_k32_ldma"
+    assert select_best_kernel(8192, 8192, 4096, torch.bfloat16, plain=True) == "128x128_k32_ldma"
+    assert select_best_kernel(2048, 2048, 2048, torch.float16, plain=True) == "128x128_k32_ldma"
+    assert select_best_kernel(1024, 1024, 1024, torch.bfloat16, plain=True) == "128x128_k32_ldma"
+    # ≥ 4096² with K÷16 but not ÷32 → LDMA alone (K=32 unavailable).
+    assert select_best_kernel(4096, 4096, 4080, torch.float16, plain=True) == "128x128_ldma"
+    # K not divisible by 16 → fall back to 64×64 lds_pp.
     assert select_best_kernel(2048, 2048, 2064, torch.float16, plain=True) == "4wave_64x64_lds_pp"

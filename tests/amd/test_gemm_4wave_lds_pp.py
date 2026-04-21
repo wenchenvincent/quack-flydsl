@@ -41,15 +41,15 @@ def test_autotune_picks_lds_pp_for_large():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     from quack.amd.gemm_autotune import select_best_kernel
-    # 2048² with K ÷ 32 now routes to 128x128_k32 (see test_gemm_128x128_k32).
+    # ≥ 1024² with K÷32 now routes to 128x128_k32_ldma (K=32 MFMA + direct DMA).
     # lds_pp still wins when K is divisible by 16 but not 32.
-    assert select_best_kernel(2048, 2048, 1024, torch.float16, plain=True) == "128x128_k32"
+    assert select_best_kernel(2048, 2048, 1024, torch.float16, plain=True) == "128x128_k32_ldma"
     assert select_best_kernel(2048, 2048, 1040, torch.float16, plain=True) == "4wave_64x64_lds_pp"
-    # 4096² and up use the direct-DMA 128x128 kernel (HBM-bound regime).
-    assert select_best_kernel(4096, 4096, 4096, torch.bfloat16, plain=True) == "128x128_ldma"
-    # 1024² uses 128x128_k32 when K ÷ 32 (wins over 4wave at this size too).
-    assert select_best_kernel(1024, 1024, 1024, torch.float16, plain=True) == "128x128_k32"
-    # 1024² with K not ÷ 128 for 128x128 → 4wave_64x64.
-    assert select_best_kernel(1024, 1024, 64, torch.float16, plain=True) == "128x128_k32"
-    # Non-128 M/N → non-128 tile.
+    # 4096²+ K÷32 → combo. K÷16 but not ÷32 → LDMA alone.
+    assert select_best_kernel(4096, 4096, 4096, torch.bfloat16, plain=True) == "128x128_k32_ldma"
+    assert select_best_kernel(4096, 4096, 4080, torch.float16, plain=True) == "128x128_ldma"
+    # 1024² K÷32 → combo wins.
+    assert select_best_kernel(1024, 1024, 1024, torch.float16, plain=True) == "128x128_k32_ldma"
+    assert select_best_kernel(1024, 1024, 64, torch.float16, plain=True) == "128x128_k32_ldma"
+    # Non-128 M/N → non-128 tile (4wave variants).
     assert select_best_kernel(1024, 1024, 16, torch.float16, plain=True) == "4wave_64x64"
