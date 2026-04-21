@@ -79,6 +79,37 @@ def _arch_supports_mfma():
     return arch in ("gfx942", "gfx950")
 
 
+def _pick_fast_path(A, B, bias, activation, alpha, beta, C, out_dtype):
+    """Pick the widest-tile f16 kernel that fits the shape via the
+    autotune selector.
+
+    Only triggers for plain ``A @ B`` calls (no bias/act/alpha/beta/C)
+    in f16 with f32 output — the epilogue-capable 16×16 path handles
+    everything else. Delegates to ``quack.amd.gemm_autotune`` which
+    consults any tuned-shape table, falling back to a "widest aligned
+    tile wins" heuristic.
+
+    Returns the output tensor or ``None`` if no fast path applies.
+    """
+    if A.dtype != torch.float16 or B.dtype != torch.float16:
+        return None
+    if out_dtype != torch.float32:
+        return None
+    if bias is not None or activation is not None:
+        return None
+    if alpha != 1.0 or beta != 0.0 or C is not None:
+        return None
+    if not _arch_supports_mfma():
+        return None
+    M, K = A.shape
+    _, N = B.shape
+    from quack.amd.gemm_autotune import select_best_kernel, get_kernel
+    kernel_name = select_best_kernel(M, N, K, A.dtype, plain=True)
+    if kernel_name is None or kernel_name == "mfma_16x16":
+        return None
+    return get_kernel(kernel_name)(A, B)
+
+
 def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
     """Can the FlyDSL MFMA kernel handle this call?
 
@@ -162,6 +193,12 @@ def gemm(
     # Default output dtype: match input (torch.matmul convention), not f32.
     effective_out_dtype = out_dtype or A.dtype
     if _mfma_eligible(A, B, bias, activation, alpha, beta, C, effective_out_dtype):
+        # Fast path: if the call has no epilogue (alpha=1, beta=0, bias=None,
+        # activation=None, C=None) and inputs are f16, pick the widest
+        # tile the shape allows from the larger-tile MFMA variants.
+        picked = _pick_fast_path(A, B, bias, activation, alpha, beta, C, effective_out_dtype)
+        if picked is not None:
+            return picked
         gemm_mfma = _arch_dispatch_mfma()
         _bias = bias
         if _bias is not None and _bias.dtype != torch.float32:
