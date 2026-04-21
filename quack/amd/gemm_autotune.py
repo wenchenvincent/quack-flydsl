@@ -76,13 +76,29 @@ class TuneEntry:
 # consulted in order; first match wins. Keep predicates precise (hit
 # only the shape they were measured on) to avoid regressing untested
 # shapes.
+#
+# Empirical sweep on MI355X / gfx950, 2026-04-21 (f16 inputs):
+#   M, N, K        hipblaslt   tiled_32   lds_32    lds_swz   4wave_64
+#   256, 256, 256  26 μs       24 μs ⬅   70 μs     74 μs     77 μs     (tiled wins 3×)
+#   512, 512, 512  28 μs       76 μs     73 μs     78 μs     64 μs ⬅  (4wave wins)
+#   1024²          24 μs       76 μs     135 μs    135 μs    71 μs ⬅  (4wave wins)
+#   2048²          26 μs       481 μs    515 μs    515 μs    482 μs    (≈tie)
+# The heuristic's "widest-tile wins" rule mis-picks at 256² by ~3×;
+# tiled_32x32 is the right call for small shapes. Above 512, 4wave
+# takes over.  Below is the override table keyed on that cut.
 _TUNED_TABLE: List[TuneEntry] = [
-    # Example (commented) — uncomment + tune after benchmarking:
-    # TuneEntry(
-    #     predicate=lambda M, N, K, dt: (M, N, K) == (4096, 4096, 4096) and dt == torch.float16,
-    #     kernel="4wave_64x64",
-    #     notes="profiled 2026-04-22: 1.4× vs lds_swz on H200-equivalent AMD shape",
-    # ),
+    TuneEntry(
+        predicate=lambda M, N, K, dt: (
+            dt in (torch.float16, torch.bfloat16)
+            and M <= 384 and N <= 384
+            and M % 32 == 0 and N % 32 == 0 and K % 16 == 0
+        ),
+        kernel="tiled_32x32",
+        notes=(
+            "Small shapes: LDS/wave overhead dominates on 64×64 tile — "
+            "tiled_32x32 in-register wins ~3× at 256² on MI355X."
+        ),
+    ),
 ]
 
 
