@@ -325,6 +325,26 @@ def _act_bwd(preact: Tensor, activation: Optional[str]) -> Tensor:
     raise NotImplementedError(f"activation={activation!r}")
 
 
+def _gemm_dact_fused_eligible(A, B, PreAct, activation):
+    if A.dtype != torch.float16 or B.dtype != torch.float16:
+        return False
+    if A.dim() != 2 or B.dim() != 2 or PreAct.dim() != 2:
+        return False
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2 or M % 16 or N % 16 or K % 16:
+        return False
+    if PreAct.shape != (M, N) or PreAct.stride(-1) != 1:
+        return False
+    if A.stride(-1) != 1 or B.stride(-1) != 1:
+        return False
+    if activation not in (None, "relu", "relu_sq", "silu", "gelu_tanh_approx"):
+        return False
+    if not _arch_supports_mfma():
+        return False
+    return True
+
+
 def gemm_dact(
     A: Tensor,
     B: Tensor,
@@ -337,12 +357,22 @@ def gemm_dact(
     """Activation-backward fused GEMM: returns ``(dx, postact)`` where
     ``dx = (A @ B) * activation'(PreAct)`` and ``postact = activation(PreAct)``.
 
-    MVP implementation composes the MFMA GEMM with torch-native
-    elementwise activation fwd/bwd. Fused FlyDSL epilogue is a follow-up
-    but keeps this API stable so downstream callers land first.
+    Dispatches to the fused FlyDSL kernel
+    (``quack.amd.gemm_dact_kernel.gemm_dact_fused``) when eligible —
+    the activation-fwd/bwd is computed in the MFMA epilogue from the
+    per-lane accumulator, saving the HBM round-trip through a
+    transient f32 buffer. Falls back to a torch-composed path
+    otherwise (non-f16 inputs, unsupported shapes).
     """
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
+    if _gemm_dact_fused_eligible(A, B, PreAct, activation):
+        from quack.amd.gemm_dact_kernel import gemm_dact_fused
+        return gemm_dact_fused(
+            A, B, PreAct, activation=activation,
+            out_dtype=out_dtype, postact_dtype=postact_dtype,
+        )
+    # Torch fallback.
     dout = gemm(A, B, out_dtype=torch.float32)
     act_prime = _act_bwd(PreAct, activation)
     dx = (dout * act_prime.float()).to(out_dtype)
@@ -386,6 +416,26 @@ _GATED_BWD_FNS = {
 }
 
 
+def _gemm_dgated_fused_eligible(A, B, PreAct, gate_type):
+    if A.dtype != torch.float16 or B.dtype != torch.float16:
+        return False
+    if A.dim() != 2 or B.dim() != 2 or PreAct.dim() != 2:
+        return False
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2 or M % 16 or N % 16 or K % 16:
+        return False
+    if PreAct.shape != (M, 2 * N) or PreAct.stride(-1) != 1:
+        return False
+    if A.stride(-1) != 1 or B.stride(-1) != 1:
+        return False
+    if gate_type not in ("swiglu", "reglu", "geglu", "glu"):
+        return False
+    if not _arch_supports_mfma():
+        return False
+    return True
+
+
 def gemm_dgated(
     A: Tensor,
     B: Tensor,
@@ -401,9 +451,20 @@ def gemm_dgated(
     axis (matching NVIDIA QuACK's convention). Returns ``(dx, postact)``
     where ``dx`` is ``(M, 2N)`` interleaved ``(dgate, dup)`` and
     ``postact`` is ``(M, N)`` forward output.
+
+    Dispatches to the fused FlyDSL kernel
+    (``quack.amd.gemm_dgated_kernel.gemm_dgated_fused``) when eligible
+    — the gate fwd/bwd happens in the MFMA epilogue per-lane. Falls
+    back to torch autograd composition otherwise.
     """
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
+    if _gemm_dgated_fused_eligible(A, B, PreAct, gate_type):
+        from quack.amd.gemm_dgated_kernel import gemm_dgated_fused
+        return gemm_dgated_fused(
+            A, B, PreAct, gate_type=gate_type,
+            out_dtype=out_dtype, postact_dtype=postact_dtype,
+        )
     dout = gemm(A, B, out_dtype=torch.float32)
     gate = PreAct[..., ::2].float()
     up = PreAct[..., 1::2].float()
@@ -433,6 +494,34 @@ def gemm_dgated(
     return dx.to(out_dtype), postact.to(postact_dtype)
 
 
+def _gemm_norm_act_fused_eligible(A, B, colvec, rowvec, bias, C, alpha, beta, activation):
+    if A.dtype != torch.float16 or B.dtype != torch.float16:
+        return False
+    if A.dim() != 2 or B.dim() != 2:
+        return False
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2 or M % 16 or N % 16 or K % 16:
+        return False
+    if A.stride(-1) != 1 or B.stride(-1) != 1:
+        return False
+    # Fused kernel doesn't yet handle alpha != 1 / beta*C — those stay on
+    # the torch path. Bias (N,) and colvec (M,), rowvec (N,) are supported.
+    if alpha != 1.0 or beta != 0.0 or C is not None:
+        return False
+    if activation not in (None, "relu", "relu_sq", "silu", "gelu_tanh_approx"):
+        return False
+    if bias is not None and (bias.dim() != 1 or bias.size(0) != N):
+        return False
+    if colvec is not None and (colvec.dim() != 1 or colvec.size(0) != M):
+        return False
+    if rowvec is not None and (rowvec.dim() != 1 or rowvec.size(0) != N):
+        return False
+    if not _arch_supports_mfma():
+        return False
+    return True
+
+
 def gemm_norm_act(
     A: Tensor,
     B: Tensor,
@@ -452,10 +541,19 @@ def gemm_norm_act(
     norm); ``rowvec`` is a per-column (N,) scale (typically a learned
     weight). Matches QuACK's ``gemm_norm_act`` surface.
 
-    MVP composes the MFMA GEMM with torch-native elementwise scaling —
-    full FlyDSL epilogue fusion is a follow-up.
+    Routes through the fused FlyDSL kernel (``gemm_norm_act_kernel``)
+    when eligible — bias / colvec / rowvec / activation all fold into
+    the MFMA epilogue register before the output store. Falls back to
+    torch-composed path for alpha/beta/C calls which the fused kernel
+    doesn't yet support.
     """
     out_dtype = out_dtype or A.dtype
+    if _gemm_norm_act_fused_eligible(A, B, colvec, rowvec, bias, C, alpha, beta, activation):
+        from quack.amd.gemm_norm_act_kernel import gemm_norm_act_fused
+        return gemm_norm_act_fused(
+            A, B, colvec=colvec, rowvec=rowvec,
+            bias=bias, activation=activation, out_dtype=out_dtype,
+        )
     # Compute GEMM + bias + alpha/beta/C in f32 for numerical headroom
     # before the row/col scaling.
     d = gemm(A, B, bias=bias, alpha=alpha, beta=beta, C=C, out_dtype=torch.float32)
