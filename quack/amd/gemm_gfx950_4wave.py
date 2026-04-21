@@ -1,0 +1,241 @@
+# Copyright (c) 2026, AMD.
+
+"""4-wave 64×64 MFMA GEMM for gfx950.
+
+256-thread workgroup (4 waves × 64 lanes) covering a 64×64 output
+tile via a 2×2 wave grid. Each wave handles an independent 32×32
+sub-tile with the same 2×2 MFMA fragment-reuse pattern as
+``gemm_gfx950_tiled.py``.
+
+Wave mapping:
+    wave_id  = tid // 64   ∈ [0, 4)
+    wave_row = wave_id // 2 ∈ [0, 2)   — covers rows [wave_row*32, +32)
+    wave_col = wave_id % 2  ∈ [0, 2)   — covers cols [wave_col*32, +32)
+
+Per wave: 4 MFMA accumulators (acc00, acc01, acc10, acc11), each f32x4
+per lane; 2 A fragments (top, bot row halves) and 2 B fragments
+(left, right col halves) loaded fresh per k-tile, with in-register
+reuse across the 4 MFMAs.
+
+Key perf difference vs the single-wave 32×32:
+  - 4× output work per workgroup launch (amortises scheduling overhead).
+  - 4× parallel MFMA dispatch per cycle (modulo wave scheduler).
+  - Same per-lane HBM load profile — no cross-wave LDS sharing yet.
+
+Scope (MVP):
+  - f16 × f16 → f32.
+  - M, N multiples of 64, K multiple of 16.
+  - No LDS staging (single-wave version already has it; cross-wave
+    sharing is a follow-up).
+
+A cross-wave LDS-shared variant (with 128×128 tile via 4×4 MFMA grid
+per wave) is the next step once this infrastructure is in place.
+"""
+
+from typing import Optional
+
+import torch
+from torch import Tensor
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, range_constexpr, vector
+from flydsl.expr.arith import ArithValue
+from flydsl.expr.numeric import Float32
+from flydsl.expr.typing import T
+from flydsl.utils.smem_allocator import SmemAllocator
+from flydsl._mlir import ir
+
+from quack.amd.flydsl_utils import get_rocm_arch
+
+
+_MFMA_M = 16
+_MFMA_N = 16
+_MFMA_K = 16
+_FRAG_A = 4
+_FRAG_B = 4
+_FRAG_C = 4
+
+
+def _build_gemm_64x64_4wave_f16(*, M, N, K, arch):
+    assert M % 64 == 0 and N % 64 == 0 and K % _MFMA_K == 0
+
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=f"quack_amd_gemm_64x64_4wave_f16_{M}_{N}_{K}_smem",
+    )
+
+    @flyc.kernel
+    def kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
+        bid_m = fx.block_idx.x
+        bid_n = fx.block_idx.y
+        tid = fx.thread_idx.x
+
+        wave_id = tid // fx.Int32(64)
+        lane_in_wave = tid % fx.Int32(64)
+        lane_row = lane_in_wave % fx.Int32(16)
+        lane_k_group = lane_in_wave // fx.Int32(16)
+
+        # Wave grid: 2x2 inside a 64x64 tile; each wave covers a 32x32 sub-tile.
+        wave_row = wave_id // fx.Int32(2)
+        wave_col = wave_id % fx.Int32(2)
+
+        A_buf = fx.rocdl.make_buffer_tensor(A)
+        B_buf = fx.rocdl.make_buffer_tensor(B)
+        C_buf = fx.rocdl.make_buffer_tensor(C)
+
+        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
+        ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        h_reg_ty = fx.MemRefType.get(T.f16, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load_h(div, idx):
+            r = fx.memref_alloca(h_reg_ty, reg_lay)
+            fx.copy_atom_call(ca_h, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store_f(div, idx, val):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(f_reg_ty, reg_lay)
+            ts = _vfull(1, Float32(val), Float32)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca_f, r, fx.slice(div, (None, idx)))
+
+        # Output tile base for this wave's 32×32 sub-tile.
+        m_base_wg = bid_m * fx.Int32(64)
+        n_base_wg = bid_n * fx.Int32(64)
+        m_base = m_base_wg + wave_row * fx.Int32(32)
+        n_base = n_base_wg + wave_col * fx.Int32(32)
+
+        a_row_top = m_base + lane_row
+        a_row_bot = m_base + fx.Int32(16) + lane_row
+        b_col_left = n_base + lane_row
+        b_col_right = n_base + fx.Int32(16) + lane_row
+
+        acc_ty = T.vec(_FRAG_C, T.f32)
+
+        def _zero_acc():
+            zs = []
+            for _ in range_constexpr(_FRAG_C):
+                zs.append(arith.constant(0.0, type=T.f32))
+            return vector.from_elements(acc_ty, zs)
+
+        acc00 = _zero_acc()
+        acc01 = _zero_acc()
+        acc10 = _zero_acc()
+        acc11 = _zero_acc()
+
+        k_tiles = K // _MFMA_K
+        for k_tile in range_constexpr(k_tiles):
+            k_tile_base = fx.Int32(k_tile * _MFMA_K)
+            lane_k_base = lane_k_group * fx.Int32(_FRAG_A) + k_tile_base
+
+            row_a_top = fx.slice(A_buf, (a_row_top, None))
+            row_a_bot = fx.slice(A_buf, (a_row_bot, None))
+            a_div_top = fx.logical_divide(row_a_top, fx.make_layout(1, 1))
+            a_div_bot = fx.logical_divide(row_a_bot, fx.make_layout(1, 1))
+            a_top_vals = []
+            a_bot_vals = []
+            for i in range_constexpr(_FRAG_A):
+                a_top_vals.append(_load_h(a_div_top, lane_k_base + fx.Int32(i)))
+                a_bot_vals.append(_load_h(a_div_bot, lane_k_base + fx.Int32(i)))
+            a_top = vector.from_elements(T.vec(_FRAG_A, T.f16), a_top_vals)
+            a_bot = vector.from_elements(T.vec(_FRAG_A, T.f16), a_bot_vals)
+
+            b_left_vals = []
+            b_right_vals = []
+            for i in range_constexpr(_FRAG_B):
+                row_b_k = fx.slice(B_buf, (lane_k_base + fx.Int32(i), None))
+                b_div = fx.logical_divide(row_b_k, fx.make_layout(1, 1))
+                b_left_vals.append(_load_h(b_div, b_col_left))
+                b_right_vals.append(_load_h(b_div, b_col_right))
+            b_left = vector.from_elements(T.vec(_FRAG_B, T.f16), b_left_vals)
+            b_right = vector.from_elements(T.vec(_FRAG_B, T.f16), b_right_vals)
+
+            acc00 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_top, b_left, acc00, 0, 0, 0])
+            acc01 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_top, b_right, acc01, 0, 0, 0])
+            acc10 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_bot, b_left, acc10, 0, 0, 0])
+            acc11 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_bot, b_right, acc11, 0, 0, 0])
+
+        def _store_subtile(acc, row_base, col_base):
+            for i in range_constexpr(_FRAG_C):
+                out_row = row_base + lane_k_group * fx.Int32(_FRAG_C) + fx.Int32(i)
+                out_col = col_base + lane_row
+                row_c = fx.slice(C_buf, (out_row, None))
+                c_div = fx.logical_divide(row_c, fx.make_layout(1, 1))
+                val_i = vector.extract(acc, static_position=[i], dynamic_position=[])
+                _store_f(c_div, out_col, val_i)
+
+        _store_subtile(acc00, m_base,                 n_base)
+        _store_subtile(acc01, m_base,                 n_base + fx.Int32(16))
+        _store_subtile(acc10, m_base + fx.Int32(16),  n_base)
+        _store_subtile(acc11, m_base + fx.Int32(16),  n_base + fx.Int32(16))
+
+    @flyc.jit
+    def launch(
+        A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        kernel(A, B, C).launch(
+            grid=(M // 64, N // 64, 1), block=(256, 1, 1), stream=stream,
+        )
+
+    return launch
+
+
+_kernel_cache: dict = {}
+
+
+def _compile(M, N, K, arch):
+    key = (M, N, K, arch)
+    got = _kernel_cache.get(key)
+    if got is None:
+        got = _build_gemm_64x64_4wave_f16(M=M, N=N, K=K, arch=arch)
+        _kernel_cache[key] = got
+    return got
+
+
+@torch.library.custom_op(
+    "quack_amd::_gemm_64x64_4wave_f16_out",
+    mutates_args=("out",),
+    schema="(Tensor a, Tensor b, Tensor(a0!) out) -> ()",
+)
+def _gemm_64x64_4wave_f16_out(a: Tensor, b: Tensor, out: Tensor) -> None:
+    assert a.is_cuda and b.is_cuda and out.is_cuda
+    assert a.dtype == torch.float16 and b.dtype == torch.float16
+    assert out.dtype == torch.float32
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2 and M % 64 == 0 and N % 64 == 0 and K % 16 == 0
+    assert out.shape == (M, N)
+    _compile(M, N, K, get_rocm_arch())(a, b, out)
+
+
+@_gemm_64x64_4wave_f16_out.register_fake
+def _gemm_64x64_4wave_f16_out_fake(a, b, out):
+    return None
+
+
+def gemm_f16_64x64_4wave(A: Tensor, B: Tensor) -> Tensor:
+    """4-wave 64×64-tile f16 × f16 → f32 MFMA GEMM.
+
+    256-thread workgroup (4 waves) covering a 64×64 output tile via
+    a 2×2 wave grid; each wave runs the 32×32 MFMA pattern on its own
+    sub-tile. Grid = ``(M/64, N/64, 1)``.
+    """
+    assert A.is_cuda and B.is_cuda
+    assert A.dtype == torch.float16 and B.dtype == torch.float16
+    M, K = A.shape
+    _, N = B.shape
+    out = torch.empty(M, N, device=A.device, dtype=torch.float32)
+    _gemm_64x64_4wave_f16_out(A, B, out)
+    return out
+
+
+__all__ = ["gemm_f16_64x64_4wave"]
