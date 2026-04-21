@@ -58,6 +58,9 @@ KERNEL_REGISTRY = {
     "4wave_64x64_lds_pp": lambda: _lazy_import(
         "quack.amd.gemm_gfx950_4wave_lds_pp", "gemm_64x64_4wave_lds_pp"
     ),
+    "128x128": lambda: _lazy_import(
+        "quack.amd.gemm_gfx950_128x128", "gemm_128x128"
+    ),
 }
 
 
@@ -115,7 +118,27 @@ class TuneEntry:
 # regression at mid-range vs single-stage). Below 2048² the barrier
 # cost still outweighs the HBM savings even with overlap — non-LDS
 # 4wave remains the default.
+# 2026-04-21 128×128 tile (``128x128``) measurements (μs, f16):
+#   shape    4wave    lds_pp    128x128   128_vs_pp
+#   1024²    31       37        57        0.64×  — 128 hurts (few WGs)
+#   2048²    165      108       108       0.99×  — tie
+#   4096²    1215     656       370       1.77×  — 128 wins big
+#
+# 128×128 needs enough workgroups in flight to hide its bigger per-WG
+# load cost — crossover near 4096² on MI355X (256 CUs).
 _TUNED_TABLE: List[TuneEntry] = [
+    TuneEntry(
+        predicate=lambda M, N, K, dt: (
+            dt in (torch.float16, torch.bfloat16)
+            and M >= 4096 and N >= 4096
+            and M % 128 == 0 and N % 128 == 0 and K % 16 == 0
+        ),
+        kernel="128x128",
+        notes=(
+            "Very large shapes (≥ 4096²): 128×128 tile amortises barrier "
+            "+ LDS overhead; 1.77× vs lds_pp at 4096² on MI355X."
+        ),
+    ),
     TuneEntry(
         predicate=lambda M, N, K, dt: (
             dt in (torch.float16, torch.bfloat16)
@@ -124,9 +147,8 @@ _TUNED_TABLE: List[TuneEntry] = [
         ),
         kernel="4wave_64x64_lds_pp",
         notes=(
-            "Large shapes (≥ 2048²): cooperative-LDS + ping-pong; HBM "
-            "savings dominate the barrier cost. 1.55-1.84× vs non-LDS "
-            "4wave on MI355X."
+            "Large shapes (2048-3999): cooperative-LDS + ping-pong; "
+            "1.55-1.84× vs non-LDS 4wave on MI355X."
         ),
     ),
 ]
