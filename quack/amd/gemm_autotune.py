@@ -61,6 +61,9 @@ KERNEL_REGISTRY = {
     "128x128": lambda: _lazy_import(
         "quack.amd.gemm_gfx950_128x128", "gemm_128x128"
     ),
+    "128x128_k32": lambda: _lazy_import(
+        "quack.amd.gemm_gfx950_128x128_k32", "gemm_128x128_k32"
+    ),
 }
 
 
@@ -126,6 +129,17 @@ class TuneEntry:
 #
 # 128×128 needs enough workgroups in flight to hide its bigger per-WG
 # load cost — crossover near 4096² on MI355X (256 CUs).
+#
+# 2026-04-21 K=32 MFMA tile (``128x128_k32``): uses mfma_f32_16x16x32_f16
+# (2× throughput per op on gfx950). Per-lane fragments 8 f16 (vs 4);
+# LDS per stage 8 KiB (vs 4 KiB). Measured at 4096²:
+#   shape    k16 (128x128)   k32
+#   1024²    58              48     1.21× faster
+#   2048²    111             72     1.54× faster   ← K=32 sweet spot
+#   4096²    368             366     1.01× (flat — HBM-bound dominates)
+# K=32 wins at 1024–3999 where MFMA throughput is the bottleneck; at
+# 4096² the working set spills L2 and HBM bandwidth dominates over
+# MFMA issue rate.
 _TUNED_TABLE: List[TuneEntry] = [
     TuneEntry(
         predicate=lambda M, N, K, dt: (
@@ -142,12 +156,24 @@ _TUNED_TABLE: List[TuneEntry] = [
     TuneEntry(
         predicate=lambda M, N, K, dt: (
             dt in (torch.float16, torch.bfloat16)
+            and M >= 1024 and N >= 1024
+            and M % 128 == 0 and N % 128 == 0 and K % 32 == 0
+        ),
+        kernel="128x128_k32",
+        notes=(
+            "Medium-large shapes (1024-3999): K=32 MFMA doubles per-op "
+            "throughput; 1.21× at 1024², 1.54× at 2048² vs K=16 128x128."
+        ),
+    ),
+    TuneEntry(
+        predicate=lambda M, N, K, dt: (
+            dt in (torch.float16, torch.bfloat16)
             and M >= 2048 and N >= 2048
             and M % 64 == 0 and N % 64 == 0 and K % 16 == 0
         ),
         kernel="4wave_64x64_lds_pp",
         notes=(
-            "Large shapes (2048-3999): cooperative-LDS + ping-pong; "
+            "Large shapes (2048-3999, K not ÷32): cooperative-LDS + ping-pong; "
             "1.55-1.84× vs non-LDS 4wave on MI355X."
         ),
     ),
