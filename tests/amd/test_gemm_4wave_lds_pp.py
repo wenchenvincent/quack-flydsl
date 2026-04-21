@@ -41,7 +41,9 @@ def test_autotune_picks_lds_pp_for_large():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     from quack.amd.gemm_autotune import select_best_kernel
+    # 2048² sits in the lds_pp band (≥2048, <4096).
     assert select_best_kernel(2048, 2048, 1024, torch.float16, plain=True) == "4wave_64x64_lds_pp"
-    assert select_best_kernel(4096, 4096, 4096, torch.bfloat16, plain=True) == "4wave_64x64_lds_pp"
+    # 4096² and up now use the 128x128 kernel (see test_gemm_128x128).
+    assert select_best_kernel(4096, 4096, 4096, torch.bfloat16, plain=True) == "128x128"
     # 1024² still uses non-LDS 4wave.
     assert select_best_kernel(1024, 1024, 1024, torch.float16, plain=True) == "4wave_64x64"
