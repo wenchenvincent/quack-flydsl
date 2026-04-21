@@ -91,7 +91,7 @@ def _pick_fast_path(A, B, bias, activation, alpha, beta, C, out_dtype):
 
     Returns the output tensor or ``None`` if no fast path applies.
     """
-    if A.dtype != torch.float16 or B.dtype != torch.float16:
+    if A.dtype not in (torch.float16, torch.bfloat16) or A.dtype != B.dtype:
         return None
     if out_dtype != torch.float32:
         return None
@@ -190,6 +190,37 @@ def gemm(
         validate_varlen(cu_seqlens_m, A.size(0))
     if A_idx is not None:
         A = A.index_select(0, A_idx.long())
+    # Per-sample bias (``(B, N)``) needs per-row lookup before it can be
+    # added. For the MVP we expand to ``(total_M, N)`` on-device using
+    # ``row_to_sample_idx`` and add after the GEMM on the torch path — a
+    # fused kernel path that consults cu_seqlens in the epilogue is a
+    # follow-up.
+    if cu_seqlens_m is not None and bias is not None and bias.dim() == 2:
+        from quack.amd.varlen_utils import row_to_sample_idx
+        B_count, N_bias = bias.shape
+        assert N_bias == B.size(-1), "per-sample bias last-dim must match N"
+        sample_ids = row_to_sample_idx(cu_seqlens_m)
+        assert sample_ids.size(0) == A.size(0)
+        per_row_bias = bias[sample_ids.long()]  # (total_M, N)
+        # Route through the torch path; bias_val added below as a full
+        # (M, N) tensor rather than the eligible-kernel's per-column bias.
+        out_f32 = gemm(
+            A, B, alpha=alpha, beta=beta, C=C,
+            out_dtype=torch.float32, bias=None, activation=None,
+        )
+        out_f32 = out_f32 + per_row_bias.to(torch.float32)
+        if activation is not None:
+            if activation == "relu":
+                out_f32 = torch.relu(out_f32)
+            elif activation == "relu_sq":
+                out_f32 = torch.relu(out_f32) * out_f32
+            elif activation == "silu":
+                out_f32 = torch.nn.functional.silu(out_f32)
+            elif activation == "gelu_tanh_approx":
+                out_f32 = torch.nn.functional.gelu(out_f32, approximate="tanh")
+            else:
+                raise NotImplementedError(f"activation={activation!r}")
+        return out_f32.to(out_dtype or A.dtype)
     # Default output dtype: match input (torch.matmul convention), not f32.
     effective_out_dtype = out_dtype or A.dtype
     if _mfma_eligible(A, B, bias, activation, alpha, beta, C, effective_out_dtype):

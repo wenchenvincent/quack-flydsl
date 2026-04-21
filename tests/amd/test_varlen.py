@@ -32,6 +32,27 @@ def test_gemm_with_cu_seqlens_m():
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
+def test_gemm_with_per_sample_bias():
+    """Varlen + (B, N) per-sample bias — each sample's rows add a
+    different bias vector."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    total_M, K, N = 64, 64, 128
+    A = torch.randn(total_M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    cu = torch.tensor([0, 16, 48, 64], device="cuda", dtype=torch.int32)
+    # 3 samples, 3 different bias vectors
+    bias = torch.randn(3, N, device="cuda", dtype=torch.float16)
+    out = gemm(A, B, bias=bias, cu_seqlens_m=cu, activation="silu")
+    # Reference: expand bias per row, apply
+    sample_idx = torch.tensor([0]*16 + [1]*32 + [2]*16, device="cuda")
+    bias_expanded = bias[sample_idx]
+    ref = torch.nn.functional.silu((A.float() @ B.float()) + bias_expanded.float())
+    ref = ref.to(torch.float16)
+    torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
 def test_gemm_with_A_idx():
     """Gather-A: A[A_idx] @ B."""
     if not torch.cuda.is_available():

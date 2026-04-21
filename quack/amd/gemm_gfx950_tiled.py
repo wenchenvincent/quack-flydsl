@@ -67,15 +67,14 @@ _FRAG_B = 4
 _FRAG_C = 4
 
 
-def _build_gemm_32x32_f16(*, M, N, K, arch):
+def _build_gemm_32x32(*, M, N, K, dtype_str, arch):
+    """32×32 MFMA GEMM kernel. ``dtype_str`` ∈ {'f16', 'bf16'}."""
     assert M % 32 == 0 and N % 32 == 0 and K % _MFMA_K == 0
-    tiles_m = M // 32
-    tiles_n = N // 32
-    del tiles_m, tiles_n  # computed but only informational
+    assert dtype_str in ("f16", "bf16")
 
     allocator = SmemAllocator(
         None, arch=arch,
-        global_sym_name=f"quack_amd_gemm_32x32_f16_{M}_{N}_{K}_smem",
+        global_sym_name=f"quack_amd_gemm_32x32_{dtype_str}_{M}_{N}_{K}_smem",
     )
 
     @flyc.kernel
@@ -91,9 +90,10 @@ def _build_gemm_32x32_f16(*, M, N, K, arch):
         B_buf = fx.rocdl.make_buffer_tensor(B)
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
-        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
+        in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
+        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-        h_reg_ty = fx.MemRefType.get(T.f16, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
@@ -148,8 +148,8 @@ def _build_gemm_32x32_f16(*, M, N, K, arch):
             for i in range_constexpr(_FRAG_A):
                 a_top_vals.append(_load_h(a_div_top, lane_k_base + fx.Int32(i)))
                 a_bot_vals.append(_load_h(a_div_bot, lane_k_base + fx.Int32(i)))
-            a_top = vector.from_elements(T.vec(_FRAG_A, T.f16), a_top_vals)
-            a_bot = vector.from_elements(T.vec(_FRAG_A, T.f16), a_bot_vals)
+            a_top = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_top_vals)
+            a_bot = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_bot_vals)
 
             # --- B fragments (left, right col halves) ---
             b_left_vals = []
@@ -159,22 +159,25 @@ def _build_gemm_32x32_f16(*, M, N, K, arch):
                 b_div = fx.logical_divide(row_b_k, fx.make_layout(1, 1))
                 b_left_vals.append(_load_h(b_div, b_col_left))
                 b_right_vals.append(_load_h(b_div, b_col_right))
-            b_left = vector.from_elements(T.vec(_FRAG_B, T.f16), b_left_vals)
-            b_right = vector.from_elements(T.vec(_FRAG_B, T.f16), b_right_vals)
+            b_left = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_left_vals)
+            b_right = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_right_vals)
 
             # --- 4 MFMAs reusing the fragments ---
-            acc00 = fx.rocdl.mfma_f32_16x16x16f16(
-                acc_ty, [a_top, b_left, acc00, 0, 0, 0],
-            )
-            acc01 = fx.rocdl.mfma_f32_16x16x16f16(
-                acc_ty, [a_top, b_right, acc01, 0, 0, 0],
-            )
-            acc10 = fx.rocdl.mfma_f32_16x16x16f16(
-                acc_ty, [a_bot, b_left, acc10, 0, 0, 0],
-            )
-            acc11 = fx.rocdl.mfma_f32_16x16x16f16(
-                acc_ty, [a_bot, b_right, acc11, 0, 0, 0],
-            )
+            def _mfma(a, b, acc):
+                if dtype_str == "bf16":
+                    a_i = vector.bitcast(T.vec(_FRAG_A, T.i16), a)
+                    b_i = vector.bitcast(T.vec(_FRAG_B, T.i16), b)
+                    return fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                        acc_ty, [a_i, b_i, acc, 0, 0, 0],
+                    )
+                return fx.rocdl.mfma_f32_16x16x16f16(
+                    acc_ty, [a, b, acc, 0, 0, 0],
+                )
+
+            acc00 = _mfma(a_top, b_left, acc00)
+            acc01 = _mfma(a_top, b_right, acc01)
+            acc10 = _mfma(a_bot, b_left, acc10)
+            acc11 = _mfma(a_bot, b_right, acc11)
 
         # --- Write back four 16×16 sub-tiles ---
         def _store_subtile(acc, row_base, col_base):
@@ -209,52 +212,57 @@ def _build_gemm_32x32_f16(*, M, N, K, arch):
 
 _kernel_cache: dict = {}
 
+_DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
-def _compile(M, N, K, arch):
-    key = (M, N, K, arch)
+
+def _compile(M, N, K, dtype_str, arch):
+    key = (M, N, K, dtype_str, arch)
     got = _kernel_cache.get(key)
     if got is None:
-        got = _build_gemm_32x32_f16(M=M, N=N, K=K, arch=arch)
+        got = _build_gemm_32x32(M=M, N=N, K=K, dtype_str=dtype_str, arch=arch)
         _kernel_cache[key] = got
     return got
 
 
 @torch.library.custom_op(
-    "quack_amd::_gemm_32x32_f16_out",
+    "quack_amd::_gemm_32x32_out",
     mutates_args=("out",),
     schema="(Tensor a, Tensor b, Tensor(a0!) out) -> ()",
 )
-def _gemm_32x32_f16_out(a: Tensor, b: Tensor, out: Tensor) -> None:
+def _gemm_32x32_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
-    assert a.dtype == torch.float16 and b.dtype == torch.float16
+    assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype
     assert out.dtype == torch.float32
     M, K = a.shape
     K2, N = b.shape
     assert K == K2 and M % 32 == 0 and N % 32 == 0 and K % 16 == 0
     assert out.shape == (M, N)
-    _compile(M, N, K, get_rocm_arch())(a, b, out)
+    _compile(M, N, K, _DTYPE2STR[a.dtype], get_rocm_arch())(a, b, out)
 
 
-@_gemm_32x32_f16_out.register_fake
-def _gemm_32x32_f16_out_fake(a, b, out):
+@_gemm_32x32_out.register_fake
+def _gemm_32x32_out_fake(a, b, out):
     return None
 
 
-def gemm_f16_32x32(A: Tensor, B: Tensor) -> Tensor:
-    """f16 × f16 → f32 MFMA GEMM with 32×32 output tiles (2×2 MFMA grid).
+def gemm_32x32(A: Tensor, B: Tensor) -> Tensor:
+    """f16/bf16 × f16/bf16 → f32 MFMA GEMM with 32×32 output tiles.
 
-    Requires M, N multiples of 32 and K a multiple of 16. For aligned
-    shapes this roughly halves HBM traffic per flop vs the 16×16 path
-    thanks to in-register A/B fragment reuse. No epilogue support yet —
-    callers needing bias/activation route through the 16×16 kernel.
+    Requires M, N multiples of 32 and K a multiple of 16. A and B must
+    have matching dtypes.
     """
     assert A.is_cuda and B.is_cuda
-    assert A.dtype == torch.float16 and B.dtype == torch.float16
+    assert A.dtype == B.dtype and A.dtype in (torch.float16, torch.bfloat16)
     M, K = A.shape
     _, N = B.shape
     out = torch.empty(M, N, device=A.device, dtype=torch.float32)
-    _gemm_32x32_f16_out(A, B, out)
+    _gemm_32x32_out(A, B, out)
     return out
 
 
-__all__ = ["gemm_f16_32x32"]
+# Backwards-compatible alias.
+def gemm_f16_32x32(A: Tensor, B: Tensor) -> Tensor:
+    return gemm_32x32(A, B)
+
+
+__all__ = ["gemm_32x32", "gemm_f16_32x32"]

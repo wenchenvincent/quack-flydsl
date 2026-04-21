@@ -58,12 +58,13 @@ _FRAG_B = 4
 _FRAG_C = 4
 
 
-def _build_gemm_64x64_4wave_f16(*, M, N, K, arch):
+def _build_gemm_64x64_4wave(*, M, N, K, dtype_str, arch):
     assert M % 64 == 0 and N % 64 == 0 and K % _MFMA_K == 0
+    assert dtype_str in ("f16", "bf16")
 
     allocator = SmemAllocator(
         None, arch=arch,
-        global_sym_name=f"quack_amd_gemm_64x64_4wave_f16_{M}_{N}_{K}_smem",
+        global_sym_name=f"quack_amd_gemm_64x64_4wave_{dtype_str}_{M}_{N}_{K}_smem",
     )
 
     @flyc.kernel
@@ -85,9 +86,10 @@ def _build_gemm_64x64_4wave_f16(*, M, N, K, arch):
         B_buf = fx.rocdl.make_buffer_tensor(B)
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
-        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
+        in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
+        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-        h_reg_ty = fx.MemRefType.get(T.f16, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
@@ -141,8 +143,8 @@ def _build_gemm_64x64_4wave_f16(*, M, N, K, arch):
             for i in range_constexpr(_FRAG_A):
                 a_top_vals.append(_load_h(a_div_top, lane_k_base + fx.Int32(i)))
                 a_bot_vals.append(_load_h(a_div_bot, lane_k_base + fx.Int32(i)))
-            a_top = vector.from_elements(T.vec(_FRAG_A, T.f16), a_top_vals)
-            a_bot = vector.from_elements(T.vec(_FRAG_A, T.f16), a_bot_vals)
+            a_top = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_top_vals)
+            a_bot = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_bot_vals)
 
             b_left_vals = []
             b_right_vals = []
@@ -151,13 +153,22 @@ def _build_gemm_64x64_4wave_f16(*, M, N, K, arch):
                 b_div = fx.logical_divide(row_b_k, fx.make_layout(1, 1))
                 b_left_vals.append(_load_h(b_div, b_col_left))
                 b_right_vals.append(_load_h(b_div, b_col_right))
-            b_left = vector.from_elements(T.vec(_FRAG_B, T.f16), b_left_vals)
-            b_right = vector.from_elements(T.vec(_FRAG_B, T.f16), b_right_vals)
+            b_left = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_left_vals)
+            b_right = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_right_vals)
 
-            acc00 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_top, b_left, acc00, 0, 0, 0])
-            acc01 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_top, b_right, acc01, 0, 0, 0])
-            acc10 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_bot, b_left, acc10, 0, 0, 0])
-            acc11 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_bot, b_right, acc11, 0, 0, 0])
+            def _mfma(a, b, acc):
+                if dtype_str == "bf16":
+                    a_i = vector.bitcast(T.vec(_FRAG_A, T.i16), a)
+                    b_i = vector.bitcast(T.vec(_FRAG_B, T.i16), b)
+                    return fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                        acc_ty, [a_i, b_i, acc, 0, 0, 0],
+                    )
+                return fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a, b, acc, 0, 0, 0])
+
+            acc00 = _mfma(a_top, b_left, acc00)
+            acc01 = _mfma(a_top, b_right, acc01)
+            acc10 = _mfma(a_bot, b_left, acc10)
+            acc11 = _mfma(a_bot, b_right, acc11)
 
         def _store_subtile(acc, row_base, col_base):
             for i in range_constexpr(_FRAG_C):
@@ -191,51 +202,58 @@ def _build_gemm_64x64_4wave_f16(*, M, N, K, arch):
 
 _kernel_cache: dict = {}
 
+_DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
-def _compile(M, N, K, arch):
-    key = (M, N, K, arch)
+
+def _compile(M, N, K, dtype_str, arch):
+    key = (M, N, K, dtype_str, arch)
     got = _kernel_cache.get(key)
     if got is None:
-        got = _build_gemm_64x64_4wave_f16(M=M, N=N, K=K, arch=arch)
+        got = _build_gemm_64x64_4wave(M=M, N=N, K=K, dtype_str=dtype_str, arch=arch)
         _kernel_cache[key] = got
     return got
 
 
 @torch.library.custom_op(
-    "quack_amd::_gemm_64x64_4wave_f16_out",
+    "quack_amd::_gemm_64x64_4wave_out",
     mutates_args=("out",),
     schema="(Tensor a, Tensor b, Tensor(a0!) out) -> ()",
 )
-def _gemm_64x64_4wave_f16_out(a: Tensor, b: Tensor, out: Tensor) -> None:
+def _gemm_64x64_4wave_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
-    assert a.dtype == torch.float16 and b.dtype == torch.float16
+    assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype
     assert out.dtype == torch.float32
     M, K = a.shape
     K2, N = b.shape
     assert K == K2 and M % 64 == 0 and N % 64 == 0 and K % 16 == 0
     assert out.shape == (M, N)
-    _compile(M, N, K, get_rocm_arch())(a, b, out)
+    _compile(M, N, K, _DTYPE2STR[a.dtype], get_rocm_arch())(a, b, out)
 
 
-@_gemm_64x64_4wave_f16_out.register_fake
-def _gemm_64x64_4wave_f16_out_fake(a, b, out):
+@_gemm_64x64_4wave_out.register_fake
+def _gemm_64x64_4wave_out_fake(a, b, out):
     return None
 
 
-def gemm_f16_64x64_4wave(A: Tensor, B: Tensor) -> Tensor:
-    """4-wave 64×64-tile f16 × f16 → f32 MFMA GEMM.
+def gemm_64x64_4wave(A: Tensor, B: Tensor) -> Tensor:
+    """4-wave 64×64-tile f16/bf16 × f16/bf16 → f32 MFMA GEMM.
 
     256-thread workgroup (4 waves) covering a 64×64 output tile via
     a 2×2 wave grid; each wave runs the 32×32 MFMA pattern on its own
-    sub-tile. Grid = ``(M/64, N/64, 1)``.
+    sub-tile.
     """
     assert A.is_cuda and B.is_cuda
-    assert A.dtype == torch.float16 and B.dtype == torch.float16
+    assert A.dtype == B.dtype and A.dtype in (torch.float16, torch.bfloat16)
     M, K = A.shape
     _, N = B.shape
     out = torch.empty(M, N, device=A.device, dtype=torch.float32)
-    _gemm_64x64_4wave_f16_out(A, B, out)
+    _gemm_64x64_4wave_out(A, B, out)
     return out
 
 
-__all__ = ["gemm_f16_64x64_4wave"]
+def gemm_f16_64x64_4wave(A: Tensor, B: Tensor) -> Tensor:
+    """Backwards-compatible f16-only alias."""
+    return gemm_64x64_4wave(A, B)
+
+
+__all__ = ["gemm_64x64_4wave", "gemm_f16_64x64_4wave"]

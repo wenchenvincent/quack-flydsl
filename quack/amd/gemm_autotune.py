@@ -33,21 +33,24 @@ import torch
 
 
 # Available kernel variants — maps a name to a lazy import + launcher.
+# The tiled/LDS/swizzle/4-wave kernels all accept f16 and bf16 via a
+# shared ``_DTYPE2STR`` flag in their launcher (the 16×16 path is the
+# full-epilogue one and uses its own dispatch).
 KERNEL_REGISTRY = {
     "mfma_16x16": lambda: _lazy_import(
         "quack.amd.gemm_gfx950", "gemm_mfma"
     ),
     "tiled_32x32": lambda: _lazy_import(
-        "quack.amd.gemm_gfx950_tiled", "gemm_f16_32x32"
+        "quack.amd.gemm_gfx950_tiled", "gemm_32x32"
     ),
     "lds_32x32": lambda: _lazy_import(
-        "quack.amd.gemm_gfx950_lds", "gemm_f16_32x32_lds"
+        "quack.amd.gemm_gfx950_lds", "gemm_32x32_lds"
     ),
     "lds_swz_32x32": lambda: _lazy_import(
-        "quack.amd.gemm_gfx950_lds_swizzle", "gemm_f16_32x32_lds_swz"
+        "quack.amd.gemm_gfx950_lds_swizzle", "gemm_32x32_lds_swz"
     ),
     "4wave_64x64": lambda: _lazy_import(
-        "quack.amd.gemm_gfx950_4wave", "gemm_f16_64x64_4wave"
+        "quack.amd.gemm_gfx950_4wave", "gemm_64x64_4wave"
     ),
 }
 
@@ -94,7 +97,9 @@ def select_best_kernel(
     ``plain`` flag: set False to signal the call has an epilogue; we
     only have an epilogue-capable kernel for 16×16 today.
     """
-    if not plain or dtype != torch.float16:
+    if not plain:
+        return "mfma_16x16"
+    if dtype not in (torch.float16, torch.bfloat16):
         return "mfma_16x16"
     # Consult the tuned table first.
     for entry in _TUNED_TABLE:

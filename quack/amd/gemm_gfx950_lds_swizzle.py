@@ -75,12 +75,13 @@ def _swizzle_b_col(k_row_i32, col_i32):
     return col_i32 ^ (rem * fx.Int32(_SWIZZLE_STRIDE))
 
 
-def _build_gemm_32x32_lds_swz_f16(*, M, N, K, arch):
+def _build_gemm_32x32_lds_swz(*, M, N, K, dtype_str, arch):
     assert M % 32 == 0 and N % 32 == 0 and K % _MFMA_K == 0
+    assert dtype_str in ("f16", "bf16")
 
     allocator = SmemAllocator(
         None, arch=arch,
-        global_sym_name=f"quack_amd_gemm_32x32_lds_swz_f16_{M}_{N}_{K}_smem",
+        global_sym_name=f"quack_amd_gemm_32x32_lds_swz_{dtype_str}_{M}_{N}_{K}_smem",
     )
     a_off_stage0 = _align(allocator.ptr, 16)
     allocator.ptr = a_off_stage0 + _A_TILE_BYTES
@@ -106,19 +107,20 @@ def _build_gemm_32x32_lds_swz_f16(*, M, N, K, arch):
 
         base_ptr = allocator.get_base()
         s_a = [
-            SmemPtr(base_ptr, a_off_stage0, T.f16, shape=(32, 16)),
-            SmemPtr(base_ptr, a_off_stage1, T.f16, shape=(32, 16)),
+            SmemPtr(base_ptr, a_off_stage0, T.f16 if dtype_str == "f16" else T.bf16, shape=(32, 16)),
+            SmemPtr(base_ptr, a_off_stage1, T.f16 if dtype_str == "f16" else T.bf16, shape=(32, 16)),
         ]
         s_b = [
-            SmemPtr(base_ptr, b_off_stage0, T.f16, shape=(16, 32)),
-            SmemPtr(base_ptr, b_off_stage1, T.f16, shape=(16, 32)),
+            SmemPtr(base_ptr, b_off_stage0, T.f16 if dtype_str == "f16" else T.bf16, shape=(16, 32)),
+            SmemPtr(base_ptr, b_off_stage1, T.f16 if dtype_str == "f16" else T.bf16, shape=(16, 32)),
         ]
         for sp in (*s_a, *s_b):
             sp.get()
 
-        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
+        in_elem_type = T.f16 if dtype_str == "f16" else T.bf16
+        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), in_elem_type)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-        h_reg_ty = fx.MemRefType.get(T.f16, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        h_reg_ty = fx.MemRefType.get(in_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
@@ -189,8 +191,8 @@ def _build_gemm_32x32_lds_swz_f16(*, M, N, K, arch):
                 k_in_lds = lane_k_group * fx.Int32(_FRAG_A) + fx.Int32(i)
                 a_top_vals.append(s_a[stage].load([_idx(lane_row), _idx(k_in_lds)]))
                 a_bot_vals.append(s_a[stage].load([_idx(fx.Int32(16) + lane_row), _idx(k_in_lds)]))
-            a_top = vector.from_elements(T.vec(_FRAG_A, T.f16), a_top_vals)
-            a_bot = vector.from_elements(T.vec(_FRAG_A, T.f16), a_bot_vals)
+            a_top = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_top_vals)
+            a_bot = vector.from_elements(T.vec(_FRAG_A, in_elem_type), a_bot_vals)
 
             b_left_vals = []
             b_right_vals = []
@@ -202,8 +204,8 @@ def _build_gemm_32x32_lds_swz_f16(*, M, N, K, arch):
                 b_right_vals.append(
                     s_b[stage].load([_idx(k_row), _idx(_swizzle_b_col(k_row, fx.Int32(16) + lane_row))])
                 )
-            b_left = vector.from_elements(T.vec(_FRAG_B, T.f16), b_left_vals)
-            b_right = vector.from_elements(T.vec(_FRAG_B, T.f16), b_right_vals)
+            b_left = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_left_vals)
+            b_right = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_right_vals)
             return a_top, a_bot, b_left, b_right
 
         acc_ty = T.vec(_FRAG_C, T.f32)
@@ -229,10 +231,19 @@ def _build_gemm_32x32_lds_swz_f16(*, M, N, K, arch):
                 _stage_tile_into_lds(k_tile + 1, 1 - cur_stage)
 
             a_top, a_bot, b_left, b_right = _load_frags_from_lds(cur_stage)
-            acc00 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_top, b_left, acc00, 0, 0, 0])
-            acc01 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_top, b_right, acc01, 0, 0, 0])
-            acc10 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_bot, b_left, acc10, 0, 0, 0])
-            acc11 = fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a_bot, b_right, acc11, 0, 0, 0])
+            def _mfma(a, b, acc):
+                if dtype_str == "bf16":
+                    a_i = vector.bitcast(T.vec(_FRAG_A, T.i16), a)
+                    b_i = vector.bitcast(T.vec(_FRAG_B, T.i16), b)
+                    return fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                        acc_ty, [a_i, b_i, acc, 0, 0, 0],
+                    )
+                return fx.rocdl.mfma_f32_16x16x16f16(acc_ty, [a, b, acc, 0, 0, 0])
+
+            acc00 = _mfma(a_top, b_left, acc00)
+            acc01 = _mfma(a_top, b_right, acc01)
+            acc10 = _mfma(a_bot, b_left, acc10)
+            acc11 = _mfma(a_bot, b_right, acc11)
             _gpu.barrier()
 
         def _store_subtile(acc, row_base, col_base):
@@ -267,54 +278,56 @@ def _build_gemm_32x32_lds_swz_f16(*, M, N, K, arch):
 
 _kernel_cache: dict = {}
 
+_DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
-def _compile(M, N, K, arch):
-    key = (M, N, K, arch)
+
+def _compile(M, N, K, dtype_str, arch):
+    key = (M, N, K, dtype_str, arch)
     got = _kernel_cache.get(key)
     if got is None:
-        got = _build_gemm_32x32_lds_swz_f16(M=M, N=N, K=K, arch=arch)
+        got = _build_gemm_32x32_lds_swz(M=M, N=N, K=K, dtype_str=dtype_str, arch=arch)
         _kernel_cache[key] = got
     return got
 
 
 @torch.library.custom_op(
-    "quack_amd::_gemm_32x32_lds_swz_f16_out",
+    "quack_amd::_gemm_32x32_lds_swz_out",
     mutates_args=("out",),
     schema="(Tensor a, Tensor b, Tensor(a0!) out) -> ()",
 )
-def _gemm_32x32_lds_swz_f16_out(a: Tensor, b: Tensor, out: Tensor) -> None:
+def _gemm_32x32_lds_swz_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
-    assert a.dtype == torch.float16 and b.dtype == torch.float16
+    assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype
     assert out.dtype == torch.float32
     M, K = a.shape
     K2, N = b.shape
     assert K == K2 and M % 32 == 0 and N % 32 == 0 and K % 16 == 0
     assert out.shape == (M, N)
-    _compile(M, N, K, get_rocm_arch())(a, b, out)
+    _compile(M, N, K, _DTYPE2STR[a.dtype], get_rocm_arch())(a, b, out)
 
 
-@_gemm_32x32_lds_swz_f16_out.register_fake
-def _gemm_32x32_lds_swz_f16_out_fake(a, b, out):
+@_gemm_32x32_lds_swz_out.register_fake
+def _gemm_32x32_lds_swz_out_fake(a, b, out):
     return None
 
 
-def gemm_f16_32x32_lds_swz(A: Tensor, B: Tensor) -> Tensor:
-    """LDS ping-pong + B-preshuffle XOR-swizzle 32×32 MFMA GEMM.
-
-    Same layout / tile / fragment-reuse as ``gemm_f16_32x32_lds`` with
-    the B LDS column address XOR-swizzled by ``(k_row % 2) * 16`` to
-    break the bank-conflict pattern on B-fragment reads.
-    """
+def gemm_32x32_lds_swz(A: Tensor, B: Tensor) -> Tensor:
+    """f16/bf16 × f16/bf16 → f32 LDS ping-pong + B-preshuffle swizzle."""
     assert A.is_cuda and B.is_cuda
-    assert A.dtype == torch.float16 and B.dtype == torch.float16
+    assert A.dtype == B.dtype and A.dtype in (torch.float16, torch.bfloat16)
     M, K = A.shape
     _, N = B.shape
     out = torch.empty(M, N, device=A.device, dtype=torch.float32)
-    _gemm_32x32_lds_swz_f16_out(A, B, out)
+    _gemm_32x32_lds_swz_out(A, B, out)
     return out
 
 
-__all__ = ["gemm_f16_32x32_lds_swz", "swizzle_xor16_f16"]
+def gemm_f16_32x32_lds_swz(A: Tensor, B: Tensor) -> Tensor:
+    """Backwards-compatible f16-only alias."""
+    return gemm_32x32_lds_swz(A, B)
+
+
+__all__ = ["gemm_32x32_lds_swz", "gemm_f16_32x32_lds_swz", "swizzle_xor16_f16"]
 
 
 def swizzle_xor16_f16(row_i32, col_i32, k_blocks16=_K_BLOCKS16):

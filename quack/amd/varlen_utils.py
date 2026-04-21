@@ -60,4 +60,25 @@ def seqlens_from_cu(cu_seqlens_m: Tensor) -> Tensor:
     return cu_seqlens_m[1:] - cu_seqlens_m[:-1]
 
 
-__all__ = ["VarlenArgs", "validate_varlen", "seqlens_from_cu"]
+def row_to_sample_idx(cu_seqlens_m: Tensor) -> Tensor:
+    """Expand cu_seqlens_m into a ``(total_M,)`` int32 tensor mapping each
+    packed row to its sample index.
+
+    Example::
+        cu  = [0, 3, 5, 7]         # 3 samples, lengths [3, 2, 2]
+        out = [0, 0, 0, 1, 1, 2, 2]
+
+    Used by varlen gather paths that need to look up per-sample metadata
+    (e.g., per-sample bias ``bias[sample_idx[m], :]``). Runs on-device via
+    ``repeat_interleave``.
+    """
+    assert cu_seqlens_m.is_cuda
+    seqlens = seqlens_from_cu(cu_seqlens_m).to(torch.int64)
+    B = seqlens.size(0)
+    sample_ids = torch.arange(B, device=cu_seqlens_m.device, dtype=torch.int32)
+    return sample_ids.repeat_interleave(seqlens)
+
+
+__all__ = [
+    "VarlenArgs", "validate_varlen", "seqlens_from_cu", "row_to_sample_idx",
+]
