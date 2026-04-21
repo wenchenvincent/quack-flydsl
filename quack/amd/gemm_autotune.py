@@ -55,6 +55,9 @@ KERNEL_REGISTRY = {
     "4wave_64x64_lds": lambda: _lazy_import(
         "quack.amd.gemm_gfx950_4wave_lds", "gemm_64x64_4wave_lds"
     ),
+    "4wave_64x64_lds_pp": lambda: _lazy_import(
+        "quack.amd.gemm_gfx950_4wave_lds_pp", "gemm_64x64_4wave_lds_pp"
+    ),
 }
 
 
@@ -95,18 +98,23 @@ class TuneEntry:
 # tiled_32x32 win at small shapes is amortized by the 4× reduction in
 # HBM instructions. 4wave wins across the range for small-medium.
 #
-# 2026-04-21 cooperative-LDS 4-wave (``4wave_64x64_lds``) measurements:
+# 2026-04-21 cooperative-LDS 4-wave (single-stage ``4wave_64x64_lds``):
 #   shape    4wave   4wave_lds  ratio
-#   64²      9 μs    8 μs       1.16×  — LDS slightly wins
-#   128²     10 μs   9 μs       1.15×
-#   256²     11 μs   13 μs      0.84×  — non-LDS wins (barrier/LDS cost)
-#   512²     19 μs   26 μs      0.73×  — non-LDS wins
-#   1024²    32 μs   47 μs      0.68×  — non-LDS wins
-#   2048²    167 μs  114 μs     1.47×  — cooperative LDS wins
-#   4096²    1320 μs 718 μs     1.84×  — cooperative LDS wins
+#   256²     11 μs   13 μs      0.84× — non-LDS wins (barrier cost)
+#   1024²    31 μs   47 μs      0.68× — non-LDS wins
+#   2048²    165 μs  110 μs     1.50× — cooperative LDS wins
+#   4096²    1212 μs 678 μs     1.79× — cooperative LDS wins
 #
-# Crossover ≈ M·N·K ≈ 2048³ where HBM bandwidth becomes the bottleneck
-# and the 2× HBM reduction from LDS sharing pays back the barriers.
+# With ping-pong (2-stage LDS, ``4wave_64x64_lds_pp``):
+#   shape      4wave    lds_pp    ratio (pp/4wave)
+#   1024²      31 μs    36 μs     0.86×  — still behind non-LDS
+#   2048²      165 μs   106 μs    1.55×  — ≈ LDS, slightly better
+#   4096²      1212 μs  660 μs    1.84×  — matches LDS
+#
+# Ping-pong replaces single-stage LDS at large shapes (same wins, no
+# regression at mid-range vs single-stage). Below 2048² the barrier
+# cost still outweighs the HBM savings even with overlap — non-LDS
+# 4wave remains the default.
 _TUNED_TABLE: List[TuneEntry] = [
     TuneEntry(
         predicate=lambda M, N, K, dt: (
@@ -114,11 +122,11 @@ _TUNED_TABLE: List[TuneEntry] = [
             and M >= 2048 and N >= 2048
             and M % 64 == 0 and N % 64 == 0 and K % 16 == 0
         ),
-        kernel="4wave_64x64_lds",
+        kernel="4wave_64x64_lds_pp",
         notes=(
-            "Large shapes (≥ 2048²): cooperative-LDS sharing cuts HBM reads "
-            "2× and outweighs the per-k-tile barrier cost — 1.47-1.84× vs "
-            "non-LDS 4wave on MI355X at 2048² / 4096²."
+            "Large shapes (≥ 2048²): cooperative-LDS + ping-pong; HBM "
+            "savings dominate the barrier cost. 1.55-1.84× vs non-LDS "
+            "4wave on MI355X."
         ),
     ),
 ]

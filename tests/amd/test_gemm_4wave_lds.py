@@ -37,12 +37,18 @@ def test_gemm_4wave_lds_matches_4wave_nonlds():
     torch.testing.assert_close(C_lds, C_ref, atol=1e-5, rtol=1e-5)
 
 
-def test_autotune_picks_lds_for_large_shapes():
-    """Dispatcher should pick the LDS variant for M≥2048 & N≥2048."""
+def test_lds_variant_registered_in_autotune():
+    """The single-stage LDS kernel is still registered in case callers
+    want to target it directly; the dispatcher now routes large shapes
+    to the ping-pong variant (``4wave_64x64_lds_pp``) — see
+    ``test_gemm_4wave_lds_pp.test_autotune_picks_lds_pp_for_large``."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
-    from quack.amd.gemm_autotune import select_best_kernel
-    assert select_best_kernel(2048, 2048, 1024, torch.float16, plain=True) == "4wave_64x64_lds"
-    assert select_best_kernel(4096, 4096, 4096, torch.bfloat16, plain=True) == "4wave_64x64_lds"
-    # Mid-range stays with non-LDS 4wave.
-    assert select_best_kernel(1024, 1024, 1024, torch.float16, plain=True) == "4wave_64x64"
+    from quack.amd.gemm_autotune import KERNEL_REGISTRY, get_kernel
+    assert "4wave_64x64_lds" in KERNEL_REGISTRY
+    fn = get_kernel("4wave_64x64_lds")
+    torch.manual_seed(0)
+    A = torch.randn(128, 128, device="cuda", dtype=torch.float16)
+    B = torch.randn(128, 128, device="cuda", dtype=torch.float16)
+    out = fn(A, B)
+    assert out.shape == (128, 128) and out.dtype == torch.float32
