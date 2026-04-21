@@ -21,7 +21,6 @@ no bias/activation/alpha/beta/C. Extensions are straightforward extensions
 of this pattern.
 """
 
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -29,9 +28,9 @@ from torch import Tensor
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, gpu as _gpu, range_constexpr, vector, buffer_ops, rocdl
+from flydsl.expr import arith, gpu as _gpu, range_constexpr, vector
 from flydsl.expr.arith import ArithValue
-from flydsl.expr.numeric import Float32, Numeric
+from flydsl.expr.numeric import Float32
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir

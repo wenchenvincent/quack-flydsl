@@ -16,7 +16,7 @@ Not yet supported (tracked for follow-up):
 """
 
 import math as _py_math
-from typing import Optional, Tuple, Type
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor

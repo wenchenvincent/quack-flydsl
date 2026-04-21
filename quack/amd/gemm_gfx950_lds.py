@@ -34,7 +34,6 @@ cycles and the HBM→LDS buffer copy is ~50+ cycles for this tile size,
 so overlap is worth ~1.5–2× on bandwidth-bound shapes.
 """
 
-from typing import Optional
 
 import torch
 from torch import Tensor

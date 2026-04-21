@@ -41,7 +41,6 @@ when inputs align to the 32-tile grid and epilogue is empty; otherwise
 falls through to the 16×16 path.
 """
 
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -50,8 +49,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, range_constexpr, vector
-from flydsl.expr.arith import ArithValue
-from flydsl.expr.numeric import Float32, Float16
+from flydsl.expr.numeric import Float32
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir

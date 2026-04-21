@@ -62,7 +62,6 @@ reduction is associative-but-not-deterministic across workgroup order.
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
-from typing import Optional
 
 
 class PersistenceMode(IntEnum):

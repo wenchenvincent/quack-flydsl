@@ -32,7 +32,6 @@ A cross-wave LDS-shared variant (with 128×128 tile via 4×4 MFMA grid
 per wave) is the next step once this infrastructure is in place.
 """
 
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -41,7 +40,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, range_constexpr, vector
-from flydsl.expr.arith import ArithValue
 from flydsl.expr.numeric import Float32
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator

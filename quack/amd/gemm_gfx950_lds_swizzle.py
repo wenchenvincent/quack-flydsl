@@ -30,7 +30,6 @@ XOR.
 Scope: f16 × f16 → f32 only; M, N multiples of 32, K multiple of 16.
 """
 
-from typing import Optional
 
 import torch
 from torch import Tensor

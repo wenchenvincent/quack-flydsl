@@ -8,7 +8,6 @@ gated activation between them.
 
 from typing import Optional
 
-import torch
 from torch import Tensor
 
 from quack.amd.linear import linear

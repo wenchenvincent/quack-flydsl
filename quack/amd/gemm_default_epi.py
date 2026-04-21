@@ -16,8 +16,6 @@ Extension points:
 
 from typing import Optional
 
-import flydsl.expr as fx
-from flydsl.expr import arith, math as _fm
 from flydsl.expr.arith import ArithValue
 
 from quack.amd.epi_ops import Scalar, RowVecLoad, ColVecLoad

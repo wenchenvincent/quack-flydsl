@@ -21,7 +21,7 @@ bitonic-merge across waves via LDS.
 """
 
 import math as _py_math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch import Tensor
@@ -29,9 +29,9 @@ from torch import Tensor
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr, buffer_ops
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue
-from flydsl.expr.numeric import Float32, Int32, Numeric
+from flydsl.expr.numeric import Float32, Int32
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir

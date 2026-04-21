@@ -17,12 +17,11 @@ These are designed to be called from inside a ``@flyc.kernel`` body. The
 """
 
 import math as _py_math
-import operator
 from typing import Callable, Optional
 
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import arith, gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.numeric import Float32
 from flydsl.expr.typing import T

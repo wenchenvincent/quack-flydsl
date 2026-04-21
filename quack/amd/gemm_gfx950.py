@@ -36,12 +36,12 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, range_constexpr, vector, math as _fm
 from flydsl.expr.arith import ArithValue
-from flydsl.expr.numeric import Float32, Float16, BFloat16, Int32, Numeric
+from flydsl.expr.numeric import Float32, Numeric
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir
 
-from quack.amd.flydsl_utils import get_rocm_arch, torch2flydsl_dtype_map
+from quack.amd.flydsl_utils import get_rocm_arch
 
 
 # For f16 MFMA: v_mfma_f32_16x16x16f16

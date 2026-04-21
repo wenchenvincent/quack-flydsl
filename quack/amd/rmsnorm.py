@@ -17,7 +17,7 @@ f32 accumulation across M). LayerNorm backward + per-head layouts are
 follow-ups.
 """
 
-from typing import Optional, Tuple, Type
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor

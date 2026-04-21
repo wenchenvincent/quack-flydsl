@@ -12,7 +12,6 @@ handles arbitrary N.
 """
 
 import math as _py_math
-from typing import Type
 
 import torch
 from torch import Tensor
