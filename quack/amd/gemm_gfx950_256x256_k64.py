@@ -1,39 +1,41 @@
 # Copyright (c) 2026, AMD.
 
-"""256×256×K=64 tile MFMA GEMM with inner K-unroll — closes the gap
-to hipBLASLt's ``MT256x256x64_MI16x16x1`` macrotile shape.
+"""256×256×K=64 tile MFMA GEMM with inner K-unroll — EXPERIMENTAL.
 
-Built on ``gemm_gfx950_256x256.py`` with one key change: the LDS tile
-is now ``(256, 64)`` for A and ``(64, 256)`` for B (4× more K per
-stage), and the inner consume loop iterates 4 K-sub-slices × 64 MFMAs
-each. Per macroiteration:
+Intended as the fix for the 256×256-K=16 kernel's hidden bottleneck
+(LDS latency serialized before MFMAs). The hope was that inlining 4
+K-sub-slices worth of loads + MFMAs per macroiter would let the
+compiler reorder load-of-slice-(ks+1) ahead of MFMA-of-slice-ks,
+hiding LDS latency behind compute.
 
-  Prologue / staged: cooperative HBM→LDS of 256×64 A + 64×256 B
-  gpu.barrier
+**Measured: did NOT work. Got dramatically slower.**
 
-  Inner consume (once per macroiter):
-    for ks in 0..3:
-      load 8 A fragments at ks*16..+16 (vectorized from LDS)
-      load 8 B fragments at ks*16..+16 (scalar from LDS)
-      64 MFMAs accumulate into acc[0..7][0..7]
+    shape       128×128   256_K16    256_K64    K64/K16    K64/hipBLASLt
+    256²        18 μs     34 μs      **210 μs**  0.16×      26.6×
+    1024²       59 μs     101 μs     **306 μs**  0.33×      23.6×
+    4096²       364 μs    458 μs     **760 μs**  0.60×      6.7×
 
-  Next prefetch: cooperative HBM→LDS of k+1 tile into the other stage
-  gpu.barrier
+Compile time alone was 3+ minutes — MLIR code explosion from inlining
+4× more operations per macroiter (256 MFMAs + 32 A-frag + 32 B-frag
+loads inlined per consume).
 
-**Why this should win** (vs plain 256×256 with K=16):
+**Why it doesn't work**:
 
-1. **Fewer barriers**: 4× fewer barriers per 4096³ work (K_macro=64
-   vs K_macro=16).
-2. **MFMA/LDS interleave freedom**: with 4 independent K-sub-slices
-   inlined in the consume body, the compiler can reorder LDS loads
-   ahead of MFMAs — hiding LDS latency behind compute. Our K=16 kernel
-   couldn't do this because only 1 slice's worth of loads existed per
-   iteration, all dependency-ordered before the MFMAs.
-3. **Amortizes cooperative-store overhead**: the 8-way-scalar LDS
-   store to place the HBM'd vec8 in LDS costs the same per k-element
-   whether we group 16 or 64 K elements into one macro-iter — but the
-   macro-iter itself has fixed per-iter bookkeeping (barrier, index
-   calcs) that gets amortized 4×.
+1. **No automatic MFMA/LDS interleave**. FlyDSL/MLIR preserves source
+   order — the compiler doesn't reorder loads ahead of dependent
+   MFMAs on its own. Would need explicit ``rocdl.sched_vmem`` /
+   ``sched_mfma`` directives for hipBLASLt-style interleaving.
+2. **Register pressure**. 4× the fragment staging (64 A + 64 B =
+   128 f16 registers across 4 slices) on top of 256 VGPR accumulators
+   stresses register allocation — likely spills or serializes.
+3. **ICache pressure**. The fully-unrolled macro body (256 MFMAs + 64
+   LDS loads + cooperative stores) inlined 64× (K=4096/64) explodes
+   beyond the 32 KiB ICache.
+
+The correct fix for LDS latency hiding is **explicit MFMA scheduling
+directives**, not compiler-trusted source-order unroll. Kept in-tree
+as evidence of what doesn't work. Not wired into the autotune
+dispatcher.
 
 LDS per stage:
     A: (256, 64) f16  = 32 KiB
