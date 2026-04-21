@@ -1,24 +1,24 @@
 # Copyright (c) 2026, AMD.
 
-"""gfx1250 (MI450) WMMA + scaled-WMMA GEMM — planned, not yet implemented.
+"""gfx1250 (MI450) WMMA GEMM — delegates to ``gemm_rdna_wmma``.
 
-gfx1250 uses wave32 + ``v_wmma_f32_16x16x16_f16`` (like gfx1201) plus
-new scaled-MFMA / WMMA variants for fp8/fp4, and ships 320 KiB of LDS
-per CU for aggressive pipelining.
+gfx1250 shares the wave32 WMMA instruction family with gfx1201 plus
+new scaled-WMMA variants for fp8/fp4 and 320 KiB LDS per CU. The
+standard-dtype path is identical to gfx1201's, so both archs route
+through ``gemm_rdna_wmma``. The scaled variants require
+``wmma_scale_f32_16x16x128_f8f6f4`` and are a separate commit track.
 
-Reference ports (FlyDSL):
-  - ``FlyDSL/kernels/wmma_gemm_gfx1250.py`` — standard-dtype WMMA.
-  - ``FlyDSL/kernels/gemm_fp8fp4_gfx1250.py`` — scaled WMMA for fp8/fp4.
-  - ``FlyDSL/kernels/moe_gemm_2stage_common_gfx1250.py`` — MoE variant.
+Reference (FlyDSL):
+  - ``FlyDSL/kernels/wmma_gemm_gfx1250.py`` — larger-tile standard.
+  - ``FlyDSL/kernels/gemm_fp8fp4_gfx1250.py`` — scaled WMMA fp8/fp4.
 """
+
+from quack.amd.gemm_rdna_wmma import gemm_wmma as _gemm_wmma
 
 
 def gemm_mfma(*args, **kwargs):
-    raise NotImplementedError(
-        "gfx1250 WMMA GEMM is not yet ported; "
-        "route through the torch fallback for now. "
-        "Reference: FlyDSL/kernels/wmma_gemm_gfx1250.py + gemm_fp8fp4_gfx1250.py"
-    )
+    """gfx1250 'MFMA' GEMM — actually WMMA; shared WMMA kernel."""
+    return _gemm_wmma(*args, **kwargs)
 
 
 __all__ = ["gemm_mfma"]
