@@ -21,9 +21,11 @@ def test_topk_fwd_matches_torch(k, M, N):
     torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
     vals, idx, sm = topk_fwd(x, k)
-    vals_ref, idx_ref = torch.topk(x, k, dim=-1)
+    vals_ref, _ = torch.topk(x, k, dim=-1)
     torch.testing.assert_close(vals, vals_ref)
-    torch.testing.assert_close(idx, idx_ref)
+    # Indices should pick out the same values (tie-breaking may differ).
+    gathered = torch.gather(x, -1, idx.long())
+    torch.testing.assert_close(gathered, vals_ref)
     assert sm is None
 
 
