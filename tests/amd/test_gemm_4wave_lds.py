@@ -1,0 +1,48 @@
+# Copyright (c) 2026, AMD.
+
+"""Tests for the 4-wave 64×64 MFMA GEMM with cooperative cross-wave LDS sharing."""
+
+import pytest
+import torch
+
+from quack.amd.gemm_gfx950_4wave_lds import gemm_64x64_4wave_lds
+
+
+@pytest.mark.parametrize("M", [256, 128, 64])
+@pytest.mark.parametrize("N", [64, 128, 256])
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gemm_64x64_4wave_lds(M, N, K, dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    A = torch.randn(M, K, device="cuda", dtype=dtype)
+    B = torch.randn(K, N, device="cuda", dtype=dtype)
+    C = gemm_64x64_4wave_lds(A, B)
+    ref = A.float() @ B.float()
+    atol = max(5e-3, K * 2e-5)
+    torch.testing.assert_close(C, ref, atol=atol, rtol=5e-3)
+
+
+def test_gemm_4wave_lds_matches_4wave_nonlds():
+    """Numerical equivalence vs the non-LDS 4-wave path."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_4wave import gemm_64x64_4wave
+    torch.manual_seed(0)
+    A = torch.randn(128, 128, device="cuda", dtype=torch.float16)
+    B = torch.randn(128, 128, device="cuda", dtype=torch.float16)
+    C_lds = gemm_64x64_4wave_lds(A, B)
+    C_ref = gemm_64x64_4wave(A, B)
+    torch.testing.assert_close(C_lds, C_ref, atol=1e-5, rtol=1e-5)
+
+
+def test_autotune_picks_lds_for_large_shapes():
+    """Dispatcher should pick the LDS variant for M≥2048 & N≥2048."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_autotune import select_best_kernel
+    assert select_best_kernel(2048, 2048, 1024, torch.float16, plain=True) == "4wave_64x64_lds"
+    assert select_best_kernel(4096, 4096, 4096, torch.bfloat16, plain=True) == "4wave_64x64_lds"
+    # Mid-range stays with non-LDS 4wave.
+    assert select_best_kernel(1024, 1024, 1024, torch.float16, plain=True) == "4wave_64x64"

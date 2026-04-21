@@ -52,6 +52,9 @@ KERNEL_REGISTRY = {
     "4wave_64x64": lambda: _lazy_import(
         "quack.amd.gemm_gfx950_4wave", "gemm_64x64_4wave"
     ),
+    "4wave_64x64_lds": lambda: _lazy_import(
+        "quack.amd.gemm_gfx950_4wave_lds", "gemm_64x64_4wave_lds"
+    ),
 }
 
 
@@ -90,10 +93,35 @@ class TuneEntry:
 #
 # Once the A-load path is vectorized, the LDS/wave overhead that made
 # tiled_32x32 win at small shapes is amortized by the 4× reduction in
-# HBM instructions. 4wave wins across the range, so the default
-# heuristic suffices — no override needed. Empty table; populate when
-# future kernel variants change the calculus.
-_TUNED_TABLE: List[TuneEntry] = []
+# HBM instructions. 4wave wins across the range for small-medium.
+#
+# 2026-04-21 cooperative-LDS 4-wave (``4wave_64x64_lds``) measurements:
+#   shape    4wave   4wave_lds  ratio
+#   64²      9 μs    8 μs       1.16×  — LDS slightly wins
+#   128²     10 μs   9 μs       1.15×
+#   256²     11 μs   13 μs      0.84×  — non-LDS wins (barrier/LDS cost)
+#   512²     19 μs   26 μs      0.73×  — non-LDS wins
+#   1024²    32 μs   47 μs      0.68×  — non-LDS wins
+#   2048²    167 μs  114 μs     1.47×  — cooperative LDS wins
+#   4096²    1320 μs 718 μs     1.84×  — cooperative LDS wins
+#
+# Crossover ≈ M·N·K ≈ 2048³ where HBM bandwidth becomes the bottleneck
+# and the 2× HBM reduction from LDS sharing pays back the barriers.
+_TUNED_TABLE: List[TuneEntry] = [
+    TuneEntry(
+        predicate=lambda M, N, K, dt: (
+            dt in (torch.float16, torch.bfloat16)
+            and M >= 2048 and N >= 2048
+            and M % 64 == 0 and N % 64 == 0 and K % 16 == 0
+        ),
+        kernel="4wave_64x64_lds",
+        notes=(
+            "Large shapes (≥ 2048²): cooperative-LDS sharing cuts HBM reads "
+            "2× and outweighs the per-k-tile barrier cost — 1.47-1.84× vs "
+            "non-LDS 4wave on MI355X at 2048² / 4096²."
+        ),
+    ),
+]
 
 
 def select_best_kernel(
