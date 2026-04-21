@@ -64,6 +64,9 @@ KERNEL_REGISTRY = {
     "128x128_k32": lambda: _lazy_import(
         "quack.amd.gemm_gfx950_128x128_k32", "gemm_128x128_k32"
     ),
+    "128x128_ldma": lambda: _lazy_import(
+        "quack.amd.gemm_gfx950_128x128_ldma", "gemm_128x128_ldma"
+    ),
 }
 
 
@@ -140,6 +143,17 @@ class TuneEntry:
 # K=32 wins at 1024–3999 where MFMA throughput is the bottleneck; at
 # 4096² the working set spills L2 and HBM bandwidth dominates over
 # MFMA issue rate.
+#
+# 2026-04-21 Direct HBM→LDS DMA (``128x128_ldma``): uses
+# rocdl.raw_ptr_buffer_load_lds so the coop load skips the
+# gmem→reg→LDS roundtrip. Same data, fewer wait-counter classes,
+# tighter MFMA/load interleave:
+#   shape    k16 (128x128)   ldma
+#   1024²    107             95.7   1.12× faster
+#   2048²    278             220    1.27× faster
+#   4096²    412             340    1.21× faster   ← finally closes some of HBM gap
+# LDMA wins everywhere 128x128 runs; replaces the K=16 128x128 entry
+# for 4096² since it strictly dominates there.
 _TUNED_TABLE: List[TuneEntry] = [
     TuneEntry(
         predicate=lambda M, N, K, dt: (
@@ -147,10 +161,10 @@ _TUNED_TABLE: List[TuneEntry] = [
             and M >= 4096 and N >= 4096
             and M % 128 == 0 and N % 128 == 0 and K % 16 == 0
         ),
-        kernel="128x128",
+        kernel="128x128_ldma",
         notes=(
-            "Very large shapes (≥ 4096²): 128×128 tile amortises barrier "
-            "+ LDS overhead; 1.77× vs lds_pp at 4096² on MI355X."
+            "Very large shapes (≥ 4096²): 128×128 with direct HBM→LDS DMA; "
+            "1.21× vs the scalar-stage 128×128, 2.14× vs lds_pp at 4096²."
         ),
     ),
     TuneEntry(
