@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.amd.linear import linear, linear_residual
+from quack.amd.linear import linear, linear_mxfp8, linear_residual
 from quack.amd.mlp import mlp, gated_mlp
 from quack.amd.linear_cross_entropy import linear_cross_entropy
 
@@ -105,6 +105,41 @@ def test_gated_mlp_swiglu():
     w_down = torch.randn(64, 128, device="cuda")
     out = gated_mlp(x, w_gate_up, w_down, gate_type="swiglu")
     assert out.shape == (4, 64)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M,N,K", [(128, 256, 64), (512, 512, 128), (1024, 1024, 256)])
+def test_linear_splitk_path(dtype, M, N, K):
+    """linear(x, w) with aligned shapes + no bias/activation routes to
+    gemm_splitk. Verify bit-exact match with F.linear (the same hipBLASLt
+    MFMA path these kernels target)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(M, K, device="cuda", dtype=dtype)
+    w = torch.randn(N, K, device="cuda", dtype=dtype)
+    out = linear(x, w)
+    ref = torch.nn.functional.linear(x, w)
+    # gemm_splitk matches hipBLASLt bit-exactly on gfx950 (same MFMA atom).
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+def test_linear_mxfp8():
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch build lacks fp8 support")
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 128
+    x = (torch.randn(M, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    w = (torch.randn(N, K, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    scale_x = torch.ones(K // 128, M, device="cuda", dtype=torch.float32)
+    scale_w = torch.ones(N // 128, K // 128, device="cuda", dtype=torch.float32)
+    out = linear_mxfp8(x, w, scale_x, scale_w)
+    # scale=1 reduces to plain fp8 matmul.
+    ref = (x.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out.float(), ref.float(), atol=5e-2, rtol=1e-2)
+    assert out.dtype == torch.bfloat16
 
 
 def test_linear_cross_entropy_matches_torch():
