@@ -423,6 +423,71 @@ def test_linear_mxfp8_func_gradcheck():
     assert losses[2] <= losses[1], f"loss went up step 1→2: {losses}"
 
 
+@pytest.mark.parametrize("activation", ["relu", "silu", "relu_sq", "gelu_tanh_approx"])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_linear_mxfp8_func_autograd_with_activation(activation, use_bias):
+    """Autograd support for linear_mxfp8_func with fused bias + activation.
+
+    Compares our backward to torch autograd running on the SAME mxfp8
+    preact — not a bf16 reference preact. Going through bf16 instead
+    would introduce sign-flip divergence near zero crossings for
+    relu-family activations (fp8 quantisation perturbs preact by ~5%
+    and flips which side of zero it sits on, making ``act'(preact)``
+    completely different between paths). Sharing the preact isolates
+    the backward-math correctness from forward-quantisation noise."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch build lacks fp8 support")
+    from quack.amd.mxfp8_ops import linear_mxfp8_func, quantize_mxfp8, _quantize_weight_with_block_scale
+    from quack.amd.gemm_gfx950_blockscaled import mxfp8_gemm
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    b = None
+    if use_bias:
+        b = (torch.randn(N, device="cuda", dtype=torch.float32) * 0.1).detach().requires_grad_(True)
+
+    y = linear_mxfp8_func(x, w, bias=b, activation=activation)
+    y.sum().backward()
+    ours_dx, ours_dw = x.grad.clone(), w.grad.clone()
+    ours_db = b.grad.clone() if use_bias else None
+
+    # Reference: compute preact through the same mxfp8 path (no grad),
+    # then run torch autograd on preact → activation, using preact as
+    # the "leaf" for dpreact. Work backward from dpreact to dx, dw, db
+    # via explicit matmuls (same math linear_mxfp8_func.backward does).
+    with torch.no_grad():
+        x_fp8, sx = quantize_mxfp8(x.detach(), transpose_scale=True)
+        w_fp8, sw = _quantize_weight_with_block_scale(w.detach())
+        preact_actual = mxfp8_gemm(
+            x_fp8, w_fp8, sx, sw, out_dtype=x.dtype,
+            bias=b.detach() if use_bias else None,
+            activation="none",
+        )
+    # Torch autograd on preact → activation gives us dpreact exactly.
+    preact_leaf = preact_actual.detach().requires_grad_(True)
+    if activation == "relu":
+        y_ref = torch.relu(preact_leaf)
+    elif activation == "silu":
+        y_ref = torch.nn.functional.silu(preact_leaf)
+    elif activation == "relu_sq":
+        y_ref = torch.relu(preact_leaf) * preact_leaf
+    elif activation == "gelu_tanh_approx":
+        y_ref = torch.nn.functional.gelu(preact_leaf, approximate="tanh")
+    y_ref.sum().backward()
+    dpreact_ref = preact_leaf.grad
+    ref_dx = torch.mm(dpreact_ref, w.detach())
+    ref_dw = torch.mm(dpreact_ref.t(), x.detach())
+    ref_db = dpreact_ref.sum(dim=0).to(torch.float32) if use_bias else None
+
+    torch.testing.assert_close(ours_dx, ref_dx, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(ours_dw, ref_dw, atol=1e-2, rtol=1e-2)
+    if use_bias:
+        torch.testing.assert_close(ours_db, ref_db, atol=1e-2, rtol=1e-2)
+
+
 def test_linear_mxfp8():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")

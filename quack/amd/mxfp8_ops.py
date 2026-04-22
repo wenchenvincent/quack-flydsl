@@ -103,59 +103,87 @@ class _LinearMXFP8Function(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, weight: Tensor, bias, activation):
-        # Save pre-quant bf16 tensors for backward.
-        ctx.save_for_backward(x, weight, bias if bias is not None else torch.empty(0))
         ctx.x_dtype = x.dtype
         ctx.weight_dtype = weight.dtype
         ctx.activation = activation
         ctx.has_bias = bias is not None
+        is_activated = activation is not None and activation != "none"
         # Quantise on the fly. Scale layouts match mxfp8_gemm's contract.
-        x_fp8, scale_x = quantize_mxfp8(x, transpose_scale=True)  # (K//128, M)
+        x_fp8, scale_x = quantize_mxfp8(x, transpose_scale=True)   # (K//128, M)
         w_fp8, scale_w = _quantize_weight_with_block_scale(weight)  # (N//128, K//128)
+        # Unfused forward: get the pre-activation from the kernel (bias
+        # stays fused since it has no bwd data dependency), then apply
+        # the activation on torch side. Saving preact lets the backward
+        # compute the exact per-sample act_prime without recompute.
+        # Fused activation in the kernel would 2× either fwd or bwd —
+        # the unfused path is the same 3 matmuls as the naive pattern,
+        # with the bias add amortised into the kernel. See NV QuACK
+        # ``MLPRecomputeFunc`` for the alternative (preact-recompute
+        # on bwd) — not measured faster at AMD shapes given the mxfp8
+        # kernel's current ~32% peak efficiency.
         preact = mxfp8_gemm(
             x_fp8, w_fp8, scale_x, scale_w, out_dtype=x.dtype,
-            bias=bias, activation=activation or "none",
+            bias=bias,
+            activation="none",
         )
-        if activation is not None and activation != "none":
-            # Save pre-activation for activation-backward. When activation
-            # is None, preact == output and we skip the save (bwd is just
-            # two matmuls).
-            #
-            # For the fused path mxfp8_gemm returns the POST-activation
-            # output — so the "preact" we need for bwd is out_of_linear =
-            # preact = linear(x, w, bias). Recompute by running mxfp8_gemm
-            # without activation would 2× the forward cost. Alternative:
-            # back-apply inverse-activation. Neither is great.
-            #
-            # Pragmatic choice: save the POST-activation ``y`` and in
-            # backward, recompute the pre-activation via a cheap torch
-            # pass. swiglu/silu/gelu_tanh aren't easily invertible, so
-            # we actually save ``y`` and a small extra kernel launch to
-            # derive ``dy_preact = act_bwd(y, grad_out)``. That's a
-            # follow-up. For now: the kernel epi is used on forward for
-            # fast inference; training with activation dispatches to the
-            # unfused path (bias only in the kernel, activation torch-side).
-            raise NotImplementedError(
-                "training-mode activation not wired through the fused "
-                "epi path yet (it needs preact-recompute infra). Call "
-                "mxfp8_gemm(..., activation=...) directly for inference."
-            )
-        return preact
+        if is_activated:
+            if activation == "relu":
+                out = torch.relu(preact)
+            elif activation == "silu":
+                out = torch.nn.functional.silu(preact)
+            elif activation == "relu_sq":
+                out = torch.relu(preact) * preact
+            elif activation == "gelu_tanh_approx":
+                out = torch.nn.functional.gelu(preact, approximate="tanh")
+            else:
+                raise ValueError(f"unknown activation {activation!r}")
+        else:
+            out = preact
+        ctx.save_for_backward(
+            x, weight,
+            bias if bias is not None else torch.empty(0),
+            preact if is_activated else torch.empty(0),
+        )
+        return out
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
-        x, weight, bias_saved = ctx.saved_tensors
-        # grad_out is (M, N) in x.dtype (bf16 typically).
-        # dx = grad_out @ weight  — NN matmul, (M, N) × (N, K) → (M, K).
-        # dw = grad_out.T @ x     — NN matmul, (N, M) × (M, K) → (N, K).
+        x, weight, bias_saved, preact = ctx.saved_tensors
+        # dpreact = grad_out * act'(preact)  (elementwise, in f32).
+        # When activation is None, dpreact = grad_out directly.
+        if ctx.activation is None or ctx.activation == "none":
+            dpreact = grad_out
+        else:
+            p32 = preact.float()
+            g32 = grad_out.float()
+            if ctx.activation == "relu":
+                deriv = (p32 > 0).float()
+            elif ctx.activation == "relu_sq":
+                # d/dx[relu(x)*x] = 2*x * (x > 0)
+                deriv = 2.0 * p32 * (p32 > 0).float()
+            elif ctx.activation == "silu":
+                sig = torch.sigmoid(p32)
+                deriv = sig * (1.0 + p32 * (1.0 - sig))
+            elif ctx.activation == "gelu_tanh_approx":
+                import math as _m
+                c1 = _m.sqrt(2.0 / _m.pi)
+                z = c1 * (p32 + 0.044715 * p32.pow(3))
+                th = torch.tanh(z)
+                dz = c1 * (1.0 + 3.0 * 0.044715 * p32.pow(2))
+                deriv = 0.5 * (1.0 + th) + 0.5 * p32 * (1.0 - th * th) * dz
+            else:
+                raise ValueError(f"unknown activation {ctx.activation!r}")
+            dpreact = (g32 * deriv).to(grad_out.dtype)
+        # dx = dpreact @ weight  — NN matmul, (M, N) × (N, K) → (M, K).
+        # dw = dpreact.T @ x     — NN matmul, (N, M) × (M, K) → (N, K).
         # torch.mm / hipBLASLt handle these at ~2× fp8 compute density
         # (bf16 matrix-core throughput). Training stays numerically stable
-        # because grad_out arrived in bf16, not fp8.
-        grad_x = torch.mm(grad_out, weight) if ctx.needs_input_grad[0] else None
-        grad_w = torch.mm(grad_out.t(), x) if ctx.needs_input_grad[1] else None
+        # because dpreact arrived in bf16, not fp8.
+        grad_x = torch.mm(dpreact, weight) if ctx.needs_input_grad[0] else None
+        grad_w = torch.mm(dpreact.t(), x) if ctx.needs_input_grad[1] else None
         grad_bias = None
         if ctx.has_bias and ctx.needs_input_grad[2]:
-            grad_bias = grad_out.sum(dim=0).to(torch.float32)
+            grad_bias = dpreact.sum(dim=0).to(torch.float32)
         return grad_x, grad_w, grad_bias, None
 
 
@@ -175,12 +203,18 @@ def linear_mxfp8_func(
     Accepts tensors with ``requires_grad=True`` and participates in the
     autograd graph — no manual scale plumbing needed.
 
+    Training with ``activation``: the autograd forward uses the unfused
+    kernel path (fused bias only; activation torch-side) and saves the
+    preact tensor so backward can compute ``act'(preact)`` exactly. This
+    matches the total-matmul count of the naive
+    ``F.silu(F.linear(x, w, b))`` pattern at the torch level (3 matmuls
+    for fwd + bwd). The fused-kernel activation path in
+    ``mxfp8_gemm(..., activation=...)`` is still available for
+    no-grad / inference use where it saves one kernel launch per call.
+
+    Supported activations: relu, relu_sq, silu, gelu_tanh_approx.
+
     Limitations:
-      - ``activation`` only supported in forward/inference. The backward
-        path for activated mxfp8 requires preact recompute (follow-up).
-        For activation in training use ``linear(x, w, bias, activation)``
-        on bf16, or ``mxfp8_gemm(..., activation=...)`` directly (no
-        autograd).
       - x and weight must be the same dtype (bf16 or f16). Mixed-precision
         across them isn't supported.
     """
