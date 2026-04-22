@@ -146,7 +146,6 @@ def test_linear_cross_entropy_matches_torch():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     torch.manual_seed(0)
-    # M=1 matches the cross_entropy_fwd constraint.
     x = torch.randn(1, 64, device="cuda")
     w = torch.randn(256, 64, device="cuda")
     target = torch.randint(0, 256, (1,), device="cuda", dtype=torch.int64)
@@ -156,3 +155,37 @@ def test_linear_cross_entropy_matches_torch():
     ref_lse = torch.logsumexp(logits, dim=-1)
     torch.testing.assert_close(loss, ref_loss, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(lse, ref_lse, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("B_L,V,d", [(2048, 512, 128), (4096, 1024, 256)])
+@pytest.mark.parametrize("chunk_size", [1024, 2048])
+def test_linear_cross_entropy_chunked_matches_unchunked(B_L, V, d, chunk_size):
+    """The chunked path must produce the same loss as the single-chunk path —
+    CE is per-row so chunking along the batch dim is loss-preserving."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(B_L, d, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(V, d, device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(0, V, (B_L,), device="cuda", dtype=torch.int64)
+    loss_chunked, _ = linear_cross_entropy(x, w, target, chunk_size=chunk_size)
+    loss_unchunked, _ = linear_cross_entropy(x, w, target, chunk_size=B_L)
+    # Same kernel path on each chunk — matches bit-exactly.
+    torch.testing.assert_close(loss_chunked, loss_unchunked, atol=0, rtol=0)
+
+
+def test_linear_cross_entropy_chunked_matches_torch():
+    """End-to-end: chunked path matches F.linear + F.cross_entropy within
+    bf16 tolerance for a realistic LLM-scale shape."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    B_L, V, d = 4096, 4096, 256
+    x = torch.randn(B_L, d, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(V, d, device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(0, V, (B_L,), device="cuda", dtype=torch.int64)
+    loss, _ = linear_cross_entropy(x, w, target, chunk_size=1024)
+    ref_logits = torch.nn.functional.linear(x.float(), w.float())
+    ref_loss = torch.nn.functional.cross_entropy(ref_logits, target, reduction="none")
+    # bf16 matmul + CE — moderate tolerance.
+    torch.testing.assert_close(loss, ref_loss, atol=5e-1, rtol=5e-2)
