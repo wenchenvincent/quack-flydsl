@@ -225,6 +225,81 @@ def test_linear_gated(gate_type, use_bias):
     )
 
 
+@pytest.mark.parametrize("activation", ["silu", "relu", "gelu_tanh_approx", "relu_sq"])
+def test_linear_act_func_autograd(activation):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.linear_training import linear_act_func
+    torch.manual_seed(0)
+    M, N, K = 256, 512, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    y = linear_act_func(x, w, activation)
+    y.sum().backward()
+    ours_dx, ours_dw = x.grad.clone(), w.grad.clone()
+
+    x.grad = None
+    w.grad = None
+    xr = x.detach().clone().requires_grad_(True)
+    wr = w.detach().clone().requires_grad_(True)
+    lin = torch.nn.functional.linear(xr, wr)
+    if activation == "silu":
+        ref = torch.nn.functional.silu(lin)
+    elif activation == "relu":
+        ref = torch.relu(lin)
+    elif activation == "gelu_tanh_approx":
+        ref = torch.nn.functional.gelu(lin, approximate="tanh")
+    elif activation == "relu_sq":
+        ref = torch.relu(lin) * lin
+    ref.sum().backward()
+    # Backward matmuls run in torch bf16 on both sides — bit-exact.
+    torch.testing.assert_close(ours_dx, xr.grad, atol=0, rtol=0)
+    torch.testing.assert_close(ours_dw, wr.grad, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+def test_linear_gated_func_autograd(gate_type):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.linear_training import linear_gated_func
+    torch.manual_seed(0)
+    M, hidden, K = 256, 256, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(2 * hidden, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    y = linear_gated_func(x, w, gate_type=gate_type)
+    y.sum().backward()
+    ours_dx, ours_dw = x.grad.clone(), w.grad.clone()
+
+    x.grad = None
+    w.grad = None
+    xr = x.detach().clone().requires_grad_(True)
+    wr = w.detach().clone().requires_grad_(True)
+    lin = torch.nn.functional.linear(xr, wr)
+    gate, up = lin.chunk(2, dim=-1)
+    if gate_type == "swiglu":
+        ref = torch.nn.functional.silu(gate) * up
+    elif gate_type == "reglu":
+        ref = torch.relu(gate) * up
+    elif gate_type == "geglu":
+        ref = torch.nn.functional.gelu(gate, approximate="tanh") * up
+    elif gate_type == "glu":
+        ref = torch.sigmoid(gate) * up
+    ref.sum().backward()
+    # swiglu and reglu happen to match bit-exactly (simple ops); geglu
+    # and glu pass through tanh/sigmoid in our path vs torch's compiled
+    # autograd, giving 1-ulp bf16 drift on a small fraction of elements.
+    # Allow 1 bf16 ULP at matmul magnitudes (dx magnitudes reach ~60 at
+    # this shape, so 0.5 abs / 1% rel is the right band).
+    if gate_type in ("swiglu", "reglu"):
+        atol, rtol = 0, 0
+    else:
+        atol, rtol = 0.5, 0.01
+    torch.testing.assert_close(ours_dx, xr.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(ours_dw, wr.grad, atol=atol, rtol=rtol)
+
+
 def test_linear_mxfp8_func_autograd():
     """MX-FP8 linear with autograd — forward in fp8 via mfma_scale, backward in bf16."""
     if not torch.cuda.is_available():
