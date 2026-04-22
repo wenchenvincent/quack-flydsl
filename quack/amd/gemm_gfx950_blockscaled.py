@@ -96,11 +96,12 @@ def _pick_config(M: int, N: int, K: int):
     tm = 128 if M % 128 == 0 else (64 if M % 64 == 0 else 32)
     tn = 128 if N % 128 == 0 else 64
     tk = 128
-    # CShuffle off by default — it's marginal at best on this kernel
-    # and triggers a numerics bug at (128, 128, 128) that we haven't
-    # isolated yet. Leaving the flag plumbed so a future tuning pass
-    # can re-enable it per shape once the small-shape case is fixed.
-    cshuffle = False
+    # CShuffle epilogue: ~+1% throughput via staged LDS writeback on
+    # large shapes. Correctness tested OK for K ≥ 256; breaks at K = 128
+    # (single K-tile iteration — prologue/epilogue interaction isn't
+    # sound in that case, produces garbage). Narrow gate keeps the win
+    # at the shapes that matter and sidesteps the bug at tiny K.
+    cshuffle = K >= 256
     waves = 2
     return (tm, tn, tk, cshuffle, waves)
 
