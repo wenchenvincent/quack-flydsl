@@ -105,6 +105,27 @@ def test_rmsnorm_bwd(dtype, M, N):
     torch.testing.assert_close(dw, ref_dw, atol=dw_atol, rtol=1e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("M,N", [(8192, 4096), (4096, 8192), (2048, 4096)])
+def test_rmsnorm_bwd_dw_2stage(dtype, M, N):
+    """Explicit coverage of the M≥1024, M%128=0, N%128=0 path that now
+    routes through the 2-stage partial+final kernels. Correctness check
+    against torch reference — the 2-stage reduction order differs from
+    the single-thread version but both should match torch within the
+    usual reduction tolerance band."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=dtype) * 0.1
+    w = torch.randn(N, device="cuda", dtype=dtype)
+    dout = torch.randn(M, N, device="cuda", dtype=dtype)
+    _, rstd, _ = rmsnorm_fwd(x, w, store_rstd=True)
+    _, dw = rmsnorm_bwd(x, w, dout, rstd)
+    ref_dw = (dout.float() * (x.float() * rstd.float().unsqueeze(-1))).sum(dim=0).to(dtype)
+    dw_atol = {torch.float32: 1e-3, torch.float16: 5e-3, torch.bfloat16: 5e-1}[dtype]
+    torch.testing.assert_close(dw, ref_dw, atol=dw_atol, rtol=1e-3)
+
+
 def _ref_layernorm_bwd(x, weight, dout, rstd, mean, bias=None, eps=1e-6):
     x_f = x.float()
     w_f = weight.float()

@@ -603,6 +603,228 @@ def _build_layernorm_dw(*, N, dtype, weight_dtype, arch):
     )
 
 
+# --- 2-stage dw reduction ---------------------------------------------------
+#
+# The single-pass ``_build_norm_dw`` accumulates an entire column's M values
+# in one thread, which makes the kernel M-serial — huge M with moderate N
+# (typical LLM training) leaves CUs idle. The 2-stage path parallelises
+# across M:
+#
+#   Stage 1 (``_build_norm_dw_partial``)
+#       Grid ``(N / TILE_N, M / M_TILE)``.  Each WG has ``TILE_N`` threads,
+#       one per column in its N-tile.  Each thread accumulates ``M_TILE``
+#       contributions (``x_hat[m,c] * dout[m,c]``) in f32 and writes one
+#       f32 scalar to ``scratch[m_tile_idx, c]``.
+#
+#   Stage 2 (``_build_norm_dw_final``)
+#       Grid ``(N / 128, 1)``.  One thread per column, sums the
+#       ``num_m_tiles`` partials, casts to weight dtype, stores ``dw[j]``.
+#
+# ``scratch`` is ``(M // M_TILE, N)`` in f32 — row-major, last-dim
+# contiguous so stage-1 writes and stage-2 strided-reads both touch whole
+# rows at a time. With ``M_TILE = 128`` and typical ``(M, N) = (8192,
+# 8192)`` the scratch footprint is ``64 * 8192 * 4`` = 2 MB.
+#
+# Stage 1 uses a compile-time ``range_constexpr(M_TILE)`` to unroll the
+# inner M loop — each thread holds exactly one f32 accumulator across the
+# fully-unrolled loop.
+
+
+_M_TILE_DEFAULT = 128
+_TILE_N_PARTIAL = 128
+
+
+def _build_norm_dw_partial(
+    *, N, dtype, is_layernorm, arch,
+    m_tile: int = _M_TILE_DEFAULT,
+    tile_n: int = _TILE_N_PARTIAL,
+):
+    """Stage 1 — per-(m_tile, n_tile) partial: one thread per column in the
+    tile, f32 accumulator over ``m_tile`` rows.
+
+    ``scratch`` has shape ``(num_m_tiles, N)`` f32, last-dim contiguous.
+    Writes ``scratch[blk_y, blk_x * tile_n + tid] = sum_{mm} x_hat[m_start+mm, c] * dout[...]``.
+    """
+    block_threads = tile_n
+    elem_bits = dtype.width
+
+    tag = "layernorm" if is_layernorm else "rmsnorm"
+    sym = (
+        f"quack_amd_{tag}_bwd_dw_partial_{N}_"
+        f"{dtype.__name__}_mt{m_tile}_tn{tile_n}_smem"
+    )
+    allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
+
+    @flyc.kernel
+    def kernel(
+        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, Mean: fx.Tensor,
+        Scratch: fx.Tensor,
+    ):
+        bx = fx.block_idx.x        # n-tile
+        by = fx.block_idx.y        # m-tile
+        tid = fx.thread_idx.x
+        # Global column for this thread.
+        c_local = tid
+        n_start = bx * fx.Int32(tile_n)
+        c = n_start + c_local
+
+        elem_type = _elem_type_for(dtype)
+        compute_type = T.f32
+
+        X_buf = fx.rocdl.make_buffer_tensor(X)
+        DOut_buf = fx.rocdl.make_buffer_tensor(DOut)
+        Rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
+        Mean_buf = fx.rocdl.make_buffer_tensor(Mean)
+        Scratch_buf = fx.rocdl.make_buffer_tensor(Scratch)
+
+        rstd_div = fx.logical_divide(Rstd_buf, fx.make_layout(1, 1))
+        mean_div = fx.logical_divide(Mean_buf, fx.make_layout(1, 1))
+        scratch_div = fx.logical_divide(Scratch_buf, fx.make_layout(1, 1))
+
+        copy_atom_x = fx.make_copy_atom(_bufcopy_for(elem_bits), elem_type)
+        copy_atom_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        x_reg_ty = fx.MemRefType.get(elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load(div, reg_ty, ca, idx):
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            fx.copy_atom_call(ca, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store(div, reg_ty, ca, idx, val):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(reg_ty.element_type)
+            ts = _vfull(1, elem_py(val), elem_py)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
+
+        m_start = by * fx.Int32(m_tile)
+        acc = ArithValue(arith.constant(0.0, type=compute_type))
+
+        for mm in range_constexpr(m_tile):
+            m_i32 = m_start + fx.Int32(mm)
+            row_x = fx.slice(X_buf, (m_i32, None))
+            row_dout = fx.slice(DOut_buf, (m_i32, None))
+            x_div = fx.logical_divide(row_x, fx.make_layout(1, 1))
+            dout_div = fx.logical_divide(row_dout, fx.make_layout(1, 1))
+            x_e = _load(x_div, x_reg_ty, copy_atom_x, c)
+            d_e = _load(dout_div, x_reg_ty, copy_atom_x, c)
+            r_e = _load(rstd_div, f_reg_ty, copy_atom_f, m_i32)
+            x = x_e if dtype is Float32 else x_e.extf(compute_type)
+            d = d_e if dtype is Float32 else d_e.extf(compute_type)
+            if is_layernorm:
+                mean_e = _load(mean_div, f_reg_ty, copy_atom_f, m_i32)
+                x_hat = (ArithValue(x) - ArithValue(mean_e)) * ArithValue(r_e)
+            else:
+                x_hat = ArithValue(x) * ArithValue(r_e)
+            acc = acc + x_hat * ArithValue(d)
+
+        # Scratch is logically (num_m_tiles, N); store scratch[by, c].
+        row_scratch = fx.slice(Scratch_buf, (by, None))
+        scratch_row_div = fx.logical_divide(row_scratch, fx.make_layout(1, 1))
+        _store(scratch_row_div, f_reg_ty, copy_atom_f, c, acc)
+
+    @flyc.jit
+    def launch(
+        X: fx.Tensor, DOut: fx.Tensor, Rstd: fx.Tensor, Mean: fx.Tensor,
+        Scratch: fx.Tensor, M: fx.Int32, stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        grid_x = N // tile_n
+        grid_y = (M + m_tile - 1) // m_tile
+        kernel(X, DOut, Rstd, Mean, Scratch).launch(
+            grid=(grid_x, grid_y, 1),
+            block=(block_threads, 1, 1), stream=stream,
+        )
+
+    return launch
+
+
+def _build_norm_dw_final(*, N, weight_dtype, arch):
+    """Stage 2 — column-sum over ``num_m_tiles`` f32 partials, cast to
+    weight dtype, store ``dw[j]``. One thread per column.
+
+    ``num_m_tiles`` is supplied at launch as ``scf.for`` bound so one
+    compiled kernel covers all M values.
+    """
+    block_threads = 128
+    w_elem_bits = weight_dtype.width
+    sym = f"quack_amd_norm_bwd_dw_final_{N}_{weight_dtype.__name__}_smem"
+    allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
+
+    @flyc.kernel
+    def kernel(
+        Scratch: fx.Tensor, DW: fx.Tensor, NumMT: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        j = bid * fx.Int32(block_threads) + tid
+
+        w_elem_type = _elem_type_for(weight_dtype)
+        compute_type = T.f32
+
+        Scratch_buf = fx.rocdl.make_buffer_tensor(Scratch)
+        DW_buf = fx.rocdl.make_buffer_tensor(DW)
+        dw_div = fx.logical_divide(DW_buf, fx.make_layout(1, 1))
+
+        copy_atom_w = fx.make_copy_atom(_bufcopy_for(w_elem_bits), w_elem_type)
+        copy_atom_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        w_reg_ty = fx.MemRefType.get(w_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load(div, reg_ty, ca, idx):
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            fx.copy_atom_call(ca, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store(div, reg_ty, ca, idx, val):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(reg_ty, reg_lay)
+            elem_py = Numeric.from_ir_type(reg_ty.element_type)
+            ts = _vfull(1, elem_py(val), elem_py)
+            fx.memref_store_vec(ts, r)
+            fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
+
+        c_zero_f = arith.constant(0.0, type=compute_type)
+        j_iv = j.ir_value() if hasattr(j, "ir_value") else j
+        n_i32 = arith.constant(N, type=T.i32)
+
+        for mt, state in range(0, NumMT, init=[c_zero_f]):
+            mt_i32 = ArithValue(mt).index_cast(T.i32)
+            row_scratch = fx.slice(Scratch_buf, (mt_i32, None))
+            scratch_row_div = fx.logical_divide(row_scratch, fx.make_layout(1, 1))
+            v = _load(scratch_row_div, f_reg_ty, copy_atom_f, j)
+            results = yield [ArithValue(state[0]) + ArithValue(v)]
+
+        acc = results
+
+        if arith.cmpi(arith.CmpIPredicate.slt, j_iv, n_i32):
+            out_val = acc if weight_dtype is Float32 else ArithValue(acc).truncf(w_elem_type)
+            _store(dw_div, w_reg_ty, copy_atom_w, j, out_val)
+
+    @flyc.jit
+    def launch(
+        Scratch: fx.Tensor, DW: fx.Tensor, NumMT: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        grid_x = (N + block_threads - 1) // block_threads
+        kernel(Scratch, DW, NumMT).launch(
+            grid=(grid_x, 1, 1), block=(block_threads, 1, 1), stream=stream,
+        )
+
+    return launch
+
+
 def _build_layernorm_db(*, N, dtype, bias_dtype, arch):
     """``db[j] = sum_over_m(dout[m, j])`` — column-parallel like dw, no rstd/mean."""
     block_threads = 128
@@ -691,6 +913,8 @@ def _build_layernorm_db(*, N, dtype, bias_dtype, arch):
 _fwd_cache: dict = {}
 _bwd_cache: dict = {}
 _bwd_dw_cache: dict = {}
+_bwd_dw_partial_cache: dict = {}
+_bwd_dw_final_cache: dict = {}
 _ln_bwd_cache: dict = {}
 _ln_bwd_dw_cache: dict = {}
 _ln_bwd_db_cache: dict = {}
@@ -751,6 +975,29 @@ def _compile_bwd_dw(N, x_dt, w_dt, arch):
             weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
         )
         _bwd_dw_cache[key] = got
+    return got
+
+
+def _compile_bwd_dw_partial(N, x_dt, arch, is_layernorm=False):
+    key = (N, x_dt, arch, is_layernorm)
+    got = _bwd_dw_partial_cache.get(key)
+    if got is None:
+        got = _build_norm_dw_partial(
+            N=N, dtype=torch2flydsl_dtype_map[x_dt],
+            is_layernorm=is_layernorm, arch=arch,
+        )
+        _bwd_dw_partial_cache[key] = got
+    return got
+
+
+def _compile_bwd_dw_final(N, w_dt, arch):
+    key = (N, w_dt, arch)
+    got = _bwd_dw_final_cache.get(key)
+    if got is None:
+        got = _build_norm_dw_final(
+            N=N, weight_dtype=torch2flydsl_dtype_map[w_dt], arch=arch,
+        )
+        _bwd_dw_final_cache[key] = got
     return got
 
 
@@ -896,9 +1143,27 @@ def _rmsnorm_bwd_dw(
     assert rstd.dim() == 1 and rstd.size(0) == x.size(0) and rstd.dtype == torch.float32
     assert all(t.stride(-1) == 1 for t in (x, dout))
     M, N = x.shape
-    launcher = _compile_bwd_dw(N, x.dtype, dw.dtype, get_rocm_arch())
-    # Same stand-in trick as _rmsnorm_bwd_dx — Mean slot unused here.
-    launcher(x, dout, rstd, rstd, dw, M)
+    arch = get_rocm_arch()
+    # 2-stage reduce is shape-eligible when N is a clean multiple of the
+    # stage-1 threads-per-WG (128), M is a clean multiple of M_TILE (128),
+    # and M is big enough that the extra launch overhead pays off. For
+    # small M the single-pass per-column kernel wins on latency.
+    if (
+        M >= 1024 and M % _M_TILE_DEFAULT == 0
+        and N % _TILE_N_PARTIAL == 0
+    ):
+        num_m_tiles = M // _M_TILE_DEFAULT
+        scratch = torch.empty(
+            (num_m_tiles, N), device=x.device, dtype=torch.float32,
+        )
+        partial = _compile_bwd_dw_partial(N, x.dtype, arch, is_layernorm=False)
+        final = _compile_bwd_dw_final(N, dw.dtype, arch)
+        # Mean slot unused for RMSNorm — stand-in with rstd.
+        partial(x, dout, rstd, rstd, scratch, M)
+        final(scratch, dw, num_m_tiles)
+    else:
+        launcher = _compile_bwd_dw(N, x.dtype, dw.dtype, arch)
+        launcher(x, dout, rstd, rstd, dw, M)
 
 
 @_rmsnorm_bwd_dw.register_fake
@@ -949,8 +1214,22 @@ def _layernorm_bwd_dw(
     assert mean.dim() == 1 and mean.size(0) == x.size(0) and mean.dtype == torch.float32
     assert all(t.stride(-1) == 1 for t in (x, dout))
     M, N = x.shape
-    launcher = _compile_ln_bwd_dw(N, x.dtype, dw.dtype, get_rocm_arch())
-    launcher(x, dout, rstd, mean, dw, M)
+    arch = get_rocm_arch()
+    if (
+        M >= 1024 and M % _M_TILE_DEFAULT == 0
+        and N % _TILE_N_PARTIAL == 0
+    ):
+        num_m_tiles = M // _M_TILE_DEFAULT
+        scratch = torch.empty(
+            (num_m_tiles, N), device=x.device, dtype=torch.float32,
+        )
+        partial = _compile_bwd_dw_partial(N, x.dtype, arch, is_layernorm=True)
+        final = _compile_bwd_dw_final(N, dw.dtype, arch)
+        partial(x, dout, rstd, mean, scratch, M)
+        final(scratch, dw, num_m_tiles)
+    else:
+        launcher = _compile_ln_bwd_dw(N, x.dtype, dw.dtype, arch)
+        launcher(x, dout, rstd, mean, dw, M)
 
 
 @_layernorm_bwd_dw.register_fake

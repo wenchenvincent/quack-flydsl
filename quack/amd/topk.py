@@ -23,6 +23,8 @@ from quack.amd.topk_lds import topk_lds as _topk_lds
 
 _SINGLE_WAVE_N = (8, 16, 32, 64)
 _LDS_N = (128, 256, 512, 1024, 2048, 4096)
+_ALL_KERNEL_N = _SINGLE_WAVE_N + _LDS_N
+_MAX_KERNEL_N = _ALL_KERNEL_N[-1]  # 4096
 _POW2_K = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
@@ -30,7 +32,16 @@ def _is_pow2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
 
 
+def _next_kernel_n(n: int) -> int:
+    """Smallest kernel-supported N ≥ ``n`` (or 0 if too large)."""
+    for cand in _ALL_KERNEL_N:
+        if cand >= n:
+            return cand
+    return 0
+
+
 def _kernel_eligible(x: Tensor, k: int) -> bool:
+    """True iff the exact-N kernel path accepts ``(x, k)`` with no padding."""
     if not (x.is_cuda and x.dim() == 2 and x.dtype == torch.float32):
         return False
     if x.stride(-1) != 1:
@@ -38,7 +49,21 @@ def _kernel_eligible(x: Tensor, k: int) -> bool:
     N = x.size(-1)
     if k not in _POW2_K or k > N:
         return False
-    return N in _SINGLE_WAVE_N or N in _LDS_N
+    return N in _ALL_KERNEL_N
+
+
+def _pad_kernel_eligible(x: Tensor, k: int) -> bool:
+    """True iff we can pad ``x`` with -inf up to a kernel-supported N and
+    run the existing kernel. Requires the padded N to be ≤ 4096."""
+    if not (x.is_cuda and x.dim() == 2 and x.dtype == torch.float32):
+        return False
+    if x.stride(-1) != 1:
+        return False
+    N = x.size(-1)
+    if k not in _POW2_K or k > N:
+        return False
+    padded = _next_kernel_n(N)
+    return padded != 0 and padded != N  # "padded != N" → there's actually padding to do
 
 
 def topk_fwd(
@@ -50,18 +75,40 @@ def topk_fwd(
     into the input's last dim. If ``softmax`` is True, the third
     return is ``softmax(values)`` with the input dtype.
 
-    Uses a FlyDSL bitonic kernel when eligible (f32, last-dim contiguous,
-    N and k powers of 2 in the supported range). Falls back to
-    ``torch.topk`` otherwise — callers that hit the fallback get the
-    same numeric answer, just via a different kernel.
+    Dispatch order:
+      1. Exact-N kernel (N ∈ {8,16,32,64, 128,256,512,1024,2048,4096},
+         k ∈ {1,2,4,8,16,32,64,128}, k ≤ N, f32, last-dim contiguous).
+      2. Padded kernel — non-power-of-2 N ≤ 4096: pad to next kernel N
+         with -inf, run, slice first k. ``-inf`` guarantees the padded
+         slots never beat a real value, so returned indices stay < N.
+      3. ``torch.topk`` fallback — N > 4096 or non-f32 or non-contiguous.
     """
     assert x.is_cuda and x.dim() == 2
+    N_orig = x.size(-1)
     if _kernel_eligible(x, k):
-        N = x.size(-1)
-        if N in _SINGLE_WAVE_N:
+        if N_orig in _SINGLE_WAVE_N:
             values, indices = _topk_mfma_single_wave(x, k=k)
         else:
             values, indices = _topk_lds(x, k=k)
+    elif _pad_kernel_eligible(x, k):
+        padded_n = _next_kernel_n(N_orig)
+        M = x.size(0)
+        pad_width = padded_n - N_orig
+        # ``-inf`` sentinel — comparing ≥ always False against any finite
+        # value, so the pad columns never win top-k. NaN inputs would
+        # break this, but torch.topk has the same caveat.
+        padding = torch.full(
+            (M, pad_width), float("-inf"),
+            device=x.device, dtype=x.dtype,
+        )
+        x_padded = torch.cat([x, padding], dim=-1).contiguous()
+        if padded_n in _SINGLE_WAVE_N:
+            values, indices = _topk_mfma_single_wave(x_padded, k=k)
+        else:
+            values, indices = _topk_lds(x_padded, k=k)
+        # Indices are into x_padded; since pad columns carry -inf they
+        # cannot appear in top-k results (k ≤ N_orig is asserted above),
+        # so indices remain valid in the original-N space.
     else:
         values, indices = torch.topk(x, k, dim=-1)
         indices = indices.to(torch.int32)
