@@ -739,3 +739,158 @@ def test_gated_mlp_func_train_autograd(gate_type):
     torch.testing.assert_close(ours_dx, xr.grad, atol=0.5, rtol=1e-2)
     torch.testing.assert_close(ours_dw_gate_up_inter, wgur.grad, atol=0.5, rtol=1e-2)
     torch.testing.assert_close(ours_dw_down, wdr.grad, atol=0.5, rtol=1e-2)
+
+
+# --- W2: split-K>1 + fused epilogue via two-launch -------------------------
+
+
+@pytest.mark.parametrize("activation", ["none", "relu", "silu"])
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("split_k", [2, 4])
+def test_splitk_bias_act_two_launch(activation, use_bias, split_k):
+    """Force SPLIT_K>1 with bias/activation, routed via two_launch."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk
+    torch.manual_seed(0)
+    M, N, K = 256, 512, 512
+    assert K % split_k == 0
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    bias = torch.randn(N, device="cuda", dtype=torch.float32) * 0.1 if use_bias else None
+    if activation == "none" and not use_bias:
+        pytest.skip("no epilogue — two_launch decision is 'none'")
+
+    out = gemm_splitk(
+        a, b, bias=bias, activation=activation,
+        force_split_k=split_k, splitk_epi_mode="two_launch",
+    )
+    ref = a.float() @ b.float().t()
+    if use_bias:
+        ref = ref + bias
+    if activation == "relu":
+        ref = torch.relu(ref)
+    elif activation == "silu":
+        ref = torch.nn.functional.silu(ref)
+    torch.testing.assert_close(out.float(), ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize("split_k", [2, 4])
+def test_splitk_gated_two_launch(gate_type, split_k):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk, interleave_gated_weight
+    torch.manual_seed(0)
+    M, K, hidden = 256, 512, 256
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    w_gate_up = torch.randn(2 * hidden, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    w_inter = interleave_gated_weight(w_gate_up)
+    out = gemm_splitk(
+        a, w_inter, gate_type=gate_type,
+        force_split_k=split_k, splitk_epi_mode="two_launch",
+    )
+    acc = a.float() @ w_inter.float().t()
+    pairs = acc.view(M, hidden, 2)
+    g = pairs[..., 0]
+    u = pairs[..., 1]
+    if gate_type == "swiglu":
+        ref = torch.nn.functional.silu(g) * u
+    elif gate_type == "reglu":
+        ref = torch.relu(g) * u
+    elif gate_type == "geglu":
+        ref = torch.nn.functional.gelu(g, approximate="tanh") * u
+    elif gate_type == "glu":
+        ref = torch.sigmoid(g) * u
+    torch.testing.assert_close(out.float(), ref.to(torch.bfloat16).float(), atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("activation", ["relu", "silu", "gelu_tanh_approx", "relu_sq"])
+@pytest.mark.parametrize("split_k", [2, 4])
+def test_splitk_dact_two_launch(activation, split_k):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk
+    torch.manual_seed(0)
+    M, N, K = 256, 512, 512
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    preact = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.3
+    out = gemm_splitk(
+        a, b, preact=preact, dact_activation=activation,
+        force_split_k=split_k, splitk_epi_mode="two_launch",
+    )
+    acc = a.float() @ b.float().t()
+    p32 = preact.float()
+    if activation == "relu":
+        deriv = (p32 > 0).float()
+    elif activation == "silu":
+        sig = torch.sigmoid(p32)
+        deriv = sig * (1.0 + p32 * (1.0 - sig))
+    elif activation == "gelu_tanh_approx":
+        import math as _m
+        c1 = _m.sqrt(2.0 / _m.pi)
+        z = c1 * (p32 + 0.044715 * p32.pow(3))
+        th = torch.tanh(z)
+        dz = c1 * (1.0 + 3.0 * 0.044715 * p32.pow(2))
+        deriv = 0.5 * (1.0 + th) + 0.5 * p32 * (1.0 - th * th) * dz
+    elif activation == "relu_sq":
+        deriv = 2.0 * p32 * (p32 > 0).float()
+    ref = (acc * deriv).to(torch.bfloat16)
+    torch.testing.assert_close(out.float(), ref.float(), atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize("split_k", [2, 4])
+def test_splitk_dgated_two_launch(gate_type, split_k):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk
+    torch.manual_seed(0)
+    M, out_dim, hidden = 256, 512, 256
+    a = torch.randn(M, out_dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(hidden, out_dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    preact = torch.randn(M, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 0.3
+
+    dpre, post = gemm_splitk(
+        a, b, dgated_gate_type=gate_type, dgated_preact=preact,
+        dgated_emit_postact=True,
+        force_split_k=split_k, splitk_epi_mode="two_launch",
+    )
+    dy = a.float() @ b.float().t()
+    pairs = preact.view(M, hidden, 2).float()
+    g = pairs[..., 0]
+    u = pairs[..., 1]
+    if gate_type == "swiglu":
+        sig = torch.sigmoid(g)
+        silu_g = g * sig
+        dsilu = sig * (1.0 + g * (1.0 - sig))
+        dgate = dy * dsilu * u
+        dup = dy * silu_g
+        ref_post = silu_g * u
+    elif gate_type == "reglu":
+        mask = (g > 0).float()
+        fwd = torch.relu(g)
+        dgate = dy * mask * u
+        dup = dy * fwd
+        ref_post = fwd * u
+    elif gate_type == "geglu":
+        import math as _m
+        c1 = _m.sqrt(2.0 / _m.pi)
+        z = c1 * (g + 0.044715 * g.pow(3))
+        th = torch.tanh(z)
+        dz = c1 * (1.0 + 3.0 * 0.044715 * g.pow(2))
+        fwd = 0.5 * g * (1.0 + th)
+        dfwd = 0.5 * (1.0 + th) + 0.5 * g * (1.0 - th * th) * dz
+        dgate = dy * dfwd * u
+        dup = dy * fwd
+        ref_post = fwd * u
+    elif gate_type == "glu":
+        sig = torch.sigmoid(g)
+        dsig = sig * (1.0 - sig)
+        dgate = dy * dsig * u
+        dup = dy * sig
+        ref_post = sig * u
+    ref_dpre = torch.stack([dgate, dup], dim=-1).view(M, 2 * hidden).to(torch.bfloat16)
+    torch.testing.assert_close(dpre.float(), ref_dpre.float(), atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(post.float(), ref_post.to(torch.bfloat16).float(), atol=5e-2, rtol=1e-2)

@@ -1247,6 +1247,197 @@ _ALLOWED_DACT = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
 _ALLOWED_DGATED = {"none", "swiglu", "reglu", "geglu", "glu"}
 
 
+# --- W2: split-K>1 + fused-epilogue dispatch -------------------------------
+#
+# Fused bias/activation/gated/dact/dgated epilogues are non-distributive over
+# split-K atomic-fadd partials, so applying them inside the matmul kernel
+# requires SPLIT_K=1. When a problem genuinely benefits from SPLIT_K>1
+# (typically small-M, large-K), we can still express the fused semantics
+# via one of:
+#
+#   "force_splitk1"  — default, fallback. SPLIT_K=1 with the fused-in-kernel
+#                      epilogue. Loses the split-K tile-balance win.
+#   "two_launch"     — run SPLIT_K>1 unfused matmul into a scratch buffer
+#                      (atomic-fadd partials into scratch), then apply the
+#                      epilogue via torch ops as a cheap elementwise pass.
+#                      Extra (M, N) scratch + one HBM round-trip for the
+#                      post-hoc epi.
+#   "last_partial"   — (future) in-kernel last-partial counter that gates
+#                      the epi path: every CU atomic-fadds, the last one to
+#                      increment per-tile runs the epi and stores. Zero
+#                      extra HBM but divergent control flow in the winner
+#                      path.
+#
+# The dispatch table maps ``(M, N, K)`` to a forced mode. Entries are
+# populated by the W3 bench harness. Unlisted shapes default to
+# ``"force_splitk1"`` — matching the pre-W2 behaviour.
+_SPLITK_EPI_MODE_TABLE: dict = {}
+
+
+def _splitk_epi_mode(
+    M: int, N: int, K: int, has_epilogue: bool, proposed_split_k: int,
+    override: Optional[str] = None,
+) -> str:
+    """Decide how to combine SPLIT_K>1 and a fused epilogue.
+
+    Returns ``"none"`` when the decision is moot (no epilogue, or SPLIT_K=1
+    proposed). Otherwise returns one of
+    ``"force_splitk1" / "two_launch" / "last_partial"``.
+    """
+    if not has_epilogue or proposed_split_k <= 1:
+        return "none"
+    if override is not None:
+        return override
+    return _SPLITK_EPI_MODE_TABLE.get((M, N, K), "force_splitk1")
+
+
+def _apply_epi_torch(
+    acc: Tensor,
+    out: Tensor,
+    bias: Optional[Tensor],
+    activation: str,
+    gate_type: str,
+    preact: Optional[Tensor],
+    dact_activation: str,
+    dgated_gate_type: str,
+    dgated_preact: Optional[Tensor],
+    emit_postact: bool,
+    postact_out: Tensor,
+) -> None:
+    """Two-launch epilogue — torch-side implementation of the kernel
+    write-back transforms. Writes into ``out`` (and ``postact_out`` when
+    ``emit_postact``) in place.
+
+    ``acc`` is the raw ``a @ b.T`` of shape ``(M, N)`` in the output
+    dtype — what the kernel produces when called with no epilogue args.
+    """
+    acc32 = acc.float()
+    if dgated_gate_type != "none":
+        # dgated: acc shape (M, hidden), output dpreact shape (M, 2*hidden).
+        M, hidden = acc.shape
+        pairs = dgated_preact.view(M, hidden, 2).float()
+        gate = pairs[..., 0]
+        up = pairs[..., 1]
+        if dgated_gate_type == "swiglu":
+            sig = torch.sigmoid(gate)
+            silu_g = gate * sig
+            dsilu_dg = sig * (1.0 + gate * (1.0 - sig))
+            dgate = acc32 * dsilu_dg * up
+            dup = acc32 * silu_g
+            post = silu_g * up
+        elif dgated_gate_type == "reglu":
+            mask = (gate > 0).float()
+            fwd = torch.relu(gate)
+            dgate = acc32 * mask * up
+            dup = acc32 * fwd
+            post = fwd * up
+        elif dgated_gate_type == "geglu":
+            import math as _m
+            c1 = _m.sqrt(2.0 / _m.pi)
+            z = c1 * (gate + 0.044715 * gate.pow(3))
+            th = torch.tanh(z)
+            dz_dg = c1 * (1.0 + 3.0 * 0.044715 * gate.pow(2))
+            gelu_g = 0.5 * gate * (1.0 + th)
+            dgelu_dg = 0.5 * (1.0 + th) + 0.5 * gate * (1.0 - th * th) * dz_dg
+            dgate = acc32 * dgelu_dg * up
+            dup = acc32 * gelu_g
+            post = gelu_g * up
+        elif dgated_gate_type == "glu":
+            sig = torch.sigmoid(gate)
+            dsig_dg = sig * (1.0 - sig)
+            dgate = acc32 * dsig_dg * up
+            dup = acc32 * sig
+            post = sig * up
+        dpreact = torch.stack([dgate, dup], dim=-1).view(M, 2 * hidden)
+        out.copy_(dpreact.to(out.dtype))
+        if emit_postact:
+            postact_out.copy_(post.to(postact_out.dtype))
+        return
+
+    if bias is not None:
+        acc32 = acc32 + bias  # bias f32, broadcasts last dim
+
+    if gate_type != "none":
+        # Interleaved-pair gated: acc cols [2c, 2c+1] = (gate, up).
+        M, N = acc.shape
+        pairs = acc32.view(M, N // 2, 2)
+        gate = pairs[..., 0]
+        up = pairs[..., 1]
+        if gate_type == "swiglu":
+            gated = torch.nn.functional.silu(gate) * up
+        elif gate_type == "reglu":
+            gated = torch.relu(gate) * up
+        elif gate_type == "geglu":
+            gated = torch.nn.functional.gelu(gate, approximate="tanh") * up
+        elif gate_type == "glu":
+            gated = torch.sigmoid(gate) * up
+        out.copy_(gated.to(out.dtype))
+        return
+
+    if dact_activation != "none":
+        # dpreact = acc * act'(preact)
+        p32 = preact.float()
+        if dact_activation == "relu":
+            deriv = (p32 > 0).float()
+        elif dact_activation == "relu_sq":
+            deriv = 2.0 * p32 * (p32 > 0).float()
+        elif dact_activation == "silu":
+            sig = torch.sigmoid(p32)
+            deriv = sig * (1.0 + p32 * (1.0 - sig))
+        elif dact_activation == "gelu_tanh_approx":
+            import math as _m
+            c1 = _m.sqrt(2.0 / _m.pi)
+            z = c1 * (p32 + 0.044715 * p32.pow(3))
+            th = torch.tanh(z)
+            dz_dp = c1 * (1.0 + 3.0 * 0.044715 * p32.pow(2))
+            deriv = 0.5 * (1.0 + th) + 0.5 * p32 * (1.0 - th * th) * dz_dp
+        out.copy_((acc32 * deriv).to(out.dtype))
+        return
+
+    # Plain bias/activation.
+    if activation == "relu":
+        acc32 = torch.relu(acc32)
+    elif activation == "relu_sq":
+        acc32 = torch.relu(acc32) * acc32
+    elif activation == "silu":
+        acc32 = torch.nn.functional.silu(acc32)
+    elif activation == "gelu_tanh_approx":
+        acc32 = torch.nn.functional.gelu(acc32, approximate="tanh")
+    out.copy_(acc32.to(out.dtype))
+
+
+def _gemm_splitk_raw(
+    a: Tensor, b: Tensor, out: Tensor, shuffled: bool, kwargs: dict,
+) -> None:
+    """Unfused matmul path — no epilogue, respects caller-supplied
+    ``kwargs["SPLIT_K"]`` > 1. Used by the two-launch epi dispatcher.
+    Writes ``out[M, N] = a @ b.T``.
+    """
+    M, K = a.shape
+    N, _ = b.shape
+    if kwargs["B_PRE_SHUFFLE"] and not shuffled:
+        b = shuffle_b(b)
+    stream = torch.cuda.current_stream()
+    sem, state = _get_semaphore(stream)
+    if kwargs["SPLIT_K"] > 1:
+        bm = (M + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
+        bn = N // kwargs["TILE_N"]
+        assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
+    exe = _compile_hgemm_kernel(
+        _DTYPE2STR[a.dtype], N, K, **kwargs,
+        has_bias=False, activation="none", gate_type="none",
+        dact_activation="none", dgated_gate_type="none",
+        emit_postact=False,
+        _m_hint=M,
+    )
+    bias_arg = torch.zeros(1, device=a.device, dtype=torch.float32)
+    preact_arg = torch.zeros(1, device=a.device, dtype=a.dtype)
+    postact_arg = torch.zeros(1, device=a.device, dtype=a.dtype)
+    exe(out, a, b, M, sem, state, bias_arg, preact_arg, postact_arg, stream)
+    if kwargs["SPLIT_K"] > 1:
+        _advance_state(stream)
+
+
 @torch.library.custom_op(
     "quack_amd::_gemm_splitk_out",
     mutates_args=("out", "postact_out"),
@@ -1255,7 +1446,8 @@ _ALLOWED_DGATED = {"none", "swiglu", "reglu", "geglu", "glu"}
         "Tensor? bias, str activation, str gate_type, "
         "Tensor? preact, str dact_activation, "
         "str dgated_gate_type, Tensor? dgated_preact, "
-        "Tensor(a1!) postact_out, bool emit_postact) -> ()"
+        "Tensor(a1!) postact_out, bool emit_postact, "
+        "str? splitk_epi_mode, int? force_split_k) -> ()"
     ),
 )
 def _gemm_splitk_out(
@@ -1266,6 +1458,8 @@ def _gemm_splitk_out(
     dgated_preact: Optional[Tensor],
     postact_out: Tensor,
     emit_postact: bool,
+    splitk_epi_mode: Optional[str] = None,
+    force_split_k: Optional[int] = None,
 ) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
     assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype == out.dtype
@@ -1309,14 +1503,41 @@ def _gemm_splitk_out(
     if has_bias:
         assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (N,)
     kwargs = _default_kwargs(M, N, K)
-    # Fused epilogue (bias + activation + gated + dact + dgated) is
-    # non-distributive over split-K atomic-fadd partial sums. Force
-    # SPLIT_K=1 whenever we plan to apply any write-back transformation.
+    if force_split_k is not None:
+        assert K % force_split_k == 0, (
+            f"force_split_k={force_split_k} must divide K={K}"
+        )
+        kwargs = dict(kwargs, SPLIT_K=force_split_k)
     has_epilogue = (
         has_bias or activation != "none" or is_gated or is_dact or is_dgated
     )
-    if has_epilogue and kwargs["SPLIT_K"] > 1:
+    # When SPLIT_K>1 is proposed AND there's an epilogue, pick a strategy.
+    # "force_splitk1" (default)  — drop SPLIT_K to 1, fuse epi in kernel.
+    # "two_launch"               — run SPLIT_K>1 unfused, apply epi in torch
+    #                               as a post-matmul pass.
+    epi_mode = _splitk_epi_mode(
+        M, N, K, has_epilogue, kwargs["SPLIT_K"], override=splitk_epi_mode,
+    )
+    if epi_mode == "force_splitk1":
         kwargs = dict(kwargs, SPLIT_K=1)
+    elif epi_mode == "last_partial":
+        # Follow-up: in-kernel last-partial counter. For now, fall back to
+        # force_splitk1 so correctness is preserved.
+        kwargs = dict(kwargs, SPLIT_K=1)
+    elif epi_mode == "two_launch":
+        # Run the unfused SPLIT_K>1 matmul into scratch, then torch epi.
+        scratch = torch.zeros(M, N, device=a.device, dtype=a.dtype)
+        _gemm_splitk_raw(
+            a, b, scratch, shuffled, kwargs,
+        )
+        _apply_epi_torch(
+            scratch, out, bias, activation, gate_type,
+            preact, dact_activation,
+            dgated_gate_type, dgated_preact,
+            emit_postact, postact_out,
+        )
+        return
+    # else: epi_mode == "none" — no epilogue or SPLIT_K was already 1.
     if kwargs["B_PRE_SHUFFLE"] and not shuffled:
         b = shuffle_b(b)
     stream = torch.cuda.current_stream()
@@ -1354,6 +1575,7 @@ def _gemm_splitk_out_fake(
     a, b, out, shuffled, bias, activation, gate_type,
     preact, dact_activation,
     dgated_gate_type, dgated_preact, postact_out, emit_postact,
+    splitk_epi_mode=None, force_split_k=None,
 ):
     return None
 
@@ -1371,6 +1593,8 @@ def gemm_splitk(
     dgated_preact: Optional[Tensor] = None,
     dgated_emit_postact: bool = False,
     dgated_postact_out: Optional[Tensor] = None,
+    splitk_epi_mode: Optional[str] = None,
+    force_split_k: Optional[int] = None,
 ) -> Tensor:
     """Stream-K-capable NT GEMM: ``c = act(a @ b.T + bias)`` on gfx950.
 
@@ -1426,6 +1650,7 @@ def gemm_splitk(
         a, b, out, shuffled, bias, activation, gate_type,
         preact, dact_activation,
         dgated_gate_type, dgated_preact, postact_arg, emit_postact,
+        splitk_epi_mode, force_split_k,
     )
     if emit_postact:
         return out, dgated_postact_out
