@@ -159,6 +159,69 @@ def test_linear_fused_epilogue_splitk(activation, use_bias):
     )
 
 
+def test_linear_mxfp8_func_autograd():
+    """MX-FP8 linear with autograd — forward in fp8 via mfma_scale, backward in bf16."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch build lacks fp8 support")
+    from quack.amd.mxfp8_ops import linear_mxfp8_func
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    # Forward: output tolerance is fp8-quantisation-bounded (~5% relative).
+    y = linear_mxfp8_func(x, w)
+    y_ref = torch.nn.functional.linear(x.detach(), w.detach())
+    rel_err = (y - y_ref).abs().mean() / y_ref.abs().mean()
+    assert rel_err < 0.1, f"mxfp8 forward rel_err {rel_err.item()} > 0.1"
+
+    # Backward: runs in bf16; matches plain autograd on the saved bf16 tensors.
+    y.sum().backward()
+    ours_dx, ours_dw = x.grad.clone(), w.grad.clone()
+
+    x.grad = None
+    w.grad = None
+    xr = x.detach().clone().requires_grad_(True)
+    wr = w.detach().clone().requires_grad_(True)
+    torch.nn.functional.linear(xr, wr).sum().backward()
+    # Our backward uses the same bf16 matmul path; bit-exact.
+    torch.testing.assert_close(ours_dx, xr.grad, atol=0, rtol=0)
+    torch.testing.assert_close(ours_dw, wr.grad, atol=0, rtol=0)
+
+
+def test_linear_mxfp8_func_gradcheck():
+    """End-to-end training step: backward grad points in the descent
+    direction. Three SGD iterations should give monotonically
+    non-increasing loss — confirms the backward grads are correctly
+    oriented (not just correctly shaped). Absolute loss reduction is
+    modest because fp8 quantisation noise floors the loss."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch build lacks fp8 support")
+    from quack.amd.mxfp8_ops import linear_mxfp8_func
+    torch.manual_seed(0)
+    M, N, K = 128, 256, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_true = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    target = torch.nn.functional.linear(x, w_true)
+    w = (w_true + 0.1 * torch.randn_like(w_true)).detach().requires_grad_(True)
+
+    losses = []
+    for _ in range(3):
+        w.grad = None
+        loss = (linear_mxfp8_func(x, w) - target).float().pow(2).mean()
+        loss.backward()
+        losses.append(loss.item())
+        with torch.no_grad():
+            w -= 0.5 * w.grad
+    # Each step should not INCREASE loss (monotonic descent).
+    assert losses[1] <= losses[0], f"loss went up step 0→1: {losses}"
+    assert losses[2] <= losses[1], f"loss went up step 1→2: {losses}"
+
+
 def test_linear_mxfp8():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
