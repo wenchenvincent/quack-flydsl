@@ -58,36 +58,13 @@ def _splitk_eligible_for_chunking(x, weight, bias, chunk_size):
     )
 
 
-def linear_cross_entropy(
-    x: Tensor,            # (B*L, d)
-    weight: Tensor,       # (V, d)
-    target: Tensor,       # (B*L,) int32/int64
-    bias: Optional[Tensor] = None,
-    return_lse: bool = False,
-    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+def _linear_cross_entropy_fwd_only(
+    x: Tensor, weight: Tensor, target: Tensor,
+    bias: Optional[Tensor], return_lse: bool, chunk_size: int,
 ) -> Tuple[Tensor, Optional[Tensor]]:
-    """Compute ``logits = x @ weight.T + bias`` (per chunk), then per-row CE.
-
-    Returns ``(loss, lse_or_None)``. Both are shape ``(B*L,)`` in f32.
-
-    ``chunk_size`` controls the row granularity of the streaming
-    execution — larger chunks amortise the matmul launch but cost
-    more HBM for the logits buffer; default 4096 matches the NVIDIA
-    QuACK reference.
-
-    This is the **forward-only** entry point. For a full training
-    forward/backward call ``linear_cross_entropy_fwd_bwd``, which
-    returns ``(loss, dx, dw)`` in the same chunked pass (no extra
-    full-logits allocation).
-    """
-    assert x.is_cuda and weight.is_cuda and target.is_cuda
-    assert x.dim() == 2 and weight.dim() == 2
+    """Forward-only path: chunked matmul + CE_fwd, no dx/dw."""
     B_L, d = x.shape
-    V, d2 = weight.shape
-    assert d == d2
-    assert target.dim() == 1 and target.size(0) == B_L
-
-    # Fast path: single chunk (smaller shapes) — no streaming overhead.
+    V = weight.size(0)
     if B_L <= chunk_size:
         logits = linear(x, weight, bias=bias)
         return cross_entropy_fwd(logits, target, return_lse=return_lse)
@@ -112,6 +89,117 @@ def linear_cross_entropy(
         if return_lse:
             lse[start:stop].copy_(lse_c)
     return loss, lse
+
+
+class _LinearCrossEntropyFunction(torch.autograd.Function):
+    """Autograd wrapper around the chunked fused fwd+bwd linear+CE path.
+
+    On ``loss.sum().backward()`` (or any downstream scalar), the backward
+    pass hands back the pre-computed dx and dw directly — no re-execution
+    of the kernels, no second logits allocation. The heavy lifting
+    happened during forward via ``linear_cross_entropy_fwd_bwd``.
+
+    Semantics:
+      - Forward returns ``loss`` of shape ``(B*L,)`` f32. Caller typically
+        reduces (``loss.mean()`` / ``loss.sum()``) before calling
+        backward; the upstream ``dloss`` from that reduction scales the
+        pre-computed ``dx`` / ``dw``.
+      - ``dloss`` must be a scalar or (B*L,). If not a scalar, we
+        broadcast per-row (standard ``reduction='none'`` pattern).
+    """
+
+    @staticmethod
+    def forward(
+        ctx, x: Tensor, weight: Tensor, target: Tensor,
+        bias: Optional[Tensor], chunk_size: int,
+    ) -> Tensor:
+        # bias_grad path not implemented — forbid non-None bias for now.
+        assert bias is None, "gradient-enabled linear_cross_entropy with bias not yet supported"
+        loss, dx, dw = linear_cross_entropy_fwd_bwd(
+            x, weight, target, bias=bias, chunk_size=chunk_size,
+        )
+        # Save dx (x.dtype) and dw (f32) for the backward pass.
+        ctx.save_for_backward(dx, dw)
+        ctx.x_dtype = x.dtype
+        ctx.weight_dtype = weight.dtype
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: Tensor):
+        dx_pre, dw_pre = ctx.saved_tensors
+        # ``dx_pre`` and ``dw_pre`` are computed with the dloss=1
+        # convention (per row). Upstream ``grad_loss`` may be:
+        #   - 0-dim scalar (rare; some torch paths)
+        #   - (B*L,) all-ones  — comes from ``loss.sum().backward()``
+        #   - (B*L,) all-1/N   — comes from ``loss.mean().backward()``
+        #   - (B*L,) non-uniform — requires per-row weighted dw
+        #     accumulation, which we don't have from the fused kernel;
+        #     we'd need to recompute. Not implemented.
+        if grad_loss.dim() == 0:
+            scale = grad_loss
+        else:
+            assert grad_loss.dim() == 1 and grad_loss.size(0) == dx_pre.size(0)
+            # Detect uniform grad_loss (the common sum/mean case). If
+            # all entries are equal, treat as a scalar scale.
+            first = grad_loss[0]
+            if not torch.allclose(grad_loss, first.expand_as(grad_loss)):
+                raise NotImplementedError(
+                    "non-uniform grad_loss (per-sample weighting) not "
+                    "supported — call linear_cross_entropy_fwd_bwd "
+                    "directly for the explicit (loss, dx, dw) API."
+                )
+            scale = first
+        dx = (dx_pre.float() * scale).to(ctx.x_dtype)
+        dw = (dw_pre * scale).to(ctx.weight_dtype)
+        # ctx.needs_input_grad is (grad_x, grad_w, grad_target, grad_bias, grad_chunk)
+        return dx, dw, None, None, None
+
+
+def linear_cross_entropy(
+    x: Tensor,            # (B*L, d)
+    weight: Tensor,       # (V, d)
+    target: Tensor,       # (B*L,) int32/int64
+    bias: Optional[Tensor] = None,
+    return_lse: bool = False,
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Compute ``logits = x @ weight.T + bias`` (per chunk), then per-row CE.
+
+    Returns ``(loss, lse_or_None)``. Both are shape ``(B*L,)`` in f32.
+
+    **When ``x.requires_grad`` or ``weight.requires_grad``**: routes
+    through ``_LinearCrossEntropyFunction`` which pre-computes dx/dw
+    during forward via the fused chunked kernel path and stashes them
+    for backward. Bypasses torch's materialised-logits autograd graph
+    entirely — same 2.18× speedup and HBM savings apply transparently.
+
+    When no grad is needed (inference), the plain forward-only chunked
+    path runs — no dx/dw buffers allocated.
+
+    Known limitations of the grad path:
+      - ``bias`` must be None (grad wrt bias not implemented).
+      - ``return_lse`` is ignored; the fused fwd+bwd kernel doesn't
+        expose lse. Call the explicit ``linear_cross_entropy_fwd_bwd``
+        API if you need lse + grads.
+      - Only scalar ``dloss`` (from ``loss.sum()`` / ``.mean()``) is
+        supported; per-element ``dloss`` raises NotImplementedError.
+    """
+    assert x.is_cuda and weight.is_cuda and target.is_cuda
+    assert x.dim() == 2 and weight.dim() == 2
+    B_L, d = x.shape
+    V, d2 = weight.shape
+    assert d == d2
+    assert target.dim() == 1 and target.size(0) == B_L
+
+    needs_grad = x.requires_grad or weight.requires_grad
+    if needs_grad and bias is None and not return_lse:
+        loss = _LinearCrossEntropyFunction.apply(
+            x, weight, target, bias, chunk_size,
+        )
+        return loss, None
+    return _linear_cross_entropy_fwd_only(
+        x, weight, target, bias, return_lse, chunk_size,
+    )
 
 
 def linear_cross_entropy_fwd_bwd(
@@ -187,4 +275,7 @@ def linear_cross_entropy_fwd_bwd(
     return loss, dx, dw
 
 
-__all__ = ["linear_cross_entropy", "linear_cross_entropy_fwd_bwd"]
+__all__ = [
+    "linear_cross_entropy",
+    "linear_cross_entropy_fwd_bwd",
+]

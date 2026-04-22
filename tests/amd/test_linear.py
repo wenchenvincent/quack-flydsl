@@ -227,6 +227,49 @@ def test_linear_cross_entropy_fwd_bwd_matches_autograd(B_L, V, d, chunk_size):
     )
 
 
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+def test_linear_cross_entropy_autograd(reduction):
+    """``loss.sum().backward()`` / ``loss.mean().backward()`` should pick
+    up the fused fwd+bwd path transparently via ``_LinearCrossEntropyFunction``,
+    producing grads that match torch autograd on the same math."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    B_L, V, d = 2048, 1024, 128
+    x = torch.randn(B_L, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(V, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    target = torch.randint(0, V, (B_L,), device="cuda", dtype=torch.int64)
+
+    loss_vec, _ = linear_cross_entropy(x, w, target, chunk_size=1024)
+    getattr(loss_vec, reduction)().backward()
+    ours_dx, ours_dw = x.grad.clone(), w.grad.clone()
+
+    x.grad = None
+    w.grad = None
+    xr = x.clone().detach().float().requires_grad_(True)
+    wr = w.clone().detach().float().requires_grad_(True)
+    ref_loss = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(xr, wr), target, reduction="none",
+    )
+    getattr(ref_loss, reduction)().backward()
+    torch.testing.assert_close(ours_dx, xr.grad.to(torch.bfloat16), atol=5e-1, rtol=5e-2)
+    torch.testing.assert_close(ours_dw.float(), wr.grad, atol=5e-1, rtol=5e-2)
+
+
+def test_linear_cross_entropy_no_grad_path():
+    """Without requires_grad, falls back to the forward-only chunked
+    path (no dx/dw allocation)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    B_L, V, d = 512, 512, 64
+    x = torch.randn(B_L, d, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(V, d, device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(0, V, (B_L,), device="cuda", dtype=torch.int64)
+    loss_vec, _ = linear_cross_entropy(x, w, target)
+    assert not loss_vec.requires_grad
+
+
 def test_linear_cross_entropy_fwd_bwd_chunked_matches_unchunked():
     """Chunked and unchunked fused fwd+bwd should give the same outputs —
     same kernel per chunk, same data, just different partition of the batch."""
