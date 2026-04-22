@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.amd.linear import linear, linear_mxfp8, linear_residual
+from quack.amd.linear import linear, linear_gated, linear_mxfp8, linear_residual
 from quack.amd.mlp import mlp, gated_mlp
 from quack.amd.linear_cross_entropy import (
     linear_cross_entropy,
@@ -156,6 +156,39 @@ def test_linear_fused_epilogue_splitk(activation, use_bias):
     torch.testing.assert_close(
         out.float(), ref.to(torch.bfloat16).float(),
         atol=5e-2, rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_linear_gated(gate_type, use_bias):
+    """Gated linear matches F.linear + torch-level gating reference
+    on splitk-eligible shapes."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, hidden, K = 256, 256, 128        # splitk-eligible: M%128, N=2*hidden=512%256, K%64
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    w_gate_up = torch.randn(2 * hidden, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(2 * hidden, device="cuda", dtype=torch.float32) * 0.3 if use_bias else None
+
+    out = linear_gated(x, w_gate_up, gate_type=gate_type, bias=b)
+    assert out.shape == (M, hidden)
+
+    lin_f32 = torch.nn.functional.linear(x.float(), w_gate_up.float())
+    if use_bias:
+        lin_f32 = lin_f32 + b
+    gate, up = lin_f32.chunk(2, dim=-1)
+    if gate_type == "swiglu":
+        ref = torch.nn.functional.silu(gate) * up
+    elif gate_type == "reglu":
+        ref = torch.relu(gate) * up
+    elif gate_type == "geglu":
+        ref = torch.nn.functional.gelu(gate, approximate="tanh") * up
+    elif gate_type == "glu":
+        ref = torch.sigmoid(gate) * up
+    torch.testing.assert_close(
+        out.float(), ref.to(torch.bfloat16).float(), atol=1e-1, rtol=2e-2,
     )
 
 

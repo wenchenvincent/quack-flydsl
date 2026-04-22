@@ -801,6 +801,15 @@ def _gemm_splitk_out(
     if has_bias:
         assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (N,)
     kwargs = _default_kwargs(M, N, K)
+    # Fused epilogue (bias + activation) is non-distributive over the
+    # split-K atomic-fadd partial sums — applying bias to each partial
+    # would add it SPLIT_K times, and activation like ReLU can't be
+    # composed under sum. When the caller requests an epilogue, force
+    # SPLIT_K=1 so the direct-store write-back handles it correctly.
+    # A proper split-K-aware finalise path (last-partial signal +
+    # post-atomic epilogue) is a follow-up.
+    if (has_epilogue := (bias is not None or activation != "none")) and kwargs["SPLIT_K"] > 1:
+        kwargs = dict(kwargs, SPLIT_K=1)
     if kwargs["B_PRE_SHUFFLE"] and not shuffled:
         b = shuffle_b(b)
     stream = torch.cuda.current_stream()

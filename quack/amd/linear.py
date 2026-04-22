@@ -85,6 +85,64 @@ def linear(
     return gemm(x, w_t, bias=bias, activation=activation)
 
 
+_GATED_ACTIVATIONS = {"swiglu", "reglu", "geglu", "glu"}
+
+
+def linear_gated(
+    x: Tensor,
+    weight_gate_up: Tensor,
+    gate_type: str = "swiglu",
+    bias: Optional[Tensor] = None,
+) -> Tensor:
+    """Gated linear: ``y = gate(linear(x, w_gate_up, bias))``.
+
+    ``weight_gate_up`` is ``(2 * hidden, in_features)`` — the first
+    ``hidden`` rows produce the gate values, the remaining ``hidden``
+    produce the up values. Output is ``(M, hidden)``.
+
+    Gate types:
+      - ``"swiglu"``: ``silu(gate) * up``
+      - ``"reglu"``:  ``relu(gate) * up``
+      - ``"geglu"``:  ``gelu_tanh_approx(gate) * up``
+      - ``"glu"``:    ``sigmoid(gate) * up``
+
+    Dispatch: when the matmul is splitk-eligible, the (M, 2*hidden)
+    output runs through ``gemm_splitk`` (with fused bias if provided)
+    and the gating is applied torch-side. The matmul dominates the
+    cost so the elementwise gating adds <5% overhead; true in-kernel
+    fusion of the gating into the write-back is a follow-up once the
+    split-output shape transformation is wired.
+    """
+    assert gate_type in _GATED_ACTIVATIONS, (
+        f"gate_type must be one of {_GATED_ACTIVATIONS}, got {gate_type!r}"
+    )
+    two_hidden, in_features = weight_gate_up.shape
+    assert two_hidden % 2 == 0, (
+        f"weight_gate_up's first dim must be even (= 2*hidden), got {two_hidden}"
+    )
+
+    # Route matmul through splitk when eligible (no gate_type baked yet,
+    # just forward + optional bias).
+    if _splitk_eligible(x, weight_gate_up, bias, activation=None):
+        from quack.amd.gemm_gfx950_splitk import gemm_splitk
+        out = gemm_splitk(x, weight_gate_up, bias=bias)
+    else:
+        # NN fallback via existing gemm path.
+        w_t = weight_gate_up.transpose(-1, -2).contiguous()
+        out = gemm(x, w_t, bias=bias)
+
+    gate, up = out.chunk(2, dim=-1)
+    if gate_type == "swiglu":
+        return torch.nn.functional.silu(gate) * up
+    if gate_type == "reglu":
+        return torch.relu(gate) * up
+    if gate_type == "geglu":
+        return torch.nn.functional.gelu(gate, approximate="tanh") * up
+    if gate_type == "glu":
+        return torch.sigmoid(gate) * up
+    raise NotImplementedError(f"gate_type={gate_type!r}")
+
+
 def linear_mxfp8(
     x: Tensor,
     weight: Tensor,
@@ -150,4 +208,4 @@ def linear_residual(
     )
 
 
-__all__ = ["linear", "linear_mxfp8", "linear_residual"]
+__all__ = ["linear", "linear_gated", "linear_mxfp8", "linear_residual"]

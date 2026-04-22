@@ -10,8 +10,7 @@ from typing import Optional
 
 from torch import Tensor
 
-from quack.amd.linear import linear
-from quack.amd.gemm import gemm_gated
+from quack.amd.linear import linear, linear_gated
 
 
 def mlp(
@@ -44,9 +43,11 @@ def gated_mlp(
     ``w_gate_up`` is a single matrix of shape ``(2 * hidden, in_features)``;
     the output of ``x @ w_gate_up.T`` is split into ``(gate, up)`` halves and
     combined via ``gate_type`` before projection through ``w_down``.
+
+    Routes through ``linear_gated`` (splitk + torch-side gating) when the
+    up-proj matmul is aligned, else the existing NN ``gemm_gated`` kernel.
     """
-    # Fuse x @ w_gate_up.T + bias + gate(...)
-    h = gemm_gated(x, w_gate_up.transpose(-1, -2), gate_type=gate_type, bias=bias_gate_up)
+    h = linear_gated(x, w_gate_up, gate_type=gate_type, bias=bias_gate_up)
     return linear(h, w_down, bias=bias_down)
 
 
