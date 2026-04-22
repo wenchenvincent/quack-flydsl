@@ -136,6 +136,14 @@ def _compile_hgemm_kernel(
     # matmul body unchanged; only the final store section differs.
     has_bias: bool = False,
     activation: str = "none",
+    # Gated activation: when set, halves the output N dim and writes
+    # ``gate_fn(LDS[m, c], LDS[m, c + N/2])`` to ``out[m, c]`` in the
+    # write-back. Caller passes weight with shape ``(2*hidden, K)`` and
+    # pre-allocates out of shape ``(M, hidden)``. Bias (if set) has
+    # shape ``(2*hidden,)`` and is applied per-column BEFORE gating
+    # (standard gated-MLP pattern). Only valid with SPLIT_K == 1 —
+    # enforced in the public launcher.
+    gate_type: str = "none",
     # ``_m_hint`` is NOT used inside the kernel body — it's part of the
     # cache key only, forcing a fresh compile per distinct runtime M.
     # Works around the FlyDSL JIT specialising on the first M passed
@@ -232,6 +240,16 @@ def _compile_hgemm_kernel(
 
     _HAS_BIAS = has_bias
     _ACT = activation
+    _GATE = gate_type
+    _IS_GATED = gate_type != "none"
+    assert not (_IS_GATED and IS_SPLIT_K), (
+        "gated epilogue requires SPLIT_K == 1 — the public launcher forces this"
+    )
+    # Output column span per tile is halved for the gated case.
+    OUT_BLOCK_N = (BLOCK_N // 2) if _IS_GATED else BLOCK_N
+    OUT_N = (n // 2) if _IS_GATED else n
+    LDG_C_X_THREADS_OUT = OUT_BLOCK_N // LDG_VEC_SIZE
+    LDG_REG_C_COUNT_OUT = (BLOCK_M * OUT_BLOCK_N) // (LDG_VEC_SIZE * BLOCK_THREADS)
 
     @flyc.kernel
     def hgemm_kernel(
@@ -249,7 +267,8 @@ def _compile_hgemm_kernel(
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        # Output tensor uses OUT_N which is n for plain/bias/act, n/2 for gated.
+        C_ = GTensor(C, dtype=dtype_, shape=(-1, OUT_N))
         if _HAS_BIAS:
             Bias_ = GTensor(Bias, dtype=T.f32, shape=(n,))
         base_ptr = allocator.get_base()
@@ -283,6 +302,9 @@ def _compile_hgemm_kernel(
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
+        # Output N-offset — halved in the gated case because output columns
+        # correspond to 2 matmul columns each.
+        n_offset_out = fx.Index(block_n_idx * OUT_BLOCK_N)
         k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
 
         warp_m_idx = wid // BLOCK_N_WARPS * WARP_M
@@ -631,21 +653,70 @@ def _compile_hgemm_kernel(
                     scf.YieldOp([])
         else:
             gpu.barrier()
-            for i in range_constexpr(LDG_REG_C_COUNT):
+            # Two write-back shapes:
+            # - Plain: iterates over (BLOCK_M, BLOCK_N), writes (M, N).
+            # - Gated: iterates over (BLOCK_M, BLOCK_N/2), writes (M, N/2).
+            #   For each output col c, loads LDS[m, c] (gate half) and
+            #   LDS[m, c + BLOCK_N/2] (up half), applies gate_fn in registers,
+            #   writes result. Bias (if set) is applied per-column to BOTH
+            #   halves before gating — matches torch ``chunk(2, dim=-1)``
+            #   convention.
+            for i in range_constexpr(LDG_REG_C_COUNT_OUT):
                 global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS_OUT)
+                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS_OUT * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
                 cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    if _HAS_BIAS or _ACT != "none":
-                        vec = _apply_epilogue(
-                            vec, Bias_ if _HAS_BIAS else None,
-                            n_offset + n_local_idx, _ACT, dtype_, LDG_VEC_SIZE,
+                    if _IS_GATED:
+                        # Interleaved-pair convention: matmul output cols
+                        # [2c, 2c+1] are (gate, up) pairs. Caller must pass
+                        # weight with gate and up rows interleaved (use the
+                        # ``interleave_gated_weight`` helper). This is the
+                        # same convention as NVIDIA's CUTLASS gated epilogue
+                        # — it allows gate/up pairing to stay WITHIN a single
+                        # matmul N-tile, avoiding cross-tile sync.
+                        #
+                        # Each 8-col output chunk at n_local_idx corresponds
+                        # to input cols [2*n_local_idx, 2*n_local_idx + 16).
+                        in_n_start = n_local_idx * fx.Index(2)
+                        pair0 = cs_.vec_load(
+                            (m_local_idx, in_n_start), LDG_VEC_SIZE,
+                        )  # cols [2c..2c+8) = (g0, u0, g1, u1, g2, u2, g3, u3)
+                        pair1 = cs_.vec_load(
+                            (m_local_idx, in_n_start + fx.Index(LDG_VEC_SIZE)),
+                            LDG_VEC_SIZE,
+                        )  # cols [2c+8..2c+16) = (g4, u4, g5, u5, g6, u6, g7, u7)
+                        if _HAS_BIAS:
+                            pair0 = _apply_epilogue(
+                                pair0, Bias_,
+                                n_offset + in_n_start,
+                                "none", dtype_, LDG_VEC_SIZE,
+                            )
+                            pair1 = _apply_epilogue(
+                                pair1, Bias_,
+                                n_offset + in_n_start + fx.Index(LDG_VEC_SIZE),
+                                "none", dtype_, LDG_VEC_SIZE,
+                            )
+                        out_vec = _apply_gated_interleaved(
+                            pair0, pair1, _GATE, dtype_, LDG_VEC_SIZE,
                         )
-                    C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
+                        C_.vec_store(
+                            (m_global_idx, n_offset_out + n_local_idx),
+                            out_vec, LDG_VEC_SIZE,
+                        )
+                    else:
+                        vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                        if _HAS_BIAS or _ACT != "none":
+                            vec = _apply_epilogue(
+                                vec, Bias_ if _HAS_BIAS else None,
+                                n_offset + n_local_idx, _ACT, dtype_, LDG_VEC_SIZE,
+                            )
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_local_idx),
+                            vec, LDG_VEC_SIZE,
+                        )
                     scf.YieldOp([])
         return
 
@@ -670,6 +741,33 @@ def _compile_hgemm_kernel(
         )
 
     return launch_hgemm_kernel
+
+
+def interleave_gated_weight(w_gate_up: Tensor) -> Tensor:
+    """Convert a gated weight from split-halves to adjacent-pair layout.
+
+    Input convention (matches ``torch.nn.Linear`` / ``chunk(2, dim=-1)``):
+        ``w_gate_up`` shape ``(2 * hidden, in_features)``; rows
+        ``[0, hidden)`` produce the gate, rows ``[hidden, 2*hidden)``
+        produce the up.
+
+    Output convention (required by ``gemm_splitk(gate_type=...)``):
+        Row-interleaved — rows ``[2i, 2i+1]`` are ``(gate_i, up_i)``.
+        Matmul output col 2i then holds gate_i and col 2i+1 holds up_i,
+        which the kernel's write-back pairs adjacently without needing
+        cross-tile synchronisation.
+
+    Call once per weight tensor at model-load time; the result can be
+    cached and reused across forward calls.
+    """
+    assert w_gate_up.dim() == 2
+    two_hidden, in_features = w_gate_up.shape
+    assert two_hidden % 2 == 0
+    hidden = two_hidden // 2
+    gate = w_gate_up[:hidden]
+    up = w_gate_up[hidden:]
+    # Stack alternately along dim 0: (hidden, 2, in_features) -> (2*hidden, in_features).
+    return torch.stack([gate, up], dim=1).reshape(2 * hidden, in_features).contiguous()
 
 
 def shuffle_b(x: Tensor, layout=(16, 16), k_steps=2) -> Tensor:
@@ -753,6 +851,72 @@ def _apply_epilogue(vec, bias_tensor, col_start, activation, out_dtype, vec_size
     return vector.from_elements(T.vec(vec_size, in_dtype), result_scalars)
 
 
+def _apply_gated_interleaved(pair0, pair1, gate_type, out_dtype, vec_size):
+    """Interleaved-pair gated activation: input vectors store
+    (g, u, g, u, ...) adjacency. Produces ``vec_size`` output values
+    from 2*``vec_size`` input values (one per (g, u) pair).
+
+    ``pair0`` covers matmul cols [2c, 2c + vec_size) = 4 pairs.
+    ``pair1`` covers cols [2c + vec_size, 2c + 2*vec_size) = 4 pairs.
+    Output covers output cols [c, c + vec_size) = 8 values.
+
+    Gate variants (matching torch's ``chunk(2, dim=-1)`` applied to a
+    tensor that's been pre-interleaved by ``interleave_gated_weight``):
+      - swiglu: silu(g) * u       = g * sigmoid(g) * u
+      - reglu:  max(g, 0) * u
+      - geglu:  gelu_tanh_approx(g) * u
+      - glu:    sigmoid(g) * u
+    """
+    import math as _py_math
+    from flydsl.expr import math as _fm
+    from flydsl.expr.arith import ArithValue
+    from flydsl.expr.numeric import Float32
+
+    def _gate_scalar(g_av, u_av):
+        if out_dtype is T.f32:
+            g, u = g_av, u_av
+        else:
+            g, u = g_av.extf(T.f32), u_av.extf(T.f32)
+        one = ArithValue(Float32(1.0))
+        zero = ArithValue(Float32(0.0))
+        if gate_type == "swiglu":
+            sig = one / (one + _fm.exp(-g, fastmath="fast"))
+            out = g * sig * u
+        elif gate_type == "reglu":
+            out = g.maximumf(zero) * u
+        elif gate_type == "geglu":
+            c1 = ArithValue(Float32(_py_math.sqrt(2.0 / _py_math.pi)))
+            c2 = ArithValue(Float32(0.044715 * _py_math.sqrt(2.0 / _py_math.pi)))
+            half = ArithValue(Float32(0.5))
+            two = ArithValue(Float32(2.0))
+            g_sq = g * g
+            z = g * (c1 + c2 * g_sq)
+            tanh_z = one - two / (one + _fm.exp(two * z, fastmath="fast"))
+            gelu_g = g * (half + half * tanh_z)
+            out = gelu_g * u
+        elif gate_type == "glu":
+            sig = one / (one + _fm.exp(-g, fastmath="fast"))
+            out = sig * u
+        else:
+            raise ValueError(f"unknown gate_type {gate_type!r}")
+        if out_dtype is T.f32:
+            return out.ir_value() if hasattr(out, "ir_value") else out
+        out_cast = out.truncf(out_dtype)
+        return out_cast.ir_value() if hasattr(out_cast, "ir_value") else out_cast
+
+    # pair0 holds vec_size interleaved (g0, u0, g1, u1, ...) producing
+    # vec_size/2 outputs. pair1 holds another vec_size/2 outputs.
+    half = vec_size // 2
+    assert vec_size % 2 == 0, "interleaved pair load needs even vec_size"
+    result = []
+    for pair_vec in (pair0, pair1):
+        for i in range_constexpr(half):
+            g_i = vector.extract(pair_vec, static_position=[2 * i], dynamic_position=[])
+            u_i = vector.extract(pair_vec, static_position=[2 * i + 1], dynamic_position=[])
+            result.append(_gate_scalar(ArithValue(g_i), ArithValue(u_i)))
+    return vector.from_elements(T.vec(vec_size, out_dtype), result)
+
+
 _SPLIT_K_SEMAPHORE: dict = {}
 _SPLIT_K_SEMAPHORE_STATE: dict = {}
 
@@ -777,6 +941,7 @@ _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
 
 _ALLOWED_ACTIVATIONS = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
+_ALLOWED_GATES = {"none", "swiglu", "reglu", "geglu", "glu"}
 
 
 @torch.library.custom_op(
@@ -784,31 +949,40 @@ _ALLOWED_ACTIVATIONS = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
     mutates_args=("out",),
     schema=(
         "(Tensor a, Tensor b, Tensor(a0!) out, bool shuffled, "
-        "Tensor? bias, str activation) -> ()"
+        "Tensor? bias, str activation, str gate_type) -> ()"
     ),
 )
 def _gemm_splitk_out(
     a: Tensor, b: Tensor, out: Tensor, shuffled: bool,
-    bias: Optional[Tensor], activation: str,
+    bias: Optional[Tensor], activation: str, gate_type: str,
 ) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
     assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype == out.dtype
     assert activation in _ALLOWED_ACTIVATIONS
+    assert gate_type in _ALLOWED_GATES
     M, K = a.shape
     N, K2 = b.shape
-    assert K == K2 and out.shape == (M, N)
+    assert K == K2
+    is_gated = gate_type != "none"
+    if is_gated:
+        assert N % 2 == 0, "gated requires N even (output is (M, N/2))"
+        expected_out_shape = (M, N // 2)
+    else:
+        expected_out_shape = (M, N)
+    assert out.shape == expected_out_shape
+    # Non-trivial combinations not yet supported:
+    assert not (is_gated and activation != "none"), (
+        "gate_type subsumes activation; combining both is redundant/unsupported"
+    )
     has_bias = bias is not None
     if has_bias:
         assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (N,)
     kwargs = _default_kwargs(M, N, K)
-    # Fused epilogue (bias + activation) is non-distributive over the
-    # split-K atomic-fadd partial sums — applying bias to each partial
-    # would add it SPLIT_K times, and activation like ReLU can't be
-    # composed under sum. When the caller requests an epilogue, force
-    # SPLIT_K=1 so the direct-store write-back handles it correctly.
-    # A proper split-K-aware finalise path (last-partial signal +
-    # post-atomic epilogue) is a follow-up.
-    if (has_epilogue := (bias is not None or activation != "none")) and kwargs["SPLIT_K"] > 1:
+    # Fused epilogue (bias + activation + gated) is non-distributive
+    # over split-K atomic-fadd partial sums. Force SPLIT_K=1 whenever
+    # we plan to apply any write-back transformation.
+    has_epilogue = has_bias or activation != "none" or is_gated
+    if has_epilogue and kwargs["SPLIT_K"] > 1:
         kwargs = dict(kwargs, SPLIT_K=1)
     if kwargs["B_PRE_SHUFFLE"] and not shuffled:
         b = shuffle_b(b)
@@ -820,7 +994,7 @@ def _gemm_splitk_out(
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
     exe = _compile_hgemm_kernel(
         _DTYPE2STR[a.dtype], N, K, **kwargs,
-        has_bias=has_bias, activation=activation,
+        has_bias=has_bias, activation=activation, gate_type=gate_type,
         _m_hint=M,
     )
     # Kernel requires a real Bias tensor even when has_bias=False (the
@@ -835,7 +1009,7 @@ def _gemm_splitk_out(
 
 
 @_gemm_splitk_out.register_fake
-def _gemm_splitk_out_fake(a, b, out, shuffled, bias, activation):
+def _gemm_splitk_out_fake(a, b, out, shuffled, bias, activation, gate_type):
     return None
 
 
@@ -845,6 +1019,7 @@ def gemm_splitk(
     shuffled: bool = False,
     bias: Optional[Tensor] = None,
     activation: str = "none",
+    gate_type: str = "none",
 ) -> Tensor:
     """Stream-K-capable NT GEMM: ``c = act(a @ b.T + bias)`` on gfx950.
 
@@ -866,12 +1041,15 @@ def gemm_splitk(
     assert a.is_cuda and b.is_cuda
     assert a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16)
     assert activation in _ALLOWED_ACTIVATIONS
+    assert gate_type in _ALLOWED_GATES
     M, K = a.shape
     N, _ = b.shape
+    is_gated = gate_type != "none"
+    out_n = (N // 2) if is_gated else N
     if out is None:
-        out = torch.empty(M, N, device=a.device, dtype=a.dtype)
-    _gemm_splitk_out(a, b, out, shuffled, bias, activation)
+        out = torch.empty(M, out_n, device=a.device, dtype=a.dtype)
+    _gemm_splitk_out(a, b, out, shuffled, bias, activation, gate_type)
     return out
 
 
-__all__ = ["gemm_splitk", "shuffle_b"]
+__all__ = ["gemm_splitk", "shuffle_b", "interleave_gated_weight"]

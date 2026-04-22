@@ -160,6 +160,39 @@ def test_linear_fused_epilogue_splitk(activation, use_bias):
 
 
 @pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+def test_linear_gated_fused_in_kernel(gate_type):
+    """In-kernel gated fusion via interleaved weight — output is (M, hidden)
+    written directly, no (M, 2*hidden) intermediate materialised."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import interleave_gated_weight
+    torch.manual_seed(0)
+    M, hidden, K = 256, 256, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    w_halves = torch.randn(2 * hidden, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    w_interleaved = interleave_gated_weight(w_halves)
+    out = linear_gated(
+        x, w_interleaved, gate_type=gate_type, weight_interleaved=True,
+    )
+    assert out.shape == (M, hidden)
+    assert out.dtype == torch.bfloat16
+
+    lin_f32 = torch.nn.functional.linear(x.float(), w_halves.float())
+    gate, up = lin_f32.chunk(2, dim=-1)
+    if gate_type == "swiglu":
+        ref = torch.nn.functional.silu(gate) * up
+    elif gate_type == "reglu":
+        ref = torch.relu(gate) * up
+    elif gate_type == "geglu":
+        ref = torch.nn.functional.gelu(gate, approximate="tanh") * up
+    elif gate_type == "glu":
+        ref = torch.sigmoid(gate) * up
+    torch.testing.assert_close(
+        out.float(), ref.to(torch.bfloat16).float(), atol=1e-1, rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_linear_gated(gate_type, use_bias):
     """Gated linear matches F.linear + torch-level gating reference

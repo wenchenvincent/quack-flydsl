@@ -93,6 +93,8 @@ def linear_gated(
     weight_gate_up: Tensor,
     gate_type: str = "swiglu",
     bias: Optional[Tensor] = None,
+    *,
+    weight_interleaved: bool = False,
 ) -> Tensor:
     """Gated linear: ``y = gate(linear(x, w_gate_up, bias))``.
 
@@ -106,12 +108,25 @@ def linear_gated(
       - ``"geglu"``:  ``gelu_tanh_approx(gate) * up``
       - ``"glu"``:    ``sigmoid(gate) * up``
 
-    Dispatch: when the matmul is splitk-eligible, the (M, 2*hidden)
-    output runs through ``gemm_splitk`` (with fused bias if provided)
-    and the gating is applied torch-side. The matmul dominates the
-    cost so the elementwise gating adds <5% overhead; true in-kernel
-    fusion of the gating into the write-back is a follow-up once the
-    split-output shape transformation is wired.
+    Fast path — **true in-kernel fusion** via ``gemm_splitk(gate_type=...)``:
+      - Caller must pre-interleave ``weight_gate_up`` so that rows
+        ``[2i, 2i+1]`` are ``(gate_i, up_i)`` using
+        ``quack.amd.gemm_gfx950_splitk.interleave_gated_weight``. When
+        ``weight_interleaved=True`` is passed, we use this fast path.
+      - The kernel writes only ``(M, hidden)`` to HBM; no intermediate
+        ``(M, 2*hidden)`` materialisation. Cuts HBM traffic ~2× on the
+        output side of the matmul.
+
+    Fallback path — split-halves + torch-side gating:
+      - When ``weight_interleaved=False`` (default) or shape isn't
+        splitk-eligible. Runs the full ``(M, 2*hidden)`` matmul then
+        applies the gate in a torch elementwise kernel.
+
+    Bias is applied per-column of the matmul output (before gating)
+    in both paths. For the fused path, bias shape must be
+    ``(2*hidden,)`` in INTERLEAVED order matching the weight — call
+    ``interleave_gated_weight(bias.unsqueeze(-1)).squeeze(-1)`` or
+    interleave manually.
     """
     assert gate_type in _GATED_ACTIVATIONS, (
         f"gate_type must be one of {_GATED_ACTIVATIONS}, got {gate_type!r}"
@@ -121,13 +136,18 @@ def linear_gated(
         f"weight_gate_up's first dim must be even (= 2*hidden), got {two_hidden}"
     )
 
-    # Route matmul through splitk when eligible (no gate_type baked yet,
-    # just forward + optional bias).
+    if weight_interleaved and _splitk_eligible(
+        x, weight_gate_up, bias, activation=None,
+    ):
+        # Fused fast path — writes (M, hidden) directly.
+        from quack.amd.gemm_gfx950_splitk import gemm_splitk
+        return gemm_splitk(x, weight_gate_up, bias=bias, gate_type=gate_type)
+
+    # Split-halves fallback: full matmul + torch gating.
     if _splitk_eligible(x, weight_gate_up, bias, activation=None):
         from quack.amd.gemm_gfx950_splitk import gemm_splitk
         out = gemm_splitk(x, weight_gate_up, bias=bias)
     else:
-        # NN fallback via existing gemm path.
         w_t = weight_gate_up.transpose(-1, -2).contiguous()
         out = gemm(x, w_t, bias=bias)
 
