@@ -5,7 +5,10 @@ import torch
 
 from quack.amd.linear import linear, linear_mxfp8, linear_residual
 from quack.amd.mlp import mlp, gated_mlp
-from quack.amd.linear_cross_entropy import linear_cross_entropy
+from quack.amd.linear_cross_entropy import (
+    linear_cross_entropy,
+    linear_cross_entropy_fwd_bwd,
+)
 
 
 def test_linear_matches_torch():
@@ -189,3 +192,56 @@ def test_linear_cross_entropy_chunked_matches_torch():
     ref_loss = torch.nn.functional.cross_entropy(ref_logits, target, reduction="none")
     # bf16 matmul + CE — moderate tolerance.
     torch.testing.assert_close(loss, ref_loss, atol=5e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("B_L,V,d", [(4096, 2048, 128), (1024, 1024, 256)])
+@pytest.mark.parametrize("chunk_size", [1024, 2048])
+def test_linear_cross_entropy_fwd_bwd_matches_autograd(B_L, V, d, chunk_size):
+    """End-to-end: our fused fwd+bwd path produces the same loss, dx, dw
+    as torch.autograd on F.linear + F.cross_entropy."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    x = torch.randn(B_L, d, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(V, d, device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(0, V, (B_L,), device="cuda", dtype=torch.int64)
+
+    loss, dx, dw = linear_cross_entropy_fwd_bwd(
+        x, w, target, chunk_size=chunk_size,
+    )
+
+    x_ref = x.clone().float().requires_grad_(True)
+    w_ref = w.clone().float().requires_grad_(True)
+    ref_loss = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(x_ref, w_ref), target, reduction="none",
+    )
+    ref_loss.sum().backward()
+    # bf16 matmul + CE accumulated error scales with K=d and V.
+    atol = max(5e-1, 1e-2 * max(V, d) / 128)
+    torch.testing.assert_close(loss, ref_loss, atol=atol, rtol=5e-2)
+    torch.testing.assert_close(
+        dx, x_ref.grad.to(x.dtype), atol=atol, rtol=5e-2,
+    )
+    torch.testing.assert_close(
+        dw, w_ref.grad, atol=atol, rtol=5e-2,
+    )
+
+
+def test_linear_cross_entropy_fwd_bwd_chunked_matches_unchunked():
+    """Chunked and unchunked fused fwd+bwd should give the same outputs —
+    same kernel per chunk, same data, just different partition of the batch."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    B_L, V, d = 2048, 1024, 128
+    x = torch.randn(B_L, d, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(V, d, device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(0, V, (B_L,), device="cuda", dtype=torch.int64)
+    l_c, dx_c, dw_c = linear_cross_entropy_fwd_bwd(x, w, target, chunk_size=512)
+    l_u, dx_u, dw_u = linear_cross_entropy_fwd_bwd(x, w, target, chunk_size=B_L)
+    # Matmul + CE per chunk identical — should be bit-exact.
+    torch.testing.assert_close(l_c, l_u, atol=0, rtol=0)
+    torch.testing.assert_close(dx_c, dx_u, atol=0, rtol=0)
+    # dw accumulates in f32 in a deterministic order (sequential) so
+    # also bit-exact across chunk partitions.
+    torch.testing.assert_close(dw_c, dw_u, atol=1e-5, rtol=1e-5)

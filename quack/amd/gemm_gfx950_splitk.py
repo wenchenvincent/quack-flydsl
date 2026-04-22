@@ -129,6 +129,12 @@ def _compile_hgemm_kernel(
     BLOCK_N_WARPS: int = 4,
     B_PRE_SHUFFLE: bool = True,
     B_TO_LDS: bool = False,
+    # ``_m_hint`` is NOT used inside the kernel body — it's part of the
+    # cache key only, forcing a fresh compile per distinct runtime M.
+    # Works around the FlyDSL JIT specialising on the first M passed
+    # for ``grid=((m + BLOCK_M - 1) // BLOCK_M, ...)``: subsequent calls
+    # with a larger M silently run with the baked grid and miss rows.
+    _m_hint: int = 0,
 ):
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
@@ -718,7 +724,7 @@ def _gemm_splitk_out(a: Tensor, b: Tensor, out: Tensor, shuffled: bool) -> None:
         bm = (M + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
         bn = N // kwargs["TILE_N"]
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe = _compile_hgemm_kernel(_DTYPE2STR[a.dtype], N, K, **kwargs)
+    exe = _compile_hgemm_kernel(_DTYPE2STR[a.dtype], N, K, **kwargs, _m_hint=M)
     exe(out, a, b, M, sem, state, stream)
     if kwargs["SPLIT_K"] > 1:
         _advance_state(stream)
