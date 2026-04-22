@@ -225,6 +225,66 @@ def test_linear_gated(gate_type, use_bias):
     )
 
 
+@pytest.mark.parametrize("activation", ["relu", "silu", "gelu_tanh_approx", "relu_sq"])
+def test_gemm_splitk_fused_dact(activation):
+    """Direct fused gemm_dact kernel: matmul + act'(preact) in write-back."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk
+    torch.manual_seed(0)
+    M, K, N = 256, 128, 512
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    preact = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.3
+    out = gemm_splitk(a, b, preact=preact, dact_activation=activation)
+
+    acc_f32 = torch.nn.functional.linear(a.float(), b.float())
+    p32 = preact.float()
+    if activation == "relu":
+        deriv = (p32 > 0).float()
+    elif activation == "silu":
+        sig = torch.sigmoid(p32)
+        deriv = sig * (1.0 + p32 * (1.0 - sig))
+    elif activation == "gelu_tanh_approx":
+        import math as m
+        c1 = m.sqrt(2.0 / m.pi)
+        z = c1 * (p32 + 0.044715 * p32.pow(3))
+        th = torch.tanh(z)
+        dz = c1 * (1.0 + 3.0 * 0.044715 * p32.pow(2))
+        deriv = 0.5 * (1.0 + th) + 0.5 * p32 * (1.0 - th * th) * dz
+    elif activation == "relu_sq":
+        deriv = 2.0 * p32 * (p32 > 0).float()
+    ref = (acc_f32 * deriv).to(torch.bfloat16)
+    torch.testing.assert_close(out.float(), ref.float(), atol=5e-2, rtol=1e-2)
+
+
+def test_mlp_func_train_autograd():
+    """MLP train wrapper: bit-exact match with torch autograd on the
+    same math (F.linear + F.silu + F.linear chain)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.linear_training import mlp_func_train
+    torch.manual_seed(0)
+    M, hidden, out_dim, K = 256, 512, 256, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w1 = torch.randn(hidden, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w2 = torch.randn(out_dim, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mlp_func_train(x, w1, w2, activation="silu").sum().backward()
+    ours_dx, ours_dw1, ours_dw2 = x.grad.clone(), w1.grad.clone(), w2.grad.clone()
+    x.grad = None
+    w1.grad = None
+    w2.grad = None
+    xr = x.detach().clone().requires_grad_(True)
+    w1r = w1.detach().clone().requires_grad_(True)
+    w2r = w2.detach().clone().requires_grad_(True)
+    torch.nn.functional.linear(
+        torch.nn.functional.silu(torch.nn.functional.linear(xr, w1r)), w2r,
+    ).sum().backward()
+    torch.testing.assert_close(ours_dx, xr.grad, atol=0, rtol=0)
+    torch.testing.assert_close(ours_dw1, w1r.grad, atol=0, rtol=0)
+    torch.testing.assert_close(ours_dw2, w2r.grad, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("activation", ["silu", "relu", "gelu_tanh_approx", "relu_sq"])
 def test_linear_act_func_autograd(activation):
     if not torch.cuda.is_available():

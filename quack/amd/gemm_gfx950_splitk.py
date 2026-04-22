@@ -144,6 +144,12 @@ def _compile_hgemm_kernel(
     # (standard gated-MLP pattern). Only valid with SPLIT_K == 1 —
     # enforced in the public launcher.
     gate_type: str = "none",
+    # Fused activation-backward (``gemm_dact`` equivalent). When set,
+    # the kernel takes an additional ``PreAct`` tensor input of shape
+    # ``(M, N)`` and computes ``dpreact = matmul_acc * act'(preact)``
+    # element-wise in the write-back. Matches NVIDIA's GemmDActMixin
+    # pattern. Mutually exclusive with bias/activation/gate_type.
+    dact_activation: str = "none",
     # ``_m_hint`` is NOT used inside the kernel body — it's part of the
     # cache key only, forcing a fresh compile per distinct runtime M.
     # Works around the FlyDSL JIT specialising on the first M passed
@@ -242,8 +248,16 @@ def _compile_hgemm_kernel(
     _ACT = activation
     _GATE = gate_type
     _IS_GATED = gate_type != "none"
+    _DACT = dact_activation
+    _IS_DACT = dact_activation != "none"
     assert not (_IS_GATED and IS_SPLIT_K), (
         "gated epilogue requires SPLIT_K == 1 — the public launcher forces this"
+    )
+    assert not (_IS_DACT and IS_SPLIT_K), (
+        "dact epilogue requires SPLIT_K == 1"
+    )
+    assert not (_IS_DACT and (_HAS_BIAS or _ACT != "none" or _IS_GATED)), (
+        "dact epilogue is mutually exclusive with bias/activation/gate_type"
     )
     # Output column span per tile is halved for the gated case.
     OUT_BLOCK_N = (BLOCK_N // 2) if _IS_GATED else BLOCK_N
@@ -258,6 +272,7 @@ def _compile_hgemm_kernel(
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
         Bias: fx.Tensor,
+        PreAct: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -269,6 +284,9 @@ def _compile_hgemm_kernel(
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         # Output tensor uses OUT_N which is n for plain/bias/act, n/2 for gated.
         C_ = GTensor(C, dtype=dtype_, shape=(-1, OUT_N))
+        if _IS_DACT:
+            # dact path: preact has the same (M, N) shape as the matmul output.
+            PreAct_ = GTensor(PreAct, dtype=dtype_, shape=(-1, n))
         if _HAS_BIAS:
             Bias_ = GTensor(Bias, dtype=T.f32, shape=(n,))
         base_ptr = allocator.get_base()
@@ -706,6 +724,22 @@ def _compile_hgemm_kernel(
                             (m_global_idx, n_offset_out + n_local_idx),
                             out_vec, LDG_VEC_SIZE,
                         )
+                    elif _IS_DACT:
+                        # Load matmul-accumulator chunk from LDS and
+                        # preact chunk from HBM, then compute
+                        # dpreact_i = acc_i * act'(preact_i).
+                        vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                        preact_vec = PreAct_.vec_load(
+                            (m_global_idx, n_offset + n_local_idx),
+                            LDG_VEC_SIZE,
+                        )
+                        vec = _apply_dact(
+                            vec, preact_vec, _DACT, dtype_, LDG_VEC_SIZE,
+                        )
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_local_idx),
+                            vec, LDG_VEC_SIZE,
+                        )
                     else:
                         vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                         if _HAS_BIAS or _ACT != "none":
@@ -727,6 +761,7 @@ def _compile_hgemm_kernel(
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
         Bias: fx.Tensor,
+        PreAct: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -736,7 +771,7 @@ def _compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state, Bias).launch(
+        hgemm_kernel(C, A, B, m, COUNTER, signal_state, Bias, PreAct).launch(
             grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream,
         )
 
@@ -851,6 +886,71 @@ def _apply_epilogue(vec, bias_tensor, col_start, activation, out_dtype, vec_size
     return vector.from_elements(T.vec(vec_size, in_dtype), result_scalars)
 
 
+def _apply_dact(acc_vec, preact_vec, activation, out_dtype, vec_size):
+    """Fused activation-backward write-back: acc_i = acc_i * act'(preact_i).
+
+    ``acc_vec`` is the matmul accumulator (conceptually ``dout @ W``).
+    ``preact_vec`` is the saved forward pre-activation. Produces a
+    vec of ``dpreact`` values cast to ``out_dtype``.
+    """
+    import math as _py_math
+    from flydsl.expr import math as _fm
+    from flydsl.expr.arith import ArithValue
+    from flydsl.expr.numeric import Float32
+
+    result = []
+    for i in range_constexpr(vec_size):
+        a_i = vector.extract(acc_vec, static_position=[i], dynamic_position=[])
+        p_i = vector.extract(preact_vec, static_position=[i], dynamic_position=[])
+        a_av = ArithValue(a_i)
+        p_av = ArithValue(p_i)
+        if out_dtype is T.f32:
+            a, p = a_av, p_av
+        else:
+            a, p = a_av.extf(T.f32), p_av.extf(T.f32)
+        one = ArithValue(Float32(1.0))
+        zero = ArithValue(Float32(0.0))
+        half = ArithValue(Float32(0.5))
+        two = ArithValue(Float32(2.0))
+        if activation == "relu":
+            # relu'(p) = (p > 0). Use (p > 0).select(a, 0) to avoid explicit branches.
+            is_pos = p > zero
+            dpreact = is_pos.select(a, zero)
+        elif activation == "relu_sq":
+            # d(relu(p)*p)/dp = 2p if p > 0 else 0. dpreact = acc * 2p * 1_{p>0}
+            is_pos = p > zero
+            grad = two * p
+            dpreact = is_pos.select(a * grad, zero)
+        elif activation == "silu":
+            # silu'(p) = sigmoid(p) * (1 + p * (1 - sigmoid(p)))
+            sig = one / (one + _fm.exp(-p, fastmath="fast"))
+            deriv = sig * (one + p * (one - sig))
+            dpreact = a * deriv
+        elif activation == "gelu_tanh_approx":
+            c1 = ArithValue(Float32(_py_math.sqrt(2.0 / _py_math.pi)))
+            c2 = ArithValue(Float32(0.044715 * _py_math.sqrt(2.0 / _py_math.pi)))
+            three_c2 = ArithValue(Float32(3.0 * 0.044715 * _py_math.sqrt(2.0 / _py_math.pi)))
+            p_sq = p * p
+            z = p * (c1 + c2 * p_sq)
+            # tanh(z) = 1 - 2/(1+exp(2z))
+            exp2z = _fm.exp(two * z, fastmath="fast")
+            tanh_z = one - two / (one + exp2z)
+            sech2_z = one - tanh_z * tanh_z
+            # dz/dp = c1 + 3*c2*p^2
+            dz_dp = c1 + three_c2 * p_sq
+            deriv = half * (one + tanh_z) + half * p * sech2_z * dz_dp
+            dpreact = a * deriv
+        else:
+            raise ValueError(f"unsupported dact_activation {activation!r}")
+        if out_dtype is T.f32:
+            out = dpreact
+        else:
+            out = dpreact.truncf(out_dtype)
+        out_ir = out.ir_value() if hasattr(out, "ir_value") else out
+        result.append(out_ir)
+    return vector.from_elements(T.vec(vec_size, out_dtype), result)
+
+
 def _apply_gated_interleaved(pair0, pair1, gate_type, out_dtype, vec_size):
     """Interleaved-pair gated activation: input vectors store
     (g, u, g, u, ...) adjacency. Produces ``vec_size`` output values
@@ -942,6 +1042,7 @@ _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
 _ALLOWED_ACTIVATIONS = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
 _ALLOWED_GATES = {"none", "swiglu", "reglu", "geglu", "glu"}
+_ALLOWED_DACT = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
 
 
 @torch.library.custom_op(
@@ -949,28 +1050,37 @@ _ALLOWED_GATES = {"none", "swiglu", "reglu", "geglu", "glu"}
     mutates_args=("out",),
     schema=(
         "(Tensor a, Tensor b, Tensor(a0!) out, bool shuffled, "
-        "Tensor? bias, str activation, str gate_type) -> ()"
+        "Tensor? bias, str activation, str gate_type, "
+        "Tensor? preact, str dact_activation) -> ()"
     ),
 )
 def _gemm_splitk_out(
     a: Tensor, b: Tensor, out: Tensor, shuffled: bool,
     bias: Optional[Tensor], activation: str, gate_type: str,
+    preact: Optional[Tensor], dact_activation: str,
 ) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
     assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype == out.dtype
     assert activation in _ALLOWED_ACTIVATIONS
     assert gate_type in _ALLOWED_GATES
+    assert dact_activation in _ALLOWED_DACT
     M, K = a.shape
     N, K2 = b.shape
     assert K == K2
     is_gated = gate_type != "none"
+    is_dact = dact_activation != "none"
+    if is_dact:
+        assert preact is not None and preact.shape == (M, N)
+        assert preact.dtype == a.dtype and preact.stride(-1) == 1
+        assert not is_gated and activation == "none" and bias is None, (
+            "dact epilogue is mutually exclusive with bias/activation/gate_type"
+        )
     if is_gated:
         assert N % 2 == 0, "gated requires N even (output is (M, N/2))"
         expected_out_shape = (M, N // 2)
     else:
         expected_out_shape = (M, N)
     assert out.shape == expected_out_shape
-    # Non-trivial combinations not yet supported:
     assert not (is_gated and activation != "none"), (
         "gate_type subsumes activation; combining both is redundant/unsupported"
     )
@@ -978,10 +1088,10 @@ def _gemm_splitk_out(
     if has_bias:
         assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (N,)
     kwargs = _default_kwargs(M, N, K)
-    # Fused epilogue (bias + activation + gated) is non-distributive
+    # Fused epilogue (bias + activation + gated + dact) is non-distributive
     # over split-K atomic-fadd partial sums. Force SPLIT_K=1 whenever
     # we plan to apply any write-back transformation.
-    has_epilogue = has_bias or activation != "none" or is_gated
+    has_epilogue = has_bias or activation != "none" or is_gated or is_dact
     if has_epilogue and kwargs["SPLIT_K"] > 1:
         kwargs = dict(kwargs, SPLIT_K=1)
     if kwargs["B_PRE_SHUFFLE"] and not shuffled:
@@ -995,21 +1105,24 @@ def _gemm_splitk_out(
     exe = _compile_hgemm_kernel(
         _DTYPE2STR[a.dtype], N, K, **kwargs,
         has_bias=has_bias, activation=activation, gate_type=gate_type,
+        dact_activation=dact_activation,
         _m_hint=M,
     )
-    # Kernel requires a real Bias tensor even when has_bias=False (the
-    # flag gates whether to USE it inside the kernel). Pass a
-    # 1-element f32 dummy.
+    # Kernels always take Bias + PreAct arg slots; pass 1-element
+    # dummies when the corresponding flag is off.
     bias_arg = bias if has_bias else torch.zeros(
         1, device=a.device, dtype=torch.float32,
     )
-    exe(out, a, b, M, sem, state, bias_arg, stream)
+    preact_arg = preact if is_dact else torch.zeros(
+        1, device=a.device, dtype=a.dtype,
+    )
+    exe(out, a, b, M, sem, state, bias_arg, preact_arg, stream)
     if kwargs["SPLIT_K"] > 1:
         _advance_state(stream)
 
 
 @_gemm_splitk_out.register_fake
-def _gemm_splitk_out_fake(a, b, out, shuffled, bias, activation, gate_type):
+def _gemm_splitk_out_fake(a, b, out, shuffled, bias, activation, gate_type, preact, dact_activation):
     return None
 
 
@@ -1020,6 +1133,8 @@ def gemm_splitk(
     bias: Optional[Tensor] = None,
     activation: str = "none",
     gate_type: str = "none",
+    preact: Optional[Tensor] = None,
+    dact_activation: str = "none",
 ) -> Tensor:
     """Stream-K-capable NT GEMM: ``c = act(a @ b.T + bias)`` on gfx950.
 
@@ -1042,13 +1157,17 @@ def gemm_splitk(
     assert a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16)
     assert activation in _ALLOWED_ACTIVATIONS
     assert gate_type in _ALLOWED_GATES
+    assert dact_activation in _ALLOWED_DACT
     M, K = a.shape
     N, _ = b.shape
     is_gated = gate_type != "none"
     out_n = (N // 2) if is_gated else N
     if out is None:
         out = torch.empty(M, out_n, device=a.device, dtype=a.dtype)
-    _gemm_splitk_out(a, b, out, shuffled, bias, activation, gate_type)
+    _gemm_splitk_out(
+        a, b, out, shuffled, bias, activation, gate_type,
+        preact, dact_activation,
+    )
     return out
 
 
