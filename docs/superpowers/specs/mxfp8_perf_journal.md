@@ -112,3 +112,24 @@ for a perf-tuning pass. If AMD / FlyDSL ships an improved
 Proceeding to the epilogue-fusion workstream, which saves ~15-125 μs
 per call (launch overhead + elementwise kernel) — net bigger than
 the 1% kernel win at shapes up to ~4096³.
+
+## Epilogue fusion landing (2026-04-22)
+
+Wired bias + activation into the vendored kernel's direct-store
+writeback path. Activations supported: relu, relu_sq, silu,
+gelu_tanh_approx. Bias is an (N,) f32 tensor, fused in f32 before
+trunc_f → bf16 store. cshuffle is forced off when has_epi is set
+(the LDS-staged path would need duplicate fusion sites).
+
+Measured savings vs `mxfp8_gemm(...); F.silu(out + bias)`:
+
+| shape                  | unfused ms | fused ms | saved           |
+|------------------------|-----------:|---------:|-----------------|
+| 4096³                  |      0.142 |    0.126 |  15 μs (10.9%)  |
+| 8192³                  |      0.936 |    0.777 | 160 μs (17.1%)  |
+| 4096×11008×4096 (FFN)  |      0.409 |    0.321 |  88 μs (21.5%)  |
+
+At typical MoE / FFN shapes the fusion is net +11–22%. Much bigger
+than the 3% estimate I had before benching — the elementwise-kernel
+launch overhead dominates at smaller shapes, and the HBM
+round-trip dominates at 8k². Both go away with in-kernel fusion.

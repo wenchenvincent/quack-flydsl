@@ -114,3 +114,74 @@ def test_output_shape_and_dtype():
     out = mxfp8_gemm(a, b, sa, sb)
     assert out.shape == (M, N)
     assert out.dtype == torch.bfloat16
+
+
+# --- fused bias + activation ----------------------------------------------
+
+
+import torch.nn.functional as F
+
+
+def _dequant_ref(a_fp8, b_fp8, scale_a, scale_b):
+    a_f = _dequant_A(a_fp8, scale_a)
+    b_f = _dequant_B(b_fp8, scale_b)
+    return a_f @ b_f.t()
+
+
+@pytest.mark.parametrize("activation", ["relu", "silu", "relu_sq", "gelu_tanh_approx"])
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("M,N,K", [(256, 256, 256), (128, 256, 256), (512, 512, 512)])
+def test_mxfp8_gemm_fused_epi(activation, use_bias, M, N, K):
+    """Fused bias + activation in the writeback match dequant → matmul →
+    torch epi reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    ab = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    bb = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    a = ab.to(torch.float8_e4m3fn)
+    b = bb.to(torch.float8_e4m3fn)
+    sa = (torch.rand(K // 128, M, device="cuda") * 0.5 + 0.75).to(torch.float32)
+    sb = (torch.rand(N // 128, K // 128, device="cuda") * 0.5 + 0.75).to(torch.float32)
+    bias = torch.randn(N, device="cuda", dtype=torch.float32) * 0.1 if use_bias else None
+    out = mxfp8_gemm(a, b, sa, sb, bias=bias, activation=activation)
+
+    ref = _dequant_ref(a, b, sa, sb)
+    if use_bias:
+        ref = ref + bias
+    if activation == "relu":
+        ref = torch.relu(ref)
+    elif activation == "silu":
+        ref = F.silu(ref)
+    elif activation == "relu_sq":
+        ref = torch.relu(ref) * ref
+    elif activation == "gelu_tanh_approx":
+        ref = F.gelu(ref, approximate="tanh")
+    ref = ref.to(torch.bfloat16)
+
+    # bf16 rounding + fp8 input quant error compound, and relu_sq
+    # squares the output so it amplifies worst-case drift. 15% relative
+    # band absorbs that.
+    err = (out.float() - ref.float()).abs().max().item()
+    mean = ref.float().abs().mean().item()
+    assert err / max(mean, 1e-9) < 0.15, f"rel={err/max(mean,1e-9):.3g} err={err} mean={mean}"
+
+
+def test_mxfp8_gemm_bias_only():
+    """bias without activation — verify the bias path in isolation."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 256
+    ab = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    bb = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    a = ab.to(torch.float8_e4m3fn); b = bb.to(torch.float8_e4m3fn)
+    sa = (torch.rand(K // 128, M, device="cuda") * 0.5 + 0.75).to(torch.float32)
+    sb = (torch.rand(N // 128, K // 128, device="cuda") * 0.5 + 0.75).to(torch.float32)
+    bias = torch.randn(N, device="cuda", dtype=torch.float32) * 0.1
+
+    out = mxfp8_gemm(a, b, sa, sb, bias=bias)
+    ref = (_dequant_ref(a, b, sa, sb) + bias).to(torch.bfloat16)
+    err = (out.float() - ref.float()).abs().max().item()
+    mean = ref.float().abs().mean().item()
+    assert err / max(mean, 1e-9) < 0.05

@@ -60,8 +60,11 @@ _DTYPE2OUT = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _kernel_cache: dict = {}
 
 
-def _compile(M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves):
-    key = (M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves)
+def _compile(
+    M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves,
+    has_bias: bool = False, activation: str = "none",
+):
+    key = (M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves, has_bias, activation)
     got = _kernel_cache.get(key)
     if got is None:
         got = compile_blockscale_preshuffle_gemm(
@@ -71,9 +74,14 @@ def _compile(M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves):
             use_cshuffle_epilog=cshuffle,
             use_async_copy=True,
             waves_per_eu=waves,
+            has_bias=has_bias,
+            activation=activation,
         )
         _kernel_cache[key] = got
     return got
+
+
+_ALLOWED_ACTIVATIONS = ("none", "relu", "relu_sq", "silu", "gelu_tanh_approx")
 
 
 def _pick_config(M: int, N: int, K: int):
@@ -109,22 +117,34 @@ def _pick_config(M: int, N: int, K: int):
 @torch.library.custom_op(
     "quack_amd::_mxfp8_gemm_out",
     mutates_args=("out",),
-    schema="(Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, Tensor(a0!) out, bool shuffled) -> ()",
+    schema=(
+        "(Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, "
+        "Tensor(a0!) out, bool shuffled, Tensor? bias, str activation) -> ()"
+    ),
 )
 def _mxfp8_gemm_out(
     a: Tensor, b: Tensor, scale_a: Tensor, scale_b: Tensor,
     out: Tensor, shuffled: bool,
+    bias: Optional[Tensor], activation: str,
 ) -> None:
     assert a.is_cuda and b.is_cuda and scale_a.is_cuda and scale_b.is_cuda and out.is_cuda
     assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
     assert scale_a.dtype == torch.float32 and scale_b.dtype == torch.float32
     assert out.dtype in (torch.bfloat16, torch.float16)
+    assert activation in _ALLOWED_ACTIVATIONS, (
+        f"activation must be one of {_ALLOWED_ACTIVATIONS}, got {activation!r}"
+    )
     M, K = a.shape
     N, K2 = b.shape
     assert K == K2 and out.shape == (M, N)
     assert K % SCALE_BLOCK_K == 0 and N % SCALE_BLOCK_N == 0
     assert scale_a.shape == (K // SCALE_BLOCK_K, M)
     assert scale_b.shape == (N // SCALE_BLOCK_N, K // SCALE_BLOCK_K)
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.is_cuda and bias.dtype == torch.float32
+        assert bias.dim() == 1 and bias.size(0) == N
+    bias_arg = bias if has_bias else torch.empty(1, device=a.device, dtype=torch.float32)
 
     if not shuffled:
         b = shuffle_b(b)
@@ -132,13 +152,16 @@ def _mxfp8_gemm_out(
     tile_m, tile_n, tile_k, cshuffle, waves = _pick_config(M, N, K)
     assert M % tile_m == 0 and N % tile_n == 0 and K % tile_k == 0
     out_dtype = _DTYPE2OUT[out.dtype]
-    exe = _compile(M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves)
+    exe = _compile(
+        M, N, K, tile_m, tile_n, tile_k, out_dtype, cshuffle, waves,
+        has_bias=has_bias, activation=activation,
+    )
     stream = torch.cuda.current_stream()
-    exe(out, a, b, scale_a, scale_b, M, N, stream)
+    exe(out, a, b, scale_a, scale_b, bias_arg, M, N, stream)
 
 
 @_mxfp8_gemm_out.register_fake
-def _mxfp8_gemm_out_fake(a, b, scale_a, scale_b, out, shuffled):
+def _mxfp8_gemm_out_fake(a, b, scale_a, scale_b, out, shuffled, bias, activation):
     return None
 
 
@@ -149,6 +172,8 @@ def mxfp8_gemm(
     *,
     shuffled: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[Tensor] = None,
+    activation: str = "none",
 ) -> Tensor:
     """MX-FP8 blockscaled GEMM: ``out = a @ b.T`` with per-block scales.
 
@@ -160,6 +185,10 @@ def mxfp8_gemm(
       out:      optional preallocated (M, N) ``out_dtype`` output.
       shuffled: True if ``b`` is already passed through ``shuffle_b``.
       out_dtype: bf16 or f16.
+      bias:     optional (N,) f32 bias, added per-column in the
+                writeback before activation (in f32, before bf16 trunc).
+      activation: ``"none"``, ``"relu"``, ``"relu_sq"``, ``"silu"``, or
+                ``"gelu_tanh_approx"``. Applied in f32 post-bias.
 
     Constraints:
       - M multiple of 32
@@ -172,7 +201,7 @@ def mxfp8_gemm(
     N, _ = b.shape
     if out is None:
         out = torch.empty(M, N, device=a.device, dtype=out_dtype)
-    _mxfp8_gemm_out(a, b, scale_a, scale_b, out, shuffled)
+    _mxfp8_gemm_out(a, b, scale_a, scale_b, out, shuffled, bias, activation)
     return out
 
 

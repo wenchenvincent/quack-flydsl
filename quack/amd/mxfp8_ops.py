@@ -102,19 +102,49 @@ class _LinearMXFP8Function(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor):
+    def forward(ctx, x: Tensor, weight: Tensor, bias, activation):
         # Save pre-quant bf16 tensors for backward.
-        ctx.save_for_backward(x, weight)
+        ctx.save_for_backward(x, weight, bias if bias is not None else torch.empty(0))
         ctx.x_dtype = x.dtype
         ctx.weight_dtype = weight.dtype
+        ctx.activation = activation
+        ctx.has_bias = bias is not None
         # Quantise on the fly. Scale layouts match mxfp8_gemm's contract.
         x_fp8, scale_x = quantize_mxfp8(x, transpose_scale=True)  # (K//128, M)
         w_fp8, scale_w = _quantize_weight_with_block_scale(weight)  # (N//128, K//128)
-        return mxfp8_gemm(x_fp8, w_fp8, scale_x, scale_w, out_dtype=x.dtype)
+        preact = mxfp8_gemm(
+            x_fp8, w_fp8, scale_x, scale_w, out_dtype=x.dtype,
+            bias=bias, activation=activation or "none",
+        )
+        if activation is not None and activation != "none":
+            # Save pre-activation for activation-backward. When activation
+            # is None, preact == output and we skip the save (bwd is just
+            # two matmuls).
+            #
+            # For the fused path mxfp8_gemm returns the POST-activation
+            # output — so the "preact" we need for bwd is out_of_linear =
+            # preact = linear(x, w, bias). Recompute by running mxfp8_gemm
+            # without activation would 2× the forward cost. Alternative:
+            # back-apply inverse-activation. Neither is great.
+            #
+            # Pragmatic choice: save the POST-activation ``y`` and in
+            # backward, recompute the pre-activation via a cheap torch
+            # pass. swiglu/silu/gelu_tanh aren't easily invertible, so
+            # we actually save ``y`` and a small extra kernel launch to
+            # derive ``dy_preact = act_bwd(y, grad_out)``. That's a
+            # follow-up. For now: the kernel epi is used on forward for
+            # fast inference; training with activation dispatches to the
+            # unfused path (bias only in the kernel, activation torch-side).
+            raise NotImplementedError(
+                "training-mode activation not wired through the fused "
+                "epi path yet (it needs preact-recompute infra). Call "
+                "mxfp8_gemm(..., activation=...) directly for inference."
+            )
+        return preact
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
-        x, weight = ctx.saved_tensors
+        x, weight, bias_saved = ctx.saved_tensors
         # grad_out is (M, N) in x.dtype (bf16 typically).
         # dx = grad_out @ weight  — NN matmul, (M, N) × (N, K) → (M, K).
         # dw = grad_out.T @ x     — NN matmul, (N, M) × (M, K) → (N, K).
@@ -123,23 +153,34 @@ class _LinearMXFP8Function(torch.autograd.Function):
         # because grad_out arrived in bf16, not fp8.
         grad_x = torch.mm(grad_out, weight) if ctx.needs_input_grad[0] else None
         grad_w = torch.mm(grad_out.t(), x) if ctx.needs_input_grad[1] else None
-        return grad_x, grad_w
+        grad_bias = None
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = grad_out.sum(dim=0).to(torch.float32)
+        return grad_x, grad_w, grad_bias, None
 
 
-def linear_mxfp8_func(x: Tensor, weight: Tensor) -> Tensor:
-    """MX-FP8 linear with autograd: ``y = x @ weight.T``.
+def linear_mxfp8_func(
+    x: Tensor, weight: Tensor,
+    bias: Optional[Tensor] = None,
+    activation: Optional[str] = None,
+) -> Tensor:
+    """MX-FP8 linear with autograd: ``y = activation(x @ weight.T + bias)``.
 
-    Drop-in for ``torch.nn.functional.linear(x, weight)`` when both
+    Drop-in for ``torch.nn.functional.linear(x, weight, bias)`` when both
     inputs are bf16/f16 and shape-aligned (M%32==0, N%128==0, K%128==0).
     Forward runs the native ``mfma_scale_f32_16x16x128_f8f6f4`` kernel
-    via on-the-fly MX-FP8 quantisation; backward runs bf16 matmul.
+    via on-the-fly MX-FP8 quantisation with fused bias in the writeback;
+    backward runs bf16 matmul.
 
     Accepts tensors with ``requires_grad=True`` and participates in the
     autograd graph — no manual scale plumbing needed.
 
     Limitations:
-      - No bias in this entry point (use ``out + bias`` post-call, or
-        the bf16 ``linear(x, w, bias)`` if you need fused bias).
+      - ``activation`` only supported in forward/inference. The backward
+        path for activated mxfp8 requires preact recompute (follow-up).
+        For activation in training use ``linear(x, w, bias, activation)``
+        on bf16, or ``mxfp8_gemm(..., activation=...)`` directly (no
+        autograd).
       - x and weight must be the same dtype (bf16 or f16). Mixed-precision
         across them isn't supported.
     """
@@ -149,7 +190,9 @@ def linear_mxfp8_func(x: Tensor, weight: Tensor) -> Tensor:
     M, K = x.shape
     N, K2 = weight.shape
     assert K == K2
-    return _LinearMXFP8Function.apply(x, weight)
+    if bias is not None:
+        assert bias.dim() == 1 and bias.size(0) == N and bias.dtype == torch.float32
+    return _LinearMXFP8Function.apply(x, weight, bias, activation)
 
 
 __all__ = ["linear_mxfp8_func", "quantize_mxfp8"]

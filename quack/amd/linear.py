@@ -171,8 +171,10 @@ def linear_mxfp8(
     *,
     weight_shuffled: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[Tensor] = None,
+    activation: Optional[str] = None,
 ) -> Tensor:
-    """MX-FP8 linear: ``y = x @ weight.T`` with per-block fp8 scales.
+    """MX-FP8 linear: ``y = activation(x @ weight.T + bias)`` with per-block fp8 scales.
 
     Args:
       x:              (M, K) fp8_e4m3fn. Row-major, last-dim contiguous.
@@ -183,6 +185,10 @@ def linear_mxfp8(
       scale_w:        (N//128, K//128) f32. ``scale_w[block_n, block_k]``.
       weight_shuffled: if True, ``weight`` is already in the kernel's preshuffled form.
       out_dtype:      bf16 or f16.
+      bias:           optional (N,) f32 bias, fused into the kernel's
+                      writeback (added in f32 before trunc_f → bf16).
+      activation:     optional ``"relu" | "relu_sq" | "silu" | "gelu_tanh_approx"``.
+                      Fused post-bias in the writeback.
 
     Returns: (M, N) tensor in ``out_dtype``.
 
@@ -192,6 +198,8 @@ def linear_mxfp8(
     return mxfp8_gemm(
         x, weight, scale_x, scale_w,
         shuffled=weight_shuffled, out_dtype=out_dtype,
+        bias=bias,
+        activation=activation if activation is not None else "none",
     )
 
 

@@ -39,6 +39,9 @@ from quack.amd._fly_mfma_preshuffle_pipeline import (
 from quack.amd._fly_mfma_epilogues import mfma_epilog
 
 
+_ALLOWED_ACTIVATIONS = ("none", "relu", "relu_sq", "silu", "gelu_tanh_approx")
+
+
 def compile_blockscale_preshuffle_gemm(
     *,
     M: int,
@@ -52,8 +55,24 @@ def compile_blockscale_preshuffle_gemm(
     use_cshuffle_epilog: bool = False,
     waves_per_eu: int = None,
     use_async_copy: bool = False,
+    # AMD port addition — in-kernel bias + activation fusion.  When either
+    # is set the writeback does ``out = act(val + bias[col])`` in f32
+    # before the trunc_f → bf16 store.  Only the direct-store epilogue
+    # path supports fusion (cshuffle path stages through LDS which would
+    # require duplicating the fused math at two sites — not worth it for
+    # the 1% cshuffle win).
+    has_bias: bool = False,
+    activation: str = "none",
 ):
     """Compile blockscale preshuffle GEMM. FP8 input, per-block scales, bf16/fp16 output."""
+    if activation not in _ALLOWED_ACTIVATIONS:
+        raise ValueError(f"activation must be one of {_ALLOWED_ACTIVATIONS}, got {activation!r}")
+    _has_epi = has_bias or activation != "none"
+    if _has_epi and use_cshuffle_epilog:
+        # Force the direct-store epilogue path so the fused bias/act hook
+        # fires. The cshuffle path writes to LDS first and would need a
+        # second fusion site — not worth the 1% cshuffle win.
+        use_cshuffle_epilog = False
     if out_dtype not in ("fp16", "bf16"):
         raise ValueError(f"out_dtype must be 'fp16' or 'bf16', got {out_dtype!r}")
     if tile_k % scale_block_k != 0:
@@ -168,6 +187,7 @@ def compile_blockscale_preshuffle_gemm(
         arg_b: fx.Tensor,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
+        arg_bias: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -230,6 +250,10 @@ def compile_blockscale_preshuffle_gemm(
 
         b_rsrc = buffer_ops.create_buffer_resource(arg_b, max_size=True)
         scale_b_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=True)
+        if has_bias:
+            # Bias is an (N,) f32 tensor. max_size=True lets buffer loads
+            # use a generic SRD; the caller must supply a valid (N,) tensor.
+            bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
         bx_m = bx * tile_m
         by_n = by * tile_n
@@ -651,6 +675,55 @@ def compile_blockscale_preshuffle_gemm(
                 )
                 return
 
+            # AMD port — fused bias + activation in the writeback. Applied
+            # in f32 before trunc_f → bf16 store so precision is preserved.
+            # Only fires on the direct-store epilogue path; cshuffle is
+            # disabled at config time when has_epi is set.
+            from flydsl.expr import math as _fm_math
+            import math as _py_math
+
+            def _apply_epi_val(val_f32, col_global_i32):
+                v = val_f32
+                if has_bias:
+                    b_val = buffer_ops.buffer_load(
+                        bias_rsrc, col_global_i32, vec_width=1, dtype=T.f32,
+                    )
+                    v = arith.addf(v, b_val)
+                if activation == "relu":
+                    zero = arith.constant(0.0, type=T.f32)
+                    v = arith.maximumf(v, zero)
+                elif activation == "relu_sq":
+                    zero = arith.constant(0.0, type=T.f32)
+                    rv = arith.maximumf(v, zero)
+                    v = arith.mulf(rv, v)
+                elif activation == "silu":
+                    # silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                    one = arith.constant(1.0, type=T.f32)
+                    neg_v = arith.negf(v)
+                    exp_neg = _fm_math.exp(ArithValue(neg_v), fastmath="fast")
+                    denom = arith.addf(one, exp_neg)
+                    v = arith.divf(v, denom)
+                elif activation == "gelu_tanh_approx":
+                    # gelu(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+                    c1 = arith.constant(
+                        _py_math.sqrt(2.0 / _py_math.pi), type=T.f32,
+                    )
+                    c2 = arith.constant(
+                        0.044715 * _py_math.sqrt(2.0 / _py_math.pi), type=T.f32,
+                    )
+                    half = arith.constant(0.5, type=T.f32)
+                    one = arith.constant(1.0, type=T.f32)
+                    two = arith.constant(2.0, type=T.f32)
+                    x_sq = arith.mulf(v, v)
+                    inner = arith.addf(c1, arith.mulf(c2, x_sq))
+                    z = arith.mulf(v, inner)
+                    two_z = arith.mulf(two, z)
+                    exp_2z = _fm_math.exp(ArithValue(two_z), fastmath="fast")
+                    tanh_z = arith.subf(one, arith.divf(two, arith.addf(one, exp_2z)))
+                    half_plus = arith.addf(half, arith.mulf(half, tanh_z))
+                    v = arith.mulf(v, half_plus)
+                return v
+
             def body_row(*, mi, ii, row_in_tile, row):
                 col_base = by_n + n_tile_base + lane_mod_16
                 idx_base = row * c_n + col_base
@@ -660,6 +733,9 @@ def compile_blockscale_preshuffle_gemm(
                     val = vector.extract(
                         acc, static_position=[ii], dynamic_position=[]
                     )
+                    if _has_epi:
+                        col_global = col_base + (ni * 16)
+                        val = _apply_epi_val(val, col_global)
                     val_out = arith.trunc_f(_out_elem_type(), val)
                     idx_out = idx_base + (ni * 16)
                     buffer_ops.buffer_store(val_out, c_rsrc, idx_out)
@@ -849,6 +925,7 @@ def compile_blockscale_preshuffle_gemm(
         arg_b: fx.Tensor,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
+        arg_bias: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
@@ -864,7 +941,7 @@ def compile_blockscale_preshuffle_gemm(
         gy = i32_n // tile_n
 
         launcher = kernel_gemm(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b,
-                               i32_m, i32_n)
+                               arg_bias, i32_m, i32_n)
         if waves_per_eu is not None:
             _wpe = int(waves_per_eu)
             if _wpe >= 1:
