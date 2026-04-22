@@ -584,3 +584,158 @@ def test_linear_cross_entropy_fwd_bwd_chunked_matches_unchunked():
     # dw accumulates in f32 in a deterministic order (sequential) so
     # also bit-exact across chunk partitions.
     torch.testing.assert_close(dw_c, dw_u, atol=1e-5, rtol=1e-5)
+
+
+# --- W1: gemm_dgated kernel + gated_mlp_func_train -------------------------
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+def test_gemm_splitk_fused_dgated(gate_type):
+    """Direct fused gemm_dgated kernel: matmul + gated act-bwd + interleaved
+    dpreact in the write-back. Reference = torch composite."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk
+    torch.manual_seed(0)
+    # Shapes meeting splitk constraints for the dgated path:
+    #   M = 128 (splitk M % 128), hidden = 256 (N % 256), out_dim = 128 (K % 64).
+    M, out_dim, hidden = 128, 128, 256
+    a = torch.randn(M, out_dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    # b plays the role of w_down.T of shape (hidden, out_dim) — splitk NT.
+    b = torch.randn(hidden, out_dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    # preact in interleaved (g0, u0, g1, u1, …) layout, shape (M, 2*hidden).
+    preact = torch.randn(M, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 0.3
+
+    dpreact = gemm_splitk(
+        a, b, dgated_gate_type=gate_type, dgated_preact=preact,
+    )
+    assert dpreact.shape == (M, 2 * hidden)
+
+    # Reference: dy = a @ b.T, then interleaved act-bwd per pair.
+    dy = a.float() @ b.float().t()  # (M, hidden)
+    preact_pairs = preact.view(M, hidden, 2).float()
+    gate = preact_pairs[..., 0]
+    up = preact_pairs[..., 1]
+    if gate_type == "swiglu":
+        sig = torch.sigmoid(gate)
+        silu_g = gate * sig
+        dsilu_dg = sig * (1.0 + gate * (1.0 - sig))
+        dgate_ref = dy * dsilu_dg * up
+        dup_ref = dy * silu_g
+    elif gate_type == "reglu":
+        mask = (gate > 0).float()
+        dgate_ref = dy * mask * up
+        dup_ref = dy * gate.clamp_min(0)
+    elif gate_type == "geglu":
+        import math as _m
+        c1 = _m.sqrt(2.0 / _m.pi)
+        z = c1 * (gate + 0.044715 * gate.pow(3))
+        th = torch.tanh(z)
+        dz_dg = c1 * (1.0 + 3.0 * 0.044715 * gate.pow(2))
+        gelu_g = 0.5 * gate * (1.0 + th)
+        dgelu_dg = 0.5 * (1.0 + th) + 0.5 * gate * (1.0 - th * th) * dz_dg
+        dgate_ref = dy * dgelu_dg * up
+        dup_ref = dy * gelu_g
+    elif gate_type == "glu":
+        sig = torch.sigmoid(gate)
+        dsig_dg = sig * (1.0 - sig)
+        dgate_ref = dy * dsig_dg * up
+        dup_ref = dy * sig
+    ref_interleaved = torch.stack(
+        [dgate_ref, dup_ref], dim=-1,
+    ).view(M, 2 * hidden).to(torch.bfloat16)
+
+    # geglu/glu involve larger-magnitude dy*act'*up products; allow bf16
+    # rounding drift (1 ulp). swiglu/reglu with random inputs still align
+    # within the gemm_splitk bf16 tolerance band.
+    tol = {"swiglu": 5e-2, "reglu": 5e-2, "geglu": 5e-2, "glu": 5e-2}[gate_type]
+    torch.testing.assert_close(dpreact.float(), ref_interleaved.float(), atol=tol, rtol=1e-2)
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+def test_gemm_splitk_fused_dgated_emit_postact(gate_type):
+    """Co-emits postact = act(g) * u alongside dpreact."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.gemm_gfx950_splitk import gemm_splitk
+    torch.manual_seed(0)
+    M, out_dim, hidden = 128, 128, 256
+    a = torch.randn(M, out_dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(hidden, out_dim, device="cuda", dtype=torch.bfloat16) * 0.3
+    preact = torch.randn(M, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 0.3
+
+    dpreact, postact = gemm_splitk(
+        a, b, dgated_gate_type=gate_type, dgated_preact=preact,
+        dgated_emit_postact=True,
+    )
+    assert dpreact.shape == (M, 2 * hidden)
+    assert postact.shape == (M, hidden)
+
+    preact_pairs = preact.view(M, hidden, 2).float()
+    gate = preact_pairs[..., 0]
+    up = preact_pairs[..., 1]
+    if gate_type == "swiglu":
+        ref_post = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+    elif gate_type == "reglu":
+        ref_post = (torch.relu(gate) * up).to(torch.bfloat16)
+    elif gate_type == "geglu":
+        ref_post = (torch.nn.functional.gelu(gate, approximate="tanh") * up).to(torch.bfloat16)
+    elif gate_type == "glu":
+        ref_post = (torch.sigmoid(gate) * up).to(torch.bfloat16)
+    torch.testing.assert_close(postact.float(), ref_post.float(), atol=5e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("gate_type", ["swiglu", "reglu", "geglu", "glu"])
+def test_gated_mlp_func_train_autograd(gate_type):
+    """End-to-end gated MLP train: matches torch autograd on the same math."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    from quack.amd.linear_training import gated_mlp_func_train
+    from quack.amd.gemm_gfx950_splitk import interleave_gated_weight
+    torch.manual_seed(0)
+    M, in_f, hidden, out_dim = 128, 128, 256, 128
+    x = torch.randn(M, in_f, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    # Standard (gate half, up half) layout; we interleave before calling.
+    w_gate_up = torch.randn(
+        2 * hidden, in_f, device="cuda", dtype=torch.bfloat16,
+    ) * 0.1
+    w_gate_up_inter = interleave_gated_weight(w_gate_up).detach().requires_grad_(True)
+    w_down = (torch.randn(
+        out_dim, hidden, device="cuda", dtype=torch.bfloat16,
+    ) * 0.1).detach().requires_grad_(True)
+
+    out = gated_mlp_func_train(x, w_gate_up_inter, w_down, gate_type=gate_type)
+    out.sum().backward()
+    ours_dx = x.grad.clone()
+    ours_dw_gate_up_inter = w_gate_up_inter.grad.clone()
+    ours_dw_down = w_down.grad.clone()
+    x.grad = None
+    w_gate_up_inter.grad = None
+    w_down.grad = None
+
+    # Reference chain: plain linear + torch gate + linear, using the
+    # same interleaved weight.
+    xr = x.detach().clone().requires_grad_(True)
+    wgur = w_gate_up_inter.detach().clone().requires_grad_(True)
+    wdr = w_down.detach().clone().requires_grad_(True)
+    preact_r = torch.nn.functional.linear(xr, wgur)
+    pairs = preact_r.view(M, hidden, 2)
+    gate_r = pairs[..., 0]
+    up_r = pairs[..., 1]
+    if gate_type == "swiglu":
+        post_r = torch.nn.functional.silu(gate_r) * up_r
+    elif gate_type == "reglu":
+        post_r = torch.relu(gate_r) * up_r
+    elif gate_type == "geglu":
+        post_r = torch.nn.functional.gelu(gate_r, approximate="tanh") * up_r
+    elif gate_type == "glu":
+        post_r = torch.sigmoid(gate_r) * up_r
+    out_r = torch.nn.functional.linear(post_r.contiguous(), wdr)
+    out_r.sum().backward()
+
+    # bf16 rounding drift at these magnitudes is within 1 ulp. Keep band
+    # loose enough to absorb (dgate, dup) accumulations into grad_x /
+    # grad_w_gate_up over the matmul.
+    torch.testing.assert_close(ours_dx, xr.grad, atol=0.5, rtol=1e-2)
+    torch.testing.assert_close(ours_dw_gate_up_inter, wgur.grad, atol=0.5, rtol=1e-2)
+    torch.testing.assert_close(ours_dw_down, wdr.grad, atol=0.5, rtol=1e-2)

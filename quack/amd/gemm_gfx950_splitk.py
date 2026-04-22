@@ -150,6 +150,18 @@ def _compile_hgemm_kernel(
     # element-wise in the write-back. Matches NVIDIA's GemmDActMixin
     # pattern. Mutually exclusive with bias/activation/gate_type.
     dact_activation: str = "none",
+    # Fused gated-activation backward (``gemm_dgated`` equivalent). When
+    # set, ``acc = A @ B.T`` of shape ``(M, n)`` is interpreted as the
+    # upstream gradient ``dy`` per gated-hidden column. The kernel loads
+    # the saved interleaved preact ``(M, 2n)`` = ``(g0, u0, g1, u1, …)``
+    # from ``PreAct``, computes ``dpreact[2c]   = act'(g_c) * u_c * dy_c``
+    # and              ``dpreact[2c+1] = act(g_c)        * dy_c``, and
+    # stores the pair back to the output tensor ``C`` of shape
+    # ``(M, 2n)``. Optionally co-emits ``postact[c] = act(g_c) * u_c``
+    # to a separate ``Postact`` output tensor (``_EMIT_POSTACT``).
+    # Mutually exclusive with bias / activation / gate_type / dact.
+    dgated_gate_type: str = "none",
+    emit_postact: bool = False,
     # ``_m_hint`` is NOT used inside the kernel body — it's part of the
     # cache key only, forcing a fresh compile per distinct runtime M.
     # Works around the FlyDSL JIT specialising on the first M passed
@@ -250,18 +262,42 @@ def _compile_hgemm_kernel(
     _IS_GATED = gate_type != "none"
     _DACT = dact_activation
     _IS_DACT = dact_activation != "none"
+    _DGATED = dgated_gate_type
+    _IS_DGATED = dgated_gate_type != "none"
+    _EMIT_POSTACT = bool(emit_postact)
     assert not (_IS_GATED and IS_SPLIT_K), (
         "gated epilogue requires SPLIT_K == 1 — the public launcher forces this"
     )
     assert not (_IS_DACT and IS_SPLIT_K), (
         "dact epilogue requires SPLIT_K == 1"
     )
+    assert not (_IS_DGATED and IS_SPLIT_K), (
+        "dgated epilogue requires SPLIT_K == 1"
+    )
     assert not (_IS_DACT and (_HAS_BIAS or _ACT != "none" or _IS_GATED)), (
         "dact epilogue is mutually exclusive with bias/activation/gate_type"
     )
-    # Output column span per tile is halved for the gated case.
-    OUT_BLOCK_N = (BLOCK_N // 2) if _IS_GATED else BLOCK_N
-    OUT_N = (n // 2) if _IS_GATED else n
+    assert not (_IS_DGATED and (_HAS_BIAS or _ACT != "none" or _IS_GATED or _IS_DACT)), (
+        "dgated epilogue is mutually exclusive with bias/activation/gate_type/dact"
+    )
+    assert not (_EMIT_POSTACT and not _IS_DGATED), (
+        "emit_postact only valid with dgated_gate_type set"
+    )
+    # Output column span per tile.
+    #   - Gated:   halved (each output col comes from 2 matmul cols).
+    #   - Dgated:  iteration stays over the acc tile (BLOCK_N); output
+    #              tensor has 2*n cols (dpreact shape), but we compute
+    #              the 2× HBM stride in the epilogue branch directly.
+    #   - Plain/dact/bias/activation: unchanged.
+    if _IS_GATED:
+        OUT_BLOCK_N = BLOCK_N // 2
+        OUT_N = n // 2
+    elif _IS_DGATED:
+        OUT_BLOCK_N = BLOCK_N
+        OUT_N = 2 * n
+    else:
+        OUT_BLOCK_N = BLOCK_N
+        OUT_N = n
     LDG_C_X_THREADS_OUT = OUT_BLOCK_N // LDG_VEC_SIZE
     LDG_REG_C_COUNT_OUT = (BLOCK_M * OUT_BLOCK_N) // (LDG_VEC_SIZE * BLOCK_THREADS)
 
@@ -273,6 +309,7 @@ def _compile_hgemm_kernel(
         signal_state: fx.Int32,
         Bias: fx.Tensor,
         PreAct: fx.Tensor,
+        Postact: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -282,11 +319,22 @@ def _compile_hgemm_kernel(
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        # Output tensor uses OUT_N which is n for plain/bias/act, n/2 for gated.
+        # Output tensor uses OUT_N:
+        #   - plain/bias/act/dact: OUT_N = n
+        #   - gated:               OUT_N = n / 2
+        #   - dgated:              OUT_N = 2 * n  (dpreact has 2× cols)
         C_ = GTensor(C, dtype=dtype_, shape=(-1, OUT_N))
         if _IS_DACT:
             # dact path: preact has the same (M, N) shape as the matmul output.
             PreAct_ = GTensor(PreAct, dtype=dtype_, shape=(-1, n))
+        if _IS_DGATED:
+            # dgated path: preact is the saved interleaved (g0,u0,g1,u1,…)
+            # with shape (M, 2n).  Same shape as the dpreact output.
+            PreAct_ = GTensor(PreAct, dtype=dtype_, shape=(-1, 2 * n))
+        if _EMIT_POSTACT:
+            # postact = act(g_c) * u_c of shape (M, n) — one scalar per
+            # matmul acc column.
+            Postact_ = GTensor(Postact, dtype=dtype_, shape=(-1, n))
         if _HAS_BIAS:
             Bias_ = GTensor(Bias, dtype=T.f32, shape=(n,))
         base_ptr = allocator.get_base()
@@ -740,6 +788,41 @@ def _compile_hgemm_kernel(
                             (m_global_idx, n_offset + n_local_idx),
                             vec, LDG_VEC_SIZE,
                         )
+                    elif _IS_DGATED:
+                        # Load one acc chunk (LDG_VEC_SIZE scalars) from LDS
+                        # and two interleaved preact chunks (2 × LDG_VEC_SIZE
+                        # scalars covering 4 + 4 = 8 (gate, up) pairs) from
+                        # HBM. Emit two dpreact chunks (interleaved dgate/dup
+                        # pairs) and optionally one postact chunk.
+                        #
+                        # HBM stride: preact and dpreact are (M, 2n); postact
+                        # is (M, n) so n_offset maps 1:1.
+                        acc_vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                        preact_n_start = fx.Index(2) * (n_offset + n_local_idx)
+                        preact0 = PreAct_.vec_load(
+                            (m_global_idx, preact_n_start), LDG_VEC_SIZE,
+                        )
+                        preact1 = PreAct_.vec_load(
+                            (m_global_idx, preact_n_start + fx.Index(LDG_VEC_SIZE)),
+                            LDG_VEC_SIZE,
+                        )
+                        dpreact0, dpreact1, postact_vec = _apply_dgated(
+                            acc_vec, preact0, preact1, _DGATED, dtype_,
+                            LDG_VEC_SIZE, emit_postact=_EMIT_POSTACT,
+                        )
+                        C_.vec_store(
+                            (m_global_idx, preact_n_start),
+                            dpreact0, LDG_VEC_SIZE,
+                        )
+                        C_.vec_store(
+                            (m_global_idx, preact_n_start + fx.Index(LDG_VEC_SIZE)),
+                            dpreact1, LDG_VEC_SIZE,
+                        )
+                        if _EMIT_POSTACT:
+                            Postact_.vec_store(
+                                (m_global_idx, n_offset + n_local_idx),
+                                postact_vec, LDG_VEC_SIZE,
+                            )
                     else:
                         vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                         if _HAS_BIAS or _ACT != "none":
@@ -762,6 +845,7 @@ def _compile_hgemm_kernel(
         signal_state: fx.Int32,
         Bias: fx.Tensor,
         PreAct: fx.Tensor,
+        Postact: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -771,7 +855,9 @@ def _compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state, Bias, PreAct).launch(
+        hgemm_kernel(
+            C, A, B, m, COUNTER, signal_state, Bias, PreAct, Postact,
+        ).launch(
             grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream,
         )
 
@@ -951,6 +1037,121 @@ def _apply_dact(acc_vec, preact_vec, activation, out_dtype, vec_size):
     return vector.from_elements(T.vec(vec_size, out_dtype), result)
 
 
+def _apply_dgated(
+    acc_vec, preact0, preact1, gate_type, out_dtype, vec_size, emit_postact,
+):
+    """Fused gated-activation backward write-back.
+
+    Inputs:
+      ``acc_vec``  —  ``vector<vec_size x out_dtype>`` of dy values (one
+                      per gated hidden column).
+      ``preact0``  —  ``vector<vec_size x out_dtype>`` covering ``vec_size / 2``
+                      ``(gate, up)`` pairs — cols ``[2c, 2c + vec_size)``.
+      ``preact1``  —  same, covering cols ``[2c + vec_size, 2c + 2*vec_size)``.
+
+    Outputs (``emit_postact`` controls whether ``postact_vec`` is produced):
+      ``dpreact0``  —  interleaved ``(dgate, dup)`` pairs for ``preact0``'s
+                       columns. ``[dg0, du0, dg1, du1, dg2, du2, dg3, du3]``.
+      ``dpreact1``  —  same, for ``preact1``'s columns.
+      ``postact_vec``  —  ``[pa0, pa1, …, pa_{vec_size - 1}]`` with
+                          ``pa_c = act(g_c) * u_c``, or ``None`` if
+                          ``emit_postact`` is False.
+
+    Activation primes (all computed in f32, cast back to ``out_dtype`` at the
+    end). ``s`` denotes ``sigmoid(g)`` reused across primes.
+      - ``swiglu``: ``act(g) = g * s``, ``act'(g) = s * (1 + g * (1 - s))``.
+      - ``reglu``:  ``act(g) = max(g, 0)``, ``act'(g) = (g > 0) ? 1 : 0``.
+      - ``geglu``:  tanh-approx gelu + its derivative.
+      - ``glu``:    ``act(g) = s``,       ``act'(g) = s * (1 - s)``.
+    """
+    import math as _py_math
+    from flydsl.expr import math as _fm
+    from flydsl.expr.arith import ArithValue
+    from flydsl.expr.numeric import Float32
+
+    def _gate_bwd_scalar(g_av, u_av, dy_av):
+        """Return (dgate, dup, postact) as out_dtype-cast IR scalars."""
+        if out_dtype is T.f32:
+            g, u, dy = g_av, u_av, dy_av
+        else:
+            g = g_av.extf(T.f32)
+            u = u_av.extf(T.f32)
+            dy = dy_av.extf(T.f32)
+        one = ArithValue(Float32(1.0))
+        zero = ArithValue(Float32(0.0))
+        if gate_type == "swiglu":
+            sig = one / (one + _fm.exp(-g, fastmath="fast"))
+            fwd = g * sig
+            fwd_prime = sig * (one + g * (one - sig))
+            dgate = fwd_prime * u * dy
+            dup = fwd * dy
+            postact = fwd * u
+        elif gate_type == "reglu":
+            is_pos = g > zero
+            fwd = is_pos.select(g, zero)
+            dgate = is_pos.select(u * dy, zero)
+            dup = fwd * dy
+            postact = fwd * u
+        elif gate_type == "geglu":
+            c1 = ArithValue(Float32(_py_math.sqrt(2.0 / _py_math.pi)))
+            c2 = ArithValue(Float32(0.044715 * _py_math.sqrt(2.0 / _py_math.pi)))
+            three_c2 = ArithValue(Float32(3.0 * 0.044715 * _py_math.sqrt(2.0 / _py_math.pi)))
+            half = ArithValue(Float32(0.5))
+            two = ArithValue(Float32(2.0))
+            g_sq = g * g
+            z = g * (c1 + c2 * g_sq)
+            exp2z = _fm.exp(two * z, fastmath="fast")
+            tanh_z = one - two / (one + exp2z)
+            sech2_z = one - tanh_z * tanh_z
+            dz_dg = c1 + three_c2 * g_sq
+            fwd = g * (half + half * tanh_z)
+            fwd_prime = half * (one + tanh_z) + half * g * sech2_z * dz_dg
+            dgate = fwd_prime * u * dy
+            dup = fwd * dy
+            postact = fwd * u
+        elif gate_type == "glu":
+            sig = one / (one + _fm.exp(-g, fastmath="fast"))
+            fwd = sig
+            fwd_prime = sig * (one - sig)
+            dgate = fwd_prime * u * dy
+            dup = fwd * dy
+            postact = fwd * u
+        else:
+            raise ValueError(f"unknown dgated_gate_type {gate_type!r}")
+
+        def _cast(v):
+            if out_dtype is T.f32:
+                return v.ir_value() if hasattr(v, "ir_value") else v
+            c = v.truncf(out_dtype)
+            return c.ir_value() if hasattr(c, "ir_value") else c
+
+        return _cast(dgate), _cast(dup), _cast(postact)
+
+    assert vec_size % 2 == 0, "dgated epilogue needs even vec_size (pair layout)"
+    half = vec_size // 2  # pairs per chunk
+    dpreact_out = [[], []]
+    postact_scalars = []
+    for chunk_idx in range_constexpr(2):
+        chunk = preact0 if chunk_idx == 0 else preact1
+        for pair_idx in range_constexpr(half):
+            g_i = vector.extract(chunk, static_position=[2 * pair_idx], dynamic_position=[])
+            u_i = vector.extract(chunk, static_position=[2 * pair_idx + 1], dynamic_position=[])
+            acc_idx = chunk_idx * half + pair_idx
+            dy_i = vector.extract(acc_vec, static_position=[acc_idx], dynamic_position=[])
+            dgate_s, dup_s, postact_s = _gate_bwd_scalar(
+                ArithValue(g_i), ArithValue(u_i), ArithValue(dy_i),
+            )
+            dpreact_out[chunk_idx].append(dgate_s)
+            dpreact_out[chunk_idx].append(dup_s)
+            postact_scalars.append(postact_s)
+    dpreact0 = vector.from_elements(T.vec(vec_size, out_dtype), dpreact_out[0])
+    dpreact1 = vector.from_elements(T.vec(vec_size, out_dtype), dpreact_out[1])
+    postact_vec = None
+    if emit_postact:
+        postact_vec = vector.from_elements(T.vec(vec_size, out_dtype), postact_scalars)
+    return dpreact0, dpreact1, postact_vec
+
+
 def _apply_gated_interleaved(pair0, pair1, gate_type, out_dtype, vec_size):
     """Interleaved-pair gated activation: input vectors store
     (g, u, g, u, ...) adjacency. Produces ``vec_size`` output values
@@ -1043,39 +1244,55 @@ _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 _ALLOWED_ACTIVATIONS = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
 _ALLOWED_GATES = {"none", "swiglu", "reglu", "geglu", "glu"}
 _ALLOWED_DACT = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
+_ALLOWED_DGATED = {"none", "swiglu", "reglu", "geglu", "glu"}
 
 
 @torch.library.custom_op(
     "quack_amd::_gemm_splitk_out",
-    mutates_args=("out",),
+    mutates_args=("out", "postact_out"),
     schema=(
         "(Tensor a, Tensor b, Tensor(a0!) out, bool shuffled, "
         "Tensor? bias, str activation, str gate_type, "
-        "Tensor? preact, str dact_activation) -> ()"
+        "Tensor? preact, str dact_activation, "
+        "str dgated_gate_type, Tensor? dgated_preact, "
+        "Tensor(a1!) postact_out, bool emit_postact) -> ()"
     ),
 )
 def _gemm_splitk_out(
     a: Tensor, b: Tensor, out: Tensor, shuffled: bool,
     bias: Optional[Tensor], activation: str, gate_type: str,
     preact: Optional[Tensor], dact_activation: str,
+    dgated_gate_type: str,
+    dgated_preact: Optional[Tensor],
+    postact_out: Tensor,
+    emit_postact: bool,
 ) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
     assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype == out.dtype
     assert activation in _ALLOWED_ACTIVATIONS
     assert gate_type in _ALLOWED_GATES
     assert dact_activation in _ALLOWED_DACT
+    assert dgated_gate_type in _ALLOWED_DGATED
     M, K = a.shape
     N, K2 = b.shape
     assert K == K2
     is_gated = gate_type != "none"
     is_dact = dact_activation != "none"
+    is_dgated = dgated_gate_type != "none"
     if is_dact:
         assert preact is not None and preact.shape == (M, N)
         assert preact.dtype == a.dtype and preact.stride(-1) == 1
         assert not is_gated and activation == "none" and bias is None, (
             "dact epilogue is mutually exclusive with bias/activation/gate_type"
         )
-    if is_gated:
+    if is_dgated:
+        assert dgated_preact is not None and dgated_preact.shape == (M, 2 * N)
+        assert dgated_preact.dtype == a.dtype and dgated_preact.stride(-1) == 1
+        assert (
+            not is_gated and not is_dact and activation == "none" and bias is None
+        ), "dgated epilogue is mutually exclusive with bias/activation/gate_type/dact"
+        expected_out_shape = (M, 2 * N)
+    elif is_gated:
         assert N % 2 == 0, "gated requires N even (output is (M, N/2))"
         expected_out_shape = (M, N // 2)
     else:
@@ -1084,14 +1301,20 @@ def _gemm_splitk_out(
     assert not (is_gated and activation != "none"), (
         "gate_type subsumes activation; combining both is redundant/unsupported"
     )
+    if emit_postact:
+        assert is_dgated, "emit_postact is only valid with dgated_gate_type set"
+        assert postact_out.shape == (M, N)
+        assert postact_out.dtype == a.dtype and postact_out.stride(-1) == 1
     has_bias = bias is not None
     if has_bias:
         assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (N,)
     kwargs = _default_kwargs(M, N, K)
-    # Fused epilogue (bias + activation + gated + dact) is non-distributive
-    # over split-K atomic-fadd partial sums. Force SPLIT_K=1 whenever
-    # we plan to apply any write-back transformation.
-    has_epilogue = has_bias or activation != "none" or is_gated or is_dact
+    # Fused epilogue (bias + activation + gated + dact + dgated) is
+    # non-distributive over split-K atomic-fadd partial sums. Force
+    # SPLIT_K=1 whenever we plan to apply any write-back transformation.
+    has_epilogue = (
+        has_bias or activation != "none" or is_gated or is_dact or is_dgated
+    )
     if has_epilogue and kwargs["SPLIT_K"] > 1:
         kwargs = dict(kwargs, SPLIT_K=1)
     if kwargs["B_PRE_SHUFFLE"] and not shuffled:
@@ -1106,23 +1329,32 @@ def _gemm_splitk_out(
         _DTYPE2STR[a.dtype], N, K, **kwargs,
         has_bias=has_bias, activation=activation, gate_type=gate_type,
         dact_activation=dact_activation,
+        dgated_gate_type=dgated_gate_type,
+        emit_postact=emit_postact,
         _m_hint=M,
     )
-    # Kernels always take Bias + PreAct arg slots; pass 1-element
+    # Kernels always take Bias / PreAct / Postact arg slots; pass 1-element
     # dummies when the corresponding flag is off.
     bias_arg = bias if has_bias else torch.zeros(
         1, device=a.device, dtype=torch.float32,
     )
-    preact_arg = preact if is_dact else torch.zeros(
-        1, device=a.device, dtype=a.dtype,
-    )
-    exe(out, a, b, M, sem, state, bias_arg, preact_arg, stream)
+    if is_dact:
+        preact_arg = preact
+    elif is_dgated:
+        preact_arg = dgated_preact
+    else:
+        preact_arg = torch.zeros(1, device=a.device, dtype=a.dtype)
+    exe(out, a, b, M, sem, state, bias_arg, preact_arg, postact_out, stream)
     if kwargs["SPLIT_K"] > 1:
         _advance_state(stream)
 
 
 @_gemm_splitk_out.register_fake
-def _gemm_splitk_out_fake(a, b, out, shuffled, bias, activation, gate_type, preact, dact_activation):
+def _gemm_splitk_out_fake(
+    a, b, out, shuffled, bias, activation, gate_type,
+    preact, dact_activation,
+    dgated_gate_type, dgated_preact, postact_out, emit_postact,
+):
     return None
 
 
@@ -1135,6 +1367,10 @@ def gemm_splitk(
     gate_type: str = "none",
     preact: Optional[Tensor] = None,
     dact_activation: str = "none",
+    dgated_gate_type: str = "none",
+    dgated_preact: Optional[Tensor] = None,
+    dgated_emit_postact: bool = False,
+    dgated_postact_out: Optional[Tensor] = None,
 ) -> Tensor:
     """Stream-K-capable NT GEMM: ``c = act(a @ b.T + bias)`` on gfx950.
 
@@ -1148,6 +1384,14 @@ def gemm_splitk(
             write-back before the activation.
       activation: ``"none"``, ``"relu"``, ``"relu_sq"``,
             ``"gelu_tanh_approx"``, or ``"silu"``; applied post-bias.
+      dgated_gate_type: if set, fuses the gated-activation backward —
+            ``a`` is ``dz`` ``(M, out_dim)``, ``b`` is ``w_down``
+            ``(out_dim, hidden)``, ``dgated_preact`` is the saved
+            interleaved ``(g, u)`` preact ``(M, 2*hidden)``. The kernel
+            returns ``dpreact`` of shape ``(M, 2*hidden)``. When
+            ``dgated_emit_postact=True`` (or ``dgated_postact_out`` is
+            supplied), also emits ``postact = act(g) * u`` of shape
+            ``(M, hidden)``; in that case returns ``(dpreact, postact)``.
 
     Fused epilogue compiles a distinct kernel per ``(has_bias, activation)``
     combination — the bias-less, no-activation default matches the original
@@ -1158,16 +1402,33 @@ def gemm_splitk(
     assert activation in _ALLOWED_ACTIVATIONS
     assert gate_type in _ALLOWED_GATES
     assert dact_activation in _ALLOWED_DACT
+    assert dgated_gate_type in _ALLOWED_DGATED
     M, K = a.shape
     N, _ = b.shape
     is_gated = gate_type != "none"
-    out_n = (N // 2) if is_gated else N
+    is_dgated = dgated_gate_type != "none"
+    if is_dgated:
+        out_n = 2 * N
+    elif is_gated:
+        out_n = N // 2
+    else:
+        out_n = N
     if out is None:
         out = torch.empty(M, out_n, device=a.device, dtype=a.dtype)
+    emit_postact = is_dgated and (dgated_emit_postact or dgated_postact_out is not None)
+    if emit_postact:
+        if dgated_postact_out is None:
+            dgated_postact_out = torch.empty(M, N, device=a.device, dtype=a.dtype)
+        postact_arg = dgated_postact_out
+    else:
+        postact_arg = torch.empty(1, device=a.device, dtype=a.dtype)
     _gemm_splitk_out(
         a, b, out, shuffled, bias, activation, gate_type,
         preact, dact_activation,
+        dgated_gate_type, dgated_preact, postact_arg, emit_postact,
     )
+    if emit_postact:
+        return out, dgated_postact_out
     return out
 
 

@@ -36,6 +36,10 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from quack.amd.linear import linear
+from quack.amd.gemm_gfx950_splitk import (
+    gemm_splitk,
+    interleave_gated_weight,
+)
 
 
 def _act_fwd(preact: Tensor, activation: str) -> Tensor:
@@ -347,6 +351,192 @@ def mlp_func_train(
     return _MLPActFunction.apply(x, w1, w2, activation, bias1, bias2)
 
 
+_DGATED_ELIGIBLE_GATES = {"swiglu", "reglu", "geglu", "glu"}
+
+
+def _fused_dgated_eligible(
+    dz: Tensor, w_down: Tensor, preact_interleaved: Tensor, gate_type: str,
+) -> bool:
+    """Shape / dtype gate for the fused gemm_dgated backward path.
+
+    Splitk NT form of the ``dy = dz @ w_down`` matmul:
+      a = dz          shape (M, out_dim)
+      b = w_down.T    shape (hidden, out_dim)  — must be contiguous in last dim
+      output          shape (M, 2*hidden)      — dpreact interleaved
+      preact          shape (M, 2*hidden)      — saved interleaved
+
+    Splitk constraints: M % 128 == 0, hidden % 256 == 0, out_dim % 64 == 0,
+    M >= 128.
+    """
+    if gate_type not in _DGATED_ELIGIBLE_GATES:
+        return False
+    if dz.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if w_down.dtype != dz.dtype or preact_interleaved.dtype != dz.dtype:
+        return False
+    M, out_dim = dz.shape
+    out_dim_w, hidden = w_down.shape
+    if out_dim_w != out_dim:
+        return False
+    if preact_interleaved.shape != (M, 2 * hidden):
+        return False
+    if not (M % 128 == 0 and hidden % 256 == 0 and out_dim % 64 == 0 and M >= 128):
+        return False
+    if dz.stride(-1) != 1 or preact_interleaved.stride(-1) != 1:
+        return False
+    return True
+
+
+def _gated_fwd_interleaved(preact_interleaved: Tensor, gate_type: str) -> Tensor:
+    """Apply the gate function to an interleaved (g0, u0, g1, u1, ...) preact.
+
+    Returns the contiguous (M, hidden) postact. Used in the autograd
+    forward when the in-kernel gated-fwd fusion is skipped.
+    """
+    M, two_hidden = preact_interleaved.shape
+    hidden = two_hidden // 2
+    pairs = preact_interleaved.view(M, hidden, 2)
+    gate = pairs[..., 0]
+    up = pairs[..., 1]
+    if gate_type == "swiglu":
+        post = F.silu(gate) * up
+    elif gate_type == "reglu":
+        post = F.relu(gate) * up
+    elif gate_type == "geglu":
+        post = F.gelu(gate, approximate="tanh") * up
+    elif gate_type == "glu":
+        post = torch.sigmoid(gate) * up
+    else:
+        raise ValueError(f"unknown gate_type {gate_type!r}")
+    return post.contiguous()
+
+
+def _gated_bwd_interleaved_fallback(
+    preact_interleaved: Tensor, dy: Tensor, gate_type: str,
+) -> Tensor:
+    """Torch fallback for the fused gemm_dgated path.
+
+    Reshapes the interleaved preact into (M, hidden, 2), applies
+    ``_gated_bwd``, then re-stacks the (dgate, dup) pair back to
+    interleaved layout.
+    """
+    M, two_hidden = preact_interleaved.shape
+    hidden = two_hidden // 2
+    pairs = preact_interleaved.view(M, hidden, 2)
+    gate = pairs[..., 0].contiguous()
+    up = pairs[..., 1].contiguous()
+    dgate, dup = _gated_bwd(gate, up, dy, gate_type)
+    return torch.stack([dgate, dup], dim=-1).view(M, 2 * hidden).contiguous()
+
+
+class _GatedMLPTrainFunction(torch.autograd.Function):
+    """Two-layer gated MLP with in-kernel act-bwd fusion via gemm_dgated.
+
+    Expects ``w_gate_up`` in interleaved layout (rows
+    ``[2i, 2i+1]`` = ``(gate_i, up_i)`` — produced by
+    ``interleave_gated_weight``). Gradient is returned in the same
+    interleaved layout. ``bias_gate_up`` (if provided) is also assumed
+    to be in interleaved layout.
+
+    Forward: plain ``linear(x, w_gate_up_interleaved)`` → preact (interleaved),
+    torch gate → postact, ``linear(postact, w_down)`` → out. Saves
+    ``preact`` and ``postact`` for backward.
+
+    Backward: routes ``dy = dz @ w_down`` through ``gemm_splitk`` with
+    ``dgated_gate_type`` when shape-eligible — the matmul and the
+    gated activation backward run in one kernel, saving one
+    ``(M, 2*hidden)`` HBM round-trip vs computing them separately.
+    """
+
+    @staticmethod
+    def forward(ctx, x, w_gate_up_interleaved, w_down, gate_type,
+                bias_gate_up_interleaved, bias_down):
+        preact = linear(
+            x, w_gate_up_interleaved, bias=bias_gate_up_interleaved,
+        )  # (M, 2*hidden) interleaved
+        postact = _gated_fwd_interleaved(preact, gate_type)  # (M, hidden)
+        out = linear(postact, w_down, bias=bias_down)
+        ctx.save_for_backward(
+            x, w_gate_up_interleaved, w_down, preact, postact,
+        )
+        ctx.gate_type = gate_type
+        ctx.has_bias_gate_up = bias_gate_up_interleaved is not None
+        ctx.has_bias_down = bias_down is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, w_gate_up_interleaved, w_down, preact, postact = ctx.saved_tensors
+        grad_x = grad_w_gate_up = grad_w_down = None
+        grad_b_gate_up = grad_b_down = None
+        dz = grad_out
+        # --- dW_down = dz.T @ postact ---
+        if ctx.needs_input_grad[2]:
+            grad_w_down = torch.mm(dz.t(), postact)
+        if ctx.has_bias_down and ctx.needs_input_grad[5]:
+            grad_b_down = dz.sum(dim=0).to(torch.float32)
+        # --- dpreact (interleaved) = fused(dz, w_down, preact) ---
+        need_dpreact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or (
+            ctx.has_bias_gate_up and ctx.needs_input_grad[4]
+        )
+        if need_dpreact:
+            if _fused_dgated_eligible(dz, w_down, preact, ctx.gate_type):
+                w_down_T = w_down.t().contiguous()
+                dpreact = gemm_splitk(
+                    dz, w_down_T,
+                    dgated_gate_type=ctx.gate_type, dgated_preact=preact,
+                )
+            else:
+                dy = torch.mm(dz, w_down)
+                dpreact = _gated_bwd_interleaved_fallback(
+                    preact, dy, ctx.gate_type,
+                )
+            if ctx.needs_input_grad[0]:
+                grad_x = torch.mm(dpreact, w_gate_up_interleaved)
+            if ctx.needs_input_grad[1]:
+                grad_w_gate_up = torch.mm(dpreact.t(), x)
+            if ctx.has_bias_gate_up and ctx.needs_input_grad[4]:
+                grad_b_gate_up = dpreact.sum(dim=0).to(torch.float32)
+        return (
+            grad_x, grad_w_gate_up, grad_w_down,
+            None, grad_b_gate_up, grad_b_down,
+        )
+
+
+def gated_mlp_func_train(
+    x: Tensor,
+    w_gate_up_interleaved: Tensor,
+    w_down: Tensor,
+    gate_type: str = "swiglu",
+    bias_gate_up_interleaved: Optional[Tensor] = None,
+    bias_down: Optional[Tensor] = None,
+) -> Tensor:
+    """Two-layer gated MLP with in-kernel gated-backward fusion.
+
+    Args:
+      x:  ``(M, in_features)`` activations.
+      w_gate_up_interleaved: ``(2 * hidden, in_features)`` weight with rows
+          ``[2i, 2i+1]`` = ``(gate_i, up_i)``. Produce via
+          ``quack.amd.gemm_gfx950_splitk.interleave_gated_weight``.
+      w_down: ``(out_features, hidden)`` down-projection weight.
+      gate_type: ``swiglu``, ``reglu``, ``geglu``, or ``glu``.
+      bias_gate_up_interleaved: optional ``(2 * hidden,)`` f32 bias in the
+          same interleaved layout as the weight.
+      bias_down: optional ``(out_features,)`` f32 bias.
+
+    Returns: ``(M, out_features)`` output.
+
+    Backward fuses the ``dy = dz @ w_down`` matmul with the
+    gated-activation backward via ``gemm_splitk(dgated_gate_type=…)``,
+    saving one ``(M, 2*hidden)`` HBM write + one act-bwd elementwise
+    kernel vs torch's default autograd chain.
+    """
+    return _GatedMLPTrainFunction.apply(
+        x, w_gate_up_interleaved, w_down, gate_type,
+        bias_gate_up_interleaved, bias_down,
+    )
+
+
 def linear_gated_func(
     x: Tensor,
     weight_gate_up: Tensor,
@@ -371,4 +561,7 @@ def linear_gated_func(
     return _LinearGatedFunction.apply(x, weight_gate_up, gate_type, bias)
 
 
-__all__ = ["linear_act_func", "linear_gated_func", "mlp_func_train"]
+__all__ = [
+    "linear_act_func", "linear_gated_func",
+    "mlp_func_train", "gated_mlp_func_train",
+]
