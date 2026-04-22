@@ -162,6 +162,10 @@ def _compile_hgemm_kernel(
     # Mutually exclusive with bias / activation / gate_type / dact.
     dgated_gate_type: str = "none",
     emit_postact: bool = False,
+    # Occupancy hint — sets ``rocdl.waves_per_eu`` attr on the gpu.func.
+    # 1 = no limit (max occupancy), 2 = default upstream, higher values
+    # constrain occupancy to reduce register pressure.
+    waves_per_eu: Optional[int] = None,
     # ``_m_hint`` is NOT used inside the kernel body — it's part of the
     # cache key only, forcing a fresh compile per distinct runtime M.
     # Works around the FlyDSL JIT specialising on the first M passed
@@ -855,9 +859,20 @@ def _compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(
+        launcher = hgemm_kernel(
             C, A, B, m, COUNTER, signal_state, Bias, PreAct, Postact,
-        ).launch(
+        )
+        if waves_per_eu is not None and int(waves_per_eu) >= 1:
+            _wpe = int(waves_per_eu)
+            for op in ctx.gpu_module_body.operations:
+                if (
+                    hasattr(op, "attributes")
+                    and op.OPERATION_NAME == "gpu.func"
+                ):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        T.i32, _wpe,
+                    )
+        launcher.launch(
             grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream,
         )
 
@@ -916,7 +931,33 @@ def _default_kwargs(m: int, n: int, k: int):
         kwargs.update(TILE_K=64, TILE_M=32, TILE_N=128, SPLIT_K=4)
     if m <= 32 and n == 384 and k == 7168:
         kwargs.update(TILE_K=128, TILE_M=16, TILE_N=128, SPLIT_K=8)
+    # W3 Round 1 — skinny-M / large-K shapes benefit from square-ish tiles
+    # with larger TILE_K. At Shape C (M=2048, K=16384, N=2048) this cuts
+    # the splitk/hipBLASLt gap from 1.81× → 1.43× (20% improvement). Shapes
+    # A (4096³) and B (8192³) stay on the default 128×256×64 which wins
+    # there; the gate below targets the regime where tall-skinny tiles
+    # aren't useful (small M, small N, huge K).
+    if (
+        1024 <= m <= 2048 and 1024 <= n <= 2048 and k >= 16384
+        and m % 128 == 0 and n % 128 == 0 and k % 128 == 0
+    ):
+        kwargs.update(TILE_M=128, TILE_N=128, TILE_K=128)
+    if _DEFAULT_KWARGS_OVERRIDE is not None:
+        kwargs.update(_DEFAULT_KWARGS_OVERRIDE)
     return kwargs
+
+
+# W3 bench harness override — merged into ``_default_kwargs``'s result. Set
+# to None in production so the tuned defaults apply.
+_DEFAULT_KWARGS_OVERRIDE: Optional[dict] = None
+
+
+def _set_default_kwargs_override(override: Optional[dict]):
+    """Test / bench hook for forcing specific tile / split-k / block-warp
+    settings without plumbing through every call site. Set to ``None`` to
+    restore the tuned default config."""
+    global _DEFAULT_KWARGS_OVERRIDE
+    _DEFAULT_KWARGS_OVERRIDE = override
 
 
 def _apply_epilogue(vec, bias_tensor, col_start, activation, out_dtype, vec_size):

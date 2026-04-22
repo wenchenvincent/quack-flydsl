@@ -243,18 +243,15 @@ def _fused_dact_eligible(dout: Tensor, w2: Tensor, preact: Tensor, activation: s
         return False
     if not (M % 128 == 0 and hidden % 256 == 0 and out_dim % 64 == 0 and M >= 128):
         return False
-    # Disabled by default: measured on MI355X, splitk's matmul at the
-    # typical MLP-backward shape (e.g. M=4096, hidden=8192, out_dim=4096,
-    # bf16) runs ~1.07× slower than hipBLASLt's torch.mm. The fusion
-    # saves ~50 μs (one (M, hidden) HBM roundtrip + one act-bwd elementwise
-    # kernel) but the matmul gap eats it — net slower overall. The
-    # fused kernel body IS shipped and correctness-tested; flipping
-    # this flag would dispatch through it when splitk broadly matches
-    # hipBLASLt across shapes. Users can still call
-    # ``gemm_splitk(a, b, preact=p, dact_activation=act)`` directly to
-    # exercise the fused kernel.
-    return False  # noqa: PLW0177 — intentional: see comment above.
-    # return dout.stride(-1) == 1 and preact.stride(-1) == 1
+    # Enabled by W3 benchmarks (2026-04-22, MI355X). Earlier analysis
+    # understated the win: splitk matmul runs ~1.15-1.20× hipBLASLt but
+    # the torch elementwise act-bwd kernel is 0.5 ms at (4096, 8192) —
+    # far larger than the matmul gap. The fused path is 2.25× faster
+    # than ``torch.mm + torch act_bwd`` at the reference MLP-backward
+    # shape (M=4096, hidden=8192, out_dim=4096, bf16). Bench data:
+    # plain splitk+torch actbwd = 0.73 ms, fused splitk dact = 0.29 ms,
+    # torch.mm+actbwd = 0.65 ms.
+    return dout.stride(-1) == 1 and preact.stride(-1) == 1
 
 
 class _MLPActFunction(torch.autograd.Function):
