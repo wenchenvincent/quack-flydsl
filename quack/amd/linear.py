@@ -24,11 +24,18 @@ from torch import Tensor
 from quack.amd.gemm import gemm
 
 
+_SPLITK_ACTIVATIONS = {"relu", "relu_sq", "gelu_tanh_approx", "silu"}
+
+
 def _splitk_eligible(
     x: Tensor, weight: Tensor, bias, activation,
 ) -> bool:
-    """True iff (x, weight) can route directly through ``gemm_splitk``."""
-    if bias is not None or activation is not None:
+    """True iff (x, weight, bias, activation) can route directly through
+    ``gemm_splitk`` with its fused-epilogue path."""
+    if activation is not None and activation not in _SPLITK_ACTIVATIONS:
+        return False
+    if bias is not None and bias.dtype != torch.float32:
+        # Fused bias path is f32-only; cast callers go through NN fallback.
         return False
     if x.dtype not in (torch.float16, torch.bfloat16):
         return False
@@ -43,7 +50,11 @@ def _splitk_eligible(
     if K != K2:
         return False
     # gemm_splitk's default config uses tile_m=128, tile_n=256, tile_k=64.
-    return M % 128 == 0 and N % 256 == 0 and K % 64 == 0 and M >= 128
+    if not (M % 128 == 0 and N % 256 == 0 and K % 64 == 0 and M >= 128):
+        return False
+    if bias is not None and bias.shape != (N,):
+        return False
+    return True
 
 
 def linear(
@@ -52,14 +63,23 @@ def linear(
     bias: Optional[Tensor] = None,
     activation: Optional[str] = None,
 ) -> Tensor:
-    """``y = x @ weight.T + bias`` then optional activation.
+    """``y = act(x @ weight.T + bias)``.
 
     ``weight`` is ``(out_features, in_features)`` matching ``torch.nn.Linear``.
+
+    Fast path: when inputs are bf16/f16 with aligned shapes and the
+    activation is one of ``{relu, relu_sq, gelu_tanh_approx, silu}``,
+    routes through ``gemm_splitk`` with a fused epilogue — bias and
+    activation are applied inside the matmul write-back in one kernel.
+    Otherwise falls back to the NN ``gemm`` path which also supports
+    the full epilogue matrix.
     """
     if _splitk_eligible(x, weight, bias, activation):
-        # Fast path: NT bf16/f16 GEMM via the stream-K-capable kernel.
         from quack.amd.gemm_gfx950_splitk import gemm_splitk
-        return gemm_splitk(x, weight)
+        return gemm_splitk(
+            x, weight, bias=bias,
+            activation=activation if activation is not None else "none",
+        )
     # Epilogue or non-aligned shape → NN kernel via transpose.
     w_t = weight.transpose(-1, -2).contiguous()
     return gemm(x, w_t, bias=bias, activation=activation)

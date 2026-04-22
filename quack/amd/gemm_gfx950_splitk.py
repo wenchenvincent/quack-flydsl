@@ -129,6 +129,13 @@ def _compile_hgemm_kernel(
     BLOCK_N_WARPS: int = 4,
     B_PRE_SHUFFLE: bool = True,
     B_TO_LDS: bool = False,
+    # Fused epilogue (NN-kernel-equivalent): optional per-column f32 bias
+    # and element-wise activation applied in the write-back. When enabled,
+    # the kernel takes a ``Bias`` tensor argument and applies
+    # ``act(y + bias[col])`` inside the C store loops. Keeps the vendored
+    # matmul body unchanged; only the final store section differs.
+    has_bias: bool = False,
+    activation: str = "none",
     # ``_m_hint`` is NOT used inside the kernel body — it's part of the
     # cache key only, forcing a fresh compile per distinct runtime M.
     # Works around the FlyDSL JIT specialising on the first M passed
@@ -223,12 +230,16 @@ def _compile_hgemm_kernel(
     if B_TO_LDS:
         KERNEL_NAME += "_BS"
 
+    _HAS_BIAS = has_bias
+    _ACT = activation
+
     @flyc.kernel
     def hgemm_kernel(
         C: fx.Tensor, A: fx.Tensor, B: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
+        Bias: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -239,6 +250,8 @@ def _compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        if _HAS_BIAS:
+            Bias_ = GTensor(Bias, dtype=T.f32, shape=(n,))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
@@ -627,6 +640,11 @@ def _compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    if _HAS_BIAS or _ACT != "none":
+                        vec = _apply_epilogue(
+                            vec, Bias_ if _HAS_BIAS else None,
+                            n_offset + n_local_idx, _ACT, dtype_, LDG_VEC_SIZE,
+                        )
                     C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                     scf.YieldOp([])
         return
@@ -637,6 +655,7 @@ def _compile_hgemm_kernel(
         m: fx.Int32,
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
+        Bias: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -646,7 +665,7 @@ def _compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(
+        hgemm_kernel(C, A, B, m, COUNTER, signal_state, Bias).launch(
             grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream,
         )
 
@@ -681,6 +700,59 @@ def _default_kwargs(m: int, n: int, k: int):
     return kwargs
 
 
+def _apply_epilogue(vec, bias_tensor, col_start, activation, out_dtype, vec_size):
+    """Compile-time emitted post-matmul epilogue: vec = act(vec + bias[cols]).
+
+    ``vec`` is a ``vector<vec_size x out_dtype>`` loaded from LDS. Bias
+    is a (N,) f32 tensor. Both bias and activation are optional (controlled
+    by the caller); when both are "off" this helper is bypassed entirely.
+    """
+    import math as _py_math
+    from flydsl.expr import math as _fm
+    from flydsl.expr.arith import ArithValue
+    from flydsl.expr.numeric import Float32
+    in_dtype = out_dtype
+    result_scalars = []
+    for i in range_constexpr(vec_size):
+        v_i = vector.extract(vec, static_position=[i], dynamic_position=[])
+        # Widen to f32 for the arithmetic. ArithValue supports .extf() / .truncf().
+        v_av = ArithValue(v_i)
+        if in_dtype is T.f32:
+            v_f32 = v_av
+        else:
+            v_f32 = v_av.extf(T.f32)
+        if bias_tensor is not None:
+            b_i = ArithValue(bias_tensor[col_start + fx.Index(i)])
+            v_f32 = v_f32 + b_i
+        zero = Float32(0.0)
+        one = Float32(1.0)
+        if activation == "relu":
+            v_f32 = v_f32.maximumf(zero)
+        elif activation == "relu_sq":
+            v_f32 = v_f32.maximumf(zero) * v_f32
+        elif activation == "silu":
+            # silu(x) = x / (1 + exp(-x))
+            v_f32 = v_f32 / (one + _fm.exp(-v_f32, fastmath="fast"))
+        elif activation == "gelu_tanh_approx":
+            c1 = Float32(_py_math.sqrt(2.0 / _py_math.pi))
+            c2 = Float32(0.044715 * _py_math.sqrt(2.0 / _py_math.pi))
+            half = Float32(0.5)
+            two = Float32(2.0)
+            x_sq = v_f32 * v_f32
+            z = v_f32 * (c1 + c2 * x_sq)
+            # tanh(z) = 1 - 2/(1+exp(2z))
+            tanh_z = one - two / (one + _fm.exp(two * z, fastmath="fast"))
+            v_f32 = v_f32 * (half + half * tanh_z)
+        # Cast back to out dtype.
+        if in_dtype is T.f32:
+            v_out = v_f32
+        else:
+            v_out = v_f32.truncf(in_dtype)
+        v_out_ir = v_out.ir_value() if hasattr(v_out, "ir_value") else v_out
+        result_scalars.append(v_out_ir)
+    return vector.from_elements(T.vec(vec_size, in_dtype), result_scalars)
+
+
 _SPLIT_K_SEMAPHORE: dict = {}
 _SPLIT_K_SEMAPHORE_STATE: dict = {}
 
@@ -704,17 +776,30 @@ def _advance_state(stream: torch.cuda.Stream):
 _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
 
+_ALLOWED_ACTIVATIONS = {"none", "relu", "relu_sq", "gelu_tanh_approx", "silu"}
+
+
 @torch.library.custom_op(
     "quack_amd::_gemm_splitk_out",
     mutates_args=("out",),
-    schema="(Tensor a, Tensor b, Tensor(a0!) out, bool shuffled) -> ()",
+    schema=(
+        "(Tensor a, Tensor b, Tensor(a0!) out, bool shuffled, "
+        "Tensor? bias, str activation) -> ()"
+    ),
 )
-def _gemm_splitk_out(a: Tensor, b: Tensor, out: Tensor, shuffled: bool) -> None:
+def _gemm_splitk_out(
+    a: Tensor, b: Tensor, out: Tensor, shuffled: bool,
+    bias: Optional[Tensor], activation: str,
+) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
     assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype == out.dtype
+    assert activation in _ALLOWED_ACTIVATIONS
     M, K = a.shape
     N, K2 = b.shape
     assert K == K2 and out.shape == (M, N)
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (N,)
     kwargs = _default_kwargs(M, N, K)
     if kwargs["B_PRE_SHUFFLE"] and not shuffled:
         b = shuffle_b(b)
@@ -724,37 +809,59 @@ def _gemm_splitk_out(a: Tensor, b: Tensor, out: Tensor, shuffled: bool) -> None:
         bm = (M + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
         bn = N // kwargs["TILE_N"]
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe = _compile_hgemm_kernel(_DTYPE2STR[a.dtype], N, K, **kwargs, _m_hint=M)
-    exe(out, a, b, M, sem, state, stream)
+    exe = _compile_hgemm_kernel(
+        _DTYPE2STR[a.dtype], N, K, **kwargs,
+        has_bias=has_bias, activation=activation,
+        _m_hint=M,
+    )
+    # Kernel requires a real Bias tensor even when has_bias=False (the
+    # flag gates whether to USE it inside the kernel). Pass a
+    # 1-element f32 dummy.
+    bias_arg = bias if has_bias else torch.zeros(
+        1, device=a.device, dtype=torch.float32,
+    )
+    exe(out, a, b, M, sem, state, bias_arg, stream)
     if kwargs["SPLIT_K"] > 1:
         _advance_state(stream)
 
 
 @_gemm_splitk_out.register_fake
-def _gemm_splitk_out_fake(a, b, out, shuffled):
+def _gemm_splitk_out_fake(a, b, out, shuffled, bias, activation):
     return None
 
 
 def gemm_splitk(
     a: Tensor, b: Tensor, out: Optional[Tensor] = None,
-    *, shuffled: bool = False,
+    *,
+    shuffled: bool = False,
+    bias: Optional[Tensor] = None,
+    activation: str = "none",
 ) -> Tensor:
-    """Stream-K-capable NT GEMM: ``c = a @ b.T`` on gfx950.
+    """Stream-K-capable NT GEMM: ``c = act(a @ b.T + bias)`` on gfx950.
 
     ``a``: (M, K) f16/bf16, ``b``: (N, K) same dtype (NT layout).
     Returns a (M, N) tensor in the same dtype.
 
-    Set ``shuffled=True`` if you've pre-called ``shuffle_b`` on ``b``
-    so the kernel can skip the on-host shuffle. The same shuffled B
-    can then be reused across many calls (e.g. a single linear layer).
+    Args:
+      out: optional preallocated (M, N) output.
+      shuffled: if True, ``b`` is already in the kernel's preshuffled form.
+      bias: optional (N,) f32 tensor; when set, added per-column in the
+            write-back before the activation.
+      activation: ``"none"``, ``"relu"``, ``"relu_sq"``,
+            ``"gelu_tanh_approx"``, or ``"silu"``; applied post-bias.
+
+    Fused epilogue compiles a distinct kernel per ``(has_bias, activation)``
+    combination — the bias-less, no-activation default matches the original
+    upstream kernel exactly.
     """
     assert a.is_cuda and b.is_cuda
     assert a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16)
+    assert activation in _ALLOWED_ACTIVATIONS
     M, K = a.shape
     N, _ = b.shape
     if out is None:
         out = torch.empty(M, N, device=a.device, dtype=a.dtype)
-    _gemm_splitk_out(a, b, out, shuffled)
+    _gemm_splitk_out(a, b, out, shuffled, bias, activation)
     return out
 
 

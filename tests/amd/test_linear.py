@@ -127,6 +127,38 @@ def test_linear_splitk_path(dtype, M, N, K):
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("activation", ["relu", "silu", "gelu_tanh_approx", "relu_sq"])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_linear_fused_epilogue_splitk(activation, use_bias):
+    """``linear(x, w, bias, activation)`` with splitk-eligible shapes
+    fuses bias+activation into the kernel write-back. Verify numerics
+    match F.linear + torch activation."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA/ROCm device")
+    torch.manual_seed(0)
+    M, N, K = 256, 512, 128    # splitk-eligible: M%128, N%256, K%64
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn(N, device="cuda", dtype=torch.float32) * 0.3 if use_bias else None
+    out = linear(x, w, bias=b, activation=activation)
+
+    lin_f32 = torch.nn.functional.linear(x.float(), w.float())
+    if use_bias:
+        lin_f32 = lin_f32 + b
+    if activation == "relu":
+        ref = torch.relu(lin_f32)
+    elif activation == "silu":
+        ref = torch.nn.functional.silu(lin_f32)
+    elif activation == "gelu_tanh_approx":
+        ref = torch.nn.functional.gelu(lin_f32, approximate="tanh")
+    elif activation == "relu_sq":
+        ref = torch.relu(lin_f32) * lin_f32
+    torch.testing.assert_close(
+        out.float(), ref.to(torch.bfloat16).float(),
+        atol=5e-2, rtol=1e-2,
+    )
+
+
 def test_linear_mxfp8():
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
