@@ -534,10 +534,16 @@ def _compile_tn_kernel(
 
 
 _TN_CANDIDATES = [
-    (128, 128, 64, 2, 2),  # default for M%128 && N%128 — 2 waves/EU unlock
+    (128, 128, 64, 2, 2),   # default for M%128 && N%128 — 2 waves/EU unlock
     (128, 128, 64, 1, 4),
-    (256, 128, 64, 2, 2),  # sometimes wins at M>=8192
-    (128, 256, 64, 1, 4),  # MVP-era default
+    (256, 128, 64, 2, 2),   # sometimes wins at M>=8192
+    (128, 256, 64, 1, 4),   # MVP-era default
+    (128, 128, 128, 1, 2),  # deeper BLOCK_K
+    (128, 128, 128, 2, 2),
+    (128, 64, 64, 2, 2),
+    (64, 128, 64, 1, 4),
+    (64, 256, 64, 1, 4),
+    (256, 64, 64, 2, 2),
 ]
 
 

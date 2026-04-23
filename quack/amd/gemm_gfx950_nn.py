@@ -590,15 +590,22 @@ def _compile_nn_kernel(
 # into autotune which benches candidate configs and caches the winner.
 
 
-# Candidate configs tried during autotune — empirically the top performers
-# from the tune-in sweep. Order matters: the first candidate that satisfies
-# the shape's divisibility is the heuristic default.
+# Candidate configs tried during autotune. Ordered so the first that
+# fits a shape is the heuristic default. Broader sweep also covers
+# smaller tiles (win when shape is bank/occupancy-bound) and bigger
+# BLOCK_K (win when shape is LDS-read-bound).
 _NN_CANDIDATES = [
     # (TILE_M, TILE_N, TILE_K, BMW, BNW)
-    (128, 128, 64, 1, 4),  # default for M%128 && N%128 — 2 waves/EU unlock
-    (128, 128, 64, 2, 2),  # marginally better at some small shapes
-    (256, 128, 64, 2, 2),  # for M%256 && N%128, sometimes wins
-    (128, 256, 64, 1, 4),  # MVP-era default — N%256 required
+    (128, 128, 64, 1, 4),   # default for M%128 && N%128 — 2 waves/EU unlock
+    (128, 128, 64, 2, 2),   # symmetric warps — marginal difference
+    (256, 128, 64, 2, 2),   # for M%256 shapes
+    (128, 256, 64, 1, 4),   # MVP-era — widest N fit
+    (128, 128, 128, 1, 2),  # deeper BLOCK_K, 2 warps
+    (128, 128, 128, 2, 2),  # deeper BLOCK_K, 4 warps
+    (128, 64, 64, 2, 2),    # smaller N tile, wins at very small N
+    (64, 128, 64, 1, 4),    # smaller M tile
+    (64, 256, 64, 1, 4),    # thin-M, wide-N
+    (256, 64, 64, 2, 2),    # wide-M, thin-N
 ]
 
 
