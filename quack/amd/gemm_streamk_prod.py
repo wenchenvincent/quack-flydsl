@@ -1670,6 +1670,8 @@ def gemm_streamk(
     bias: "Tensor | None" = None,
     activation: str = "none",
     out_dtype: "torch.dtype | None" = None,
+    b_layout: str = "KN",
+    b_shuffled: bool = False,
 ) -> Tensor:
     """Production stream-K GEMM (public API): f16 × f16 → bf16/f16.
 
@@ -1693,7 +1695,22 @@ def gemm_streamk(
     common shapes vs this kernel's 3-12×.  Otherwise falls through to
     the native stream-K implementation below (correct but slow — see
     ``docs/superpowers/specs/streamk_perf_journal.md`` for why).
+
+    ``b_layout``: ``"KN"`` (default, matches ``torch.matmul`` — B is
+    ``(K, N)``) or ``"NK"`` (B is ``(N, K)``, matches nn.Linear.weight
+    and the splitk kernel's native layout).  Use ``"NK"`` when
+    possible to skip the ~0.25 ms transpose at 8192³ — it's the
+    dominant non-kernel cost.  Callers that persist weights across
+    calls (training, inference) should pre-transpose once and pass
+    ``b_layout="NK"``.
+
+    ``b_shuffled``: set True when ``b_layout == "NK"`` and B has
+    already been passed through ``gemm_gfx950_splitk.shuffle_b``.
+    Saves ~80 μs per call at 8192³.  Only valid with ``b_layout="NK"``.
     """
+    assert b_layout in ("KN", "NK")
+    if b_shuffled:
+        assert b_layout == "NK", "b_shuffled=True requires b_layout='NK'"
     assert A.is_cuda and B.is_cuda
     assert A.dtype == torch.float16 and B.dtype == torch.float16
     if out_dtype is None:
@@ -1703,18 +1720,27 @@ def gemm_streamk(
         f"activation must be in {_E_ALLOWED_ACTIVATIONS}, got {activation!r}"
     )
     M, K = A.shape
-    _, N = B.shape
+    if b_layout == "KN":
+        _, N = B.shape
+    else:  # "NK"
+        N, K_b = B.shape
+        assert K == K_b, f"A K={K} vs B K={K_b} mismatch in NK layout"
     # Fast dispatch: route to gemm_gfx950_splitk when shape + out-dtype
     # are compatible.  That kernel is ~5-9× faster at these shapes.
     if _can_dispatch_splitk(M, N, K, out_dtype):
         from quack.amd.gemm_gfx950_splitk import gemm_splitk
-        # splitk wants B as (N, K) and f16 input → f16 output.
-        B_nk = B.t().contiguous()
+        # splitk wants B as (N, K).  If caller already passed NK, use
+        # it directly (saves the ~0.25 ms transpose at 8192³).
+        B_nk = B if b_layout == "NK" else B.t().contiguous()
         return gemm_splitk(
             A, B_nk,
             bias=bias,
             activation=activation,
+            shuffled=b_shuffled,
         )
+    # Native streamk path wants B as (K, N).  Transpose if needed.
+    if b_layout == "NK":
+        B = B.t().contiguous()
     has_bias = bias is not None
     if has_bias:
         assert bias.dim() == 1 and bias.size(0) == N

@@ -145,24 +145,79 @@ At production-scale training shapes (8192²+) we're **~1.3-1.4× hipBLASLt
 — competitive**.  At small shapes we're 3-6× slower but this is
 universal across our AMD GEMM stack (not a stream-K-specific issue).
 
-Summary of the workstream:
+## Session G3 — rocprofv3 HW counter analysis + B-layout fix
 
-- Old demo ``gemm_streamk.py``:   **100-600× slower** than hipBLASLt
-- Sessions A-E (from-scratch rewrite): **3-12× slower**
-- Session G1 (dispatch to splitk): **2-10× slower** at mid shapes
-- Session G2 (size-threshold tuning): **1.3-6× slower**, with the
-  production shapes (8192²+) within 1.4×
+Per-dispatch rocprofv3 profile at 8192³ bf16 (kernel duration only,
+no Python-side overhead):
 
-The remaining gap at 8192³ (1.39×) matches splitk's own perf vs
-hipBLASLt on bf16 matmul (~1.17× per the W3 journal).  Closing
-below that requires kernel-body tuning orthogonal to the stream-K
-scheduler — likely an LDS ping-pong overhaul, vec4 coalesced
-atomics, or matching hipBLASLt's small-shape assembly tuning.
-None of those are stream-K-shaped problems.
+| counter             | splitk      | hipBLASLt   | ratio |
+|---------------------|------------:|------------:|------:|
+| Avg dispatch (μs)   | 792.8       | 771.2       | 1.03× |
+| VGPR / SGPR         | 124 / 112   | 256 / 112   |       |
+| LDS                 | 64 KB       | 130 KB      |       |
+| Grid / Waves        | 524K / 8192 | 64K / 1024  |       |
+| SQ_INSTS_MFMA       | 6.71e7      | 6.72e7      | 1.00× |
+| SQ_INSTS_VALU       | 1.02e8      | 1.07e8      | 0.95× |
+| SQ_INSTS_LDS        | 1.80e7      | 1.69e7      | 1.07× |
+| SQ_INSTS_VMEM       | 1.27e7      | 0.85e7      | 1.50× |
 
-For the original stream-K use case ("saturate CUs at small-M
-awkward grids"), the dispatch to splitk (with its adaptive
-``force_split_k`` heuristic already landed in W2) accomplishes
-the scheduling goal.  The native stream-K kernel remains as a
-correctness reference and as the fallback for shapes splitk
-can't handle.
+**Kernel duration is nearly identical** (1.03× difference).  The
+MFMA count matches to 0.1%, VALU is 5% higher in hip (wider
+epilogue), LDS and VMEM within reason.  hip uses a 256×256×64 tile
+(vs splitk's 128×256×64) which gives it 8× fewer waves and 2×
+VGPR/LDS per WG — a design trade-off, not a correctness issue.
+
+**The 1.17-1.4× gap reported at the Python-bench level was almost
+entirely ``B.t().contiguous()`` cost** — splitk wants ``(N, K)``
+layout, ``torch.matmul`` takes ``(K, N)``.  Our dispatch inserted
+``B.t().contiguous()`` on every call = ~255 μs at 8192³.
+
+### Fix: ``b_layout`` + ``b_shuffled`` kwargs
+
+Added to ``gemm_streamk``:
+
+  - ``b_layout="NK"`` — caller pre-transposes B (natural for training
+    workloads where B is persistent weights in ``(N, K)`` layout).
+    Skips the per-call transpose.
+  - ``b_shuffled=True`` — caller pre-shuffles via ``shuffle_b(B)``.
+    Skips the in-launcher shuffle (saves ~80 μs at 8192³).
+
+### Final perf (f16, best path — NK + shuffled B):
+
+| shape              | gemm_streamk ms | hipBLASLt ms | ratio        |
+|--------------------|----------------:|-------------:|-------------:|
+| 1024² K=512        | 0.074           | 0.015        | 4.87×        |
+| 4096³ K=1024       | 0.068           | 0.035        | 1.92×        |
+| **8192² K=1024**   | **0.117**       | 0.130        | **0.90×** ✓  |
+| **8192³**          | **0.788**       | 0.788        | **1.00×** ✓  |
+
+**At production-scale training shapes (8192²+), we match or beat
+hipBLASLt.**  At smaller shapes the gap is Python-side launch
+overhead (~60 μs), not kernel compute.
+
+### Workstream summary
+
+| version                         | worst ratio      | 8192³ ratio |
+|---------------------------------|-----------------:|------------:|
+| Old demo ``gemm_streamk.py``    | 100-600×         |    —        |
+| Sessions A-E (from-scratch)     |   3-12×          |    —        |
+| Session G1 (dispatch)           |   2-10×          |  2.4×       |
+| Session G2 (size threshold)     | 1.3-6×           |  1.39×      |
+| **Session G3 (layout + shuf)**  |   ~5× small,     |  **1.00×** ✓|
+|                                 |   **tied large** |             |
+
+### Caveats and what's left
+
+The production wins require caller cooperation: pass ``b_layout="NK"``
+(matches ``nn.Linear.weight``) and pre-shuffle via
+``shuffle_b(B)`` once at model load.  For callers that can't (e.g.,
+``torch.matmul`` drop-in with no pre-processing), we still eat the
+transpose cost per call.
+
+The existing ``linear()`` public API in ``quack.amd.linear``
+already calls ``gemm_splitk`` directly and skips ``gemm_streamk``,
+so this workstream primarily upgrades ``gemm_streamk`` itself from
+a broken demo to a competitive option.  The ~5× small-shape gap
+remains (Python launch overhead, not kernel) — closing it requires
+persistent kernels / graph capture / different call convention,
+beyond the stream-K scope.
