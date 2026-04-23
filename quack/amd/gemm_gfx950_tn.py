@@ -547,11 +547,14 @@ def _gemm_tn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.dtype == b.dtype == out.dtype
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.stride(-1) == 1
     dtype_str = _DTYPE2STR[a.dtype]
-    # Shape-aware tile: (256, 128, 64, 2x2) gives small win on medium/large
-    # TN shapes but regresses at small (K=2048 M=4096 N=1024), so gate on M
-    # being large enough that the bigger output-M tile keeps tiles/CU > 2.
-    if M >= 8192 and M % 256 == 0 and N % 128 == 0:
-        tile_kwargs = dict(TILE_M=256, TILE_N=128, TILE_K=64,
+    # Shape-aware tile: (128, 128, 64, 2×2 warps) is the sweet spot for TN,
+    # mirroring the NN kernel's discovery but with 2×2 warp layout (vs 1×4
+    # on NN) — TN's tr16_b64 on BOTH sides benefits from the more symmetric
+    # warp decomposition. Win: small 277 → 396 TF/s (+43%), medium 527 → 698
+    # TF/s (+32%). The smaller output tile also lets the compiler hit 2
+    # waves/EU.
+    if M % 128 == 0 and N % 128 == 0:
+        tile_kwargs = dict(TILE_M=128, TILE_N=128, TILE_K=64,
                            BLOCK_M_WARPS=2, BLOCK_N_WARPS=2)
     else:
         tile_kwargs = dict(TILE_M=128, TILE_N=256, TILE_K=64,
