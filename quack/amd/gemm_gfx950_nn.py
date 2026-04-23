@@ -330,44 +330,84 @@ def _compile_nn_kernel(
             return vecs
 
         def sts_b(vecs, lds_stage):
-            """Register → LDS with N-byte XOR swizzle. LDS layout is (STAGES, BLOCK_K, BLOCK_N)."""
+            """Register → LDS (no swizzle; tr16_b64 read handles bank alignment).
+
+            The LDS layout is (STAGES, BLOCK_K, BS_N_STRIDE) with K-outer.
+            Writes are straightforward N-contiguous vec_stores; the matching
+            ``ds_read_tr16_b64`` reads rely on the hardware transpose to
+            rearrange 4×4 sub-blocks into MFMA-fragment layout, and the
+            row-stride pad handles bank spreading on reads.
+            """
             for i in range_constexpr(LDG_REG_B_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 k_local_idx = global_tid // LDG_B_X_THREADS
                 n_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-                col_in_bytes = n_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(k_local_idx, col_in_bytes, n_blocks16)
                 bs_.vec_store(
-                    (fx.Index(lds_stage), k_local_idx, col_in_bytes // DTYPE_BYTES),
+                    (fx.Index(lds_stage), k_local_idx, n_local_idx),
                     vecs[i], LDG_VEC_SIZE,
                 )
 
         def lds_matrix_b(lds_stage):
-            """LDS → register MFMA B fragment. Strided scalar loads (stride=BLOCK_N).
+            """LDS → register MFMA B fragment via ``rocdl.ds_read_tr16_b64``.
 
-            Each lane owns one N column and needs FRAG K-values (from different
-            K rows). In the N-inner LDS layout, these K-values are at stride
-            BLOCK_N — so ``FRAG`` separate scalar loads per fragment. The XOR
-            swizzle on N-bytes ensures each of those scalar loads lands in a
-            distinct bank per lane.
+            The CDNA4 hardware-transposed LDS read performs a 4×4 transpose
+            within each 16-lane block: for lane L in a block,
+            ``output[L, e] = Input[e*4 + (L%16)//4, L%4]`` where ``Input[s, p]``
+            is the p-th f16 from the b64 (4 f16) loaded by source lane s.
+
+            Each MFMA B fragment needs 8 K-contig f16 per lane at one N. Two
+            ``ds_read_tr16_b64`` calls give this: read 0 produces B[k_base..k_base+3, N],
+            read 1 produces B[k_base+4..k_base+7, N]. Per-lane address for
+            read r in block ``bl = L // 16``:
+              row = warp_atom_k + bl*8 + r*4 + (L%16)//4
+              col = warp_atom_n + (L%16)%4 * 4
+            After hardware transpose, lane L's output is 4 f16 of B at its
+            (N = warp_atom_n + L%16) column. Concatenating the two reads
+            produces the 8-f16 fragment.
+
+            This replaces the MVP's 8 scalar strided loads per lane per
+            fragment with 2 vectorised b64 reads, eliminating the dominant
+            LDS bottleneck (was 92M LDS ops + 135M bank-conflict cycles).
             """
             s = fx.Index(lds_stage)
             b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS)
             FRAG = WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
+            assert FRAG == 8, f"ds_read_tr16_b64 path assumes FRAG=8, got {FRAG}"
+            v4_type = T.vec(4, dtype_)
+            v8_type = T.vec(FRAG, dtype_)
+            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            lb = w_tid % WMMA_N                # 0..15 lane-in-block (n_col direction)
+            sg = lb // 4                        # 0..3 sub-group
+            pr = lb % 4                         # 0..3 position-in-sub-group
+            block_offset = w_tid // WMMA_N     # 0..3 k_group block
             for kk in range_constexpr(WARP_K_STEPS):
                 for jj in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
                     warp_atom_k_idx = kk * WARP_ATOM_K
-                    k_start = warp_atom_k_idx + ldmatrix_b_k_vec_idx  # lane's K start
-                    n_col = warp_atom_n_idx + ldmatrix_b_n_idx        # lane's N col
-                    values = []
-                    for ii in range_constexpr(FRAG):
-                        row = k_start + ii
-                        col_in_bytes = n_col * DTYPE_BYTES
-                        col_in_bytes = swizzle_xor16(row, col_in_bytes, n_blocks16)
-                        v = bs_[s, fx.Index(row), fx.Index(col_in_bytes // DTYPE_BYTES)]
-                        values.append(v)
-                    vec = vector.from_elements(T.vec(FRAG, dtype_), values)
+                    halves = []
+                    for r in range_constexpr(2):
+                        # Per-lane (row, col) targeting the source data for
+                        # the 4×4 transpose:
+                        row = warp_atom_k_idx + block_offset * 8 + r * 4 + sg
+                        col = warp_atom_n_idx + pr * 4
+                        # LDS byte address = base + (stage*stride_stage + row*stride_row + col)*2
+                        lds_byte_offset = bs_.linear_offset(
+                            (s, fx.Index(row), fx.Index(col))
+                        ) * DTYPE_BYTES
+                        lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr)
+                        lds_addr_idx = lds_base + lds_byte_offset
+                        lds_addr_i64 = arith.index_cast(T.i64, lds_addr_idx)
+                        lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_i64)
+                        v4 = rocdl.ds_read_tr16_b64(v4_type, lds_ptr).result
+                        halves.append(v4)
+                    # Concat 2 × v4 into v8 by extracting + reassembling.
+                    elems = []
+                    for h in range_constexpr(2):
+                        for e in range_constexpr(4):
+                            elems.append(vector.extract(
+                                halves[h], static_position=[e], dynamic_position=[],
+                            ))
+                    vec = vector.from_elements(v8_type, elems)
                     b_frags[kk * WARP_N_STEPS + jj] = vec
             return b_frags
 
