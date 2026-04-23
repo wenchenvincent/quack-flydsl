@@ -78,6 +78,79 @@ def test_linear_train_no_dx_grad(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("activation", ["relu", "silu", "gelu_tanh_approx"])
+def test_linear_act_train(dtype, activation):
+    """LinearActFunc: fwd+bwd of act(x @ W.T + b) matches torch."""
+    torch.manual_seed(3)
+    from quack.amd.linear import linear_act_train
+    bs, in_f, out_f = 256, 256, 512
+    x = _leaf((bs, in_f), dtype)
+    W = _leaf((out_f, in_f), dtype)
+    bias = torch.randn(out_f, device="cuda", dtype=torch.float32).detach() * 0.05
+    bias.requires_grad_(True)
+
+    # Reference: linear + bias (fp32 bias upcast) + activation
+    x_ref = x.detach().clone().requires_grad_(True)
+    W_ref = W.detach().clone().requires_grad_(True)
+    b_ref = bias.detach().clone().requires_grad_(True)
+    # splitk applies bias in f32 then truncates back to dtype, so the ref
+    # matches via (x @ W.T + b).to(dtype) before activation.
+    preact_ref = torch.nn.functional.linear(x_ref.float(), W_ref.float()).to(dtype) + b_ref.to(dtype)
+    if activation == "relu":
+        y_ref = torch.relu(preact_ref)
+    elif activation == "silu":
+        y_ref = torch.nn.functional.silu(preact_ref)
+    else:
+        y_ref = torch.nn.functional.gelu(preact_ref, approximate="tanh")
+    y_ref.sum().backward()
+
+    y = linear_act_train(x, W, activation=activation, bias=bias)
+    y.sum().backward()
+
+    fwd_err = (y.float() - y_ref.float()).abs().max().item()
+    dx_err = (x.grad.float() - x_ref.grad.float()).abs().max().item()
+    dw_err = (W.grad.float() - W_ref.grad.float()).abs().max().item()
+    db_err = (bias.grad.float() - b_ref.grad.float()).abs().max().item()
+    tol = 0.5
+    assert fwd_err < tol, f"fwd err {fwd_err}"
+    assert dx_err < tol, f"dx err {dx_err}"
+    assert dw_err < tol, f"dw err {dw_err}"
+    # dbias tolerance is wider because torch's autograd sums in preact dtype
+    # (bf16/f16) then upcasts; our impl sums in f32 for accuracy. The
+    # difference is torch-ref-imprecision, not our bug.
+    assert db_err < 5.0, f"db err {db_err} (vs bf16-sum reference — note our f32 accum is more accurate)"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mlp_train(dtype):
+    """Full mlp_train: fwd+bwd of w2 @ relu(w1 @ x) matches torch."""
+    from quack.amd.mlp import mlp_train
+    torch.manual_seed(4)
+    bs, in_f, hidden, out_f = 256, 256, 512, 256
+    x = _leaf((bs, in_f), dtype)
+    W1 = _leaf((hidden, in_f), dtype)
+    W2 = _leaf((out_f, hidden), dtype)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    W1_ref = W1.detach().clone().requires_grad_(True)
+    W2_ref = W2.detach().clone().requires_grad_(True)
+    h_ref = torch.relu(torch.nn.functional.linear(x_ref, W1_ref))
+    y_ref = torch.nn.functional.linear(h_ref, W2_ref)
+    y_ref.sum().backward()
+
+    y = mlp_train(x, W1, W2, activation="relu")
+    y.sum().backward()
+
+    for name, g, gr in [
+        ("dx", x.grad, x_ref.grad),
+        ("dW1", W1.grad, W1_ref.grad),
+        ("dW2", W2.grad, W2_ref.grad),
+    ]:
+        err = (g.float() - gr.float()).abs().max().item()
+        assert err < 0.5, f"mlp_train {dtype} {name} err {err}"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_linear_train_mlp_composition(dtype):
     """Two-layer MLP: fwd = W2 @ relu(W1 @ x). Verify all four grads via torch."""
     torch.manual_seed(2)

@@ -21,6 +21,7 @@ import time
 import torch
 
 from quack.amd.linear import linear_train
+from quack.amd.mlp import mlp_train
 
 
 _SHAPES = [
@@ -48,11 +49,20 @@ def _bench(step_fn, warmup=10, iters=30):
     return times[0]  # min — best-of-N
 
 
-def _mlp_step_ours(x, W1, W2):
+def _mlp_step_ours_plain(x, W1, W2):
+    """Phase 5: two LinearFunc + explicit torch.relu."""
     h = torch.relu(linear_train(x, W1))
     y = linear_train(h, W2)
-    loss = y.sum()
-    loss.backward()
+    y.sum().backward()
+    x.grad = None
+    W1.grad = None
+    W2.grad = None
+
+
+def _mlp_step_ours_fused(x, W1, W2):
+    """Phase 6: mlp_train (LinearActFunc + LinearFunc, saves one kernel boundary)."""
+    y = mlp_train(x, W1, W2, activation="relu")
+    y.sum().backward()
     x.grad = None
     W1.grad = None
     W2.grad = None
@@ -61,15 +71,17 @@ def _mlp_step_ours(x, W1, W2):
 def _mlp_step_torch(x, W1, W2):
     h = torch.relu(torch.nn.functional.linear(x, W1))
     y = torch.nn.functional.linear(h, W2)
-    loss = y.sum()
-    loss.backward()
+    y.sum().backward()
     x.grad = None
     W1.grad = None
     W2.grad = None
 
 
 def main():
-    header = f"{'shape':<14}{'dtype':<6}{'ours ms':>10}{'torch ms':>10}{'ratio':>8}"
+    header = (
+        f"{'shape':<14}{'dtype':<6}{'plain ms':>10}{'fused ms':>10}"
+        f"{'torch ms':>10}{'fused/torch':>13}"
+    )
     print(header)
     print("-" * len(header))
     for dtype, dtype_str in [(torch.bfloat16, "bf16"), (torch.float16, "f16")]:
@@ -82,16 +94,17 @@ def main():
             W2 = (torch.randn(hidden, out_f, device="cuda", dtype=dtype) * 0.1).detach()
             W2.requires_grad_(True)
 
-            # Reference leaves for torch baseline.
             xt = x.detach().clone().requires_grad_(True)
             W1t = W1.detach().clone().requires_grad_(True)
             W2t = W2.detach().clone().requires_grad_(True)
 
-            t_ours = _bench(lambda: _mlp_step_ours(x, W1, W2))
+            t_plain = _bench(lambda: _mlp_step_ours_plain(x, W1, W2))
+            t_fused = _bench(lambda: _mlp_step_ours_fused(x, W1, W2))
             t_torch = _bench(lambda: _mlp_step_torch(xt, W1t, W2t))
-            ratio = t_torch / t_ours  # >1 = we're faster (unlikely); <1 = we're slower
+            ratio = t_torch / t_fused
             print(f"{name:<14}{dtype_str:<6}"
-                  f"{t_ours*1e3:>10.3f}{t_torch*1e3:>10.3f}{ratio:>7.3f}x")
+                  f"{t_plain*1e3:>10.3f}{t_fused*1e3:>10.3f}"
+                  f"{t_torch*1e3:>10.3f}{ratio:>12.3f}x")
 
 
 if __name__ == "__main__":

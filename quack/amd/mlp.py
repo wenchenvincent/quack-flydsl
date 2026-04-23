@@ -4,13 +4,18 @@
 
 Thin composition of two ``quack.amd.linear`` calls with an activation or
 gated activation between them.
+
+Two entry points:
+  - ``mlp`` — inference, forward-only, no autograd wiring.
+  - ``mlp_train`` — autograd-aware, uses ``LinearActFunc`` + ``LinearFunc``
+    so ``.backward()`` reaches our NN/TN kernels.
 """
 
 from typing import Optional
 
 from torch import Tensor
 
-from quack.amd.linear import linear, linear_gated
+from quack.amd.linear import linear, linear_gated, linear_act_train, linear_train
 
 
 def mlp(
@@ -51,4 +56,32 @@ def gated_mlp(
     return linear(h, w_down, bias=bias_down)
 
 
-__all__ = ["mlp", "gated_mlp"]
+def mlp_train(
+    x: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    activation: str = "relu",
+    bias1: Optional[Tensor] = None,
+    bias2: Optional[Tensor] = None,
+) -> Tensor:
+    """Autograd-aware two-layer MLP: ``w2 @ act(w1 @ x + b1) + b2``.
+
+    Uses ``LinearActFunc`` for the first layer (activation fused into the
+    autograd Function's saved state) and ``LinearFunc`` for the second.
+    Both layers route backward through ``gemm_nn`` / ``gemm_tn`` so the
+    full training step stays on our kernels.
+
+    Weights are ``(out, in)`` like ``torch.nn.Linear``.
+    """
+    h = linear_act_train(x, w1, activation=activation, bias=bias1)
+    if bias2 is None:
+        y = linear_train(h, w2)
+    else:
+        # MVP: bias2 on the output layer falls back to the
+        # unfused-act LinearActFunc with activation='none' semantics — but
+        # LinearActFunc requires a real activation, so we manually add bias2.
+        y = linear_train(h, w2) + bias2
+    return y
+
+
+__all__ = ["mlp", "gated_mlp", "mlp_train"]

@@ -243,6 +243,8 @@ __all__ = [
     "linear_residual",
     "LinearFunc",
     "linear_train",
+    "LinearActFunc",
+    "linear_act_train",
 ]
 
 
@@ -323,3 +325,124 @@ def linear_train(x: Tensor, weight: Tensor) -> Tensor:
       - batch dim (after flatten) % 128 == 0
     """
     return LinearFunc.apply(x, weight)
+
+
+# ---------------------------------------------------------------------------
+# Activation-fused linear autograd
+# ---------------------------------------------------------------------------
+
+
+def _act_fn(activation: str):
+    """Return the torch callable for an activation name."""
+    if activation == "relu":
+        return torch.relu
+    if activation == "relu_sq":
+        return lambda p: torch.relu(p) ** 2
+    if activation == "gelu_tanh_approx":
+        return lambda p: torch.nn.functional.gelu(p, approximate="tanh")
+    if activation == "silu":
+        return torch.nn.functional.silu
+    raise ValueError(f"unsupported activation: {activation!r}")
+
+
+def _dact_mul(dout: Tensor, preact: Tensor, activation: str) -> Tensor:
+    """Compute ``dout * activation'(preact)`` elementwise.
+
+    Uses closed-form derivatives (works inside torch.autograd's no-grad
+    backward context). All outputs match ``dout``'s dtype.
+    """
+    p = preact.to(dout.dtype)
+    if activation == "relu":
+        return dout * (p > 0).to(dout.dtype)
+    if activation == "relu_sq":
+        # d/dp (relu(p) * p) = 2*p * (p > 0)
+        return dout * (2.0 * p * (p > 0).to(dout.dtype))
+    if activation == "silu":
+        # silu(p) = p * sigmoid(p); silu'(p) = sigmoid(p) * (1 + p*(1 - sigmoid(p)))
+        sig = torch.sigmoid(p)
+        return dout * (sig * (1.0 + p * (1.0 - sig)))
+    if activation == "gelu_tanh_approx":
+        # gelu_tanh(p) = 0.5 * p * (1 + tanh(z))  where z = sqrt(2/pi) * (p + 0.044715*p^3)
+        # d/dp = 0.5*(1 + tanh(z)) + 0.5*p*sech^2(z) * dz/dp
+        #      = 0.5*(1 + tanh(z)) + 0.5*p*(1 - tanh(z)^2) * sqrt(2/pi)*(1 + 3*0.044715*p^2)
+        import math as _m
+        c1 = _m.sqrt(2.0 / _m.pi)
+        c2 = 0.044715 * c1
+        three_c2 = 3.0 * 0.044715 * c1
+        p_sq = p * p
+        z = p * (c1 + c2 * p_sq)
+        tanh_z = torch.tanh(z)
+        sech2 = 1.0 - tanh_z * tanh_z
+        dz_dp = c1 + three_c2 * p_sq
+        deriv = 0.5 * (1.0 + tanh_z) + 0.5 * p * sech2 * dz_dp
+        return dout * deriv
+    raise ValueError(f"unsupported activation: {activation!r}")
+
+
+class LinearActFunc(torch.autograd.Function):
+    """Autograd Function for linear + activation: ``y = act(x @ W.T + b)``.
+
+    Saves ``preact`` for the backward pass (needed for ``act'(preact)``).
+    For inputs requiring grad, backward computes:
+      dpreact = dy * act'(preact)     (elementwise, torch op)
+      dx      = dpreact @ W           (gemm_nn)
+      dW      = dpreact.T @ x         (gemm_tn)
+      dbias   = dpreact.sum(0)        (reduction, torch op)
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, activation):
+        from quack.amd.gemm_gfx950_splitk import gemm_splitk
+        batch_shape = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1]).contiguous()
+        # Run splitk WITHOUT activation fusion so we get preact. The
+        # activation costs one elementwise pass (cheap vs the matmul).
+        preact = gemm_splitk(x2, weight, bias=bias)
+        postact = _act_fn(activation)(preact)
+        ctx.save_for_backward(x2, weight, preact)
+        ctx.activation = activation
+        ctx.has_bias = bias is not None
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        ctx.batch_shape = batch_shape
+        return postact.reshape(*batch_shape, postact.shape[-1])
+
+    @staticmethod
+    def backward(ctx, dout):
+        from quack.amd.gemm_gfx950_nn import gemm_nn
+        from quack.amd.gemm_gfx950_tn import gemm_tn
+
+        x, weight, preact = ctx.saved_tensors
+        dout2 = dout.reshape(-1, dout.shape[-1]).contiguous()
+        dpreact = _dact_mul(dout2, preact, ctx.activation)
+
+        dx = None
+        if ctx.needs_input_grad[0]:
+            dx = gemm_nn(dpreact, weight)
+            dx = dx.reshape(*ctx.batch_shape, dx.shape[-1])
+
+        dweight = None
+        if ctx.needs_input_grad[1]:
+            dweight = gemm_tn(dpreact, x)
+
+        dbias = None
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            # Accumulate bias grad in f32 — bf16/f16 batch-sum introduces
+            # ~2.0 error over bs=256. Then cast to bias's saved dtype.
+            dbias = dpreact.sum(0, dtype=torch.float32).to(ctx.bias_dtype)
+
+        # 4th arg (activation) has no grad
+        return dx, dweight, dbias, None
+
+
+def linear_act_train(
+    x: Tensor,
+    weight: Tensor,
+    activation: str,
+    bias: Optional[Tensor] = None,
+) -> Tensor:
+    """Autograd-aware ``y = act(x @ W.T + b)``.
+
+    Fwd uses gemm_splitk + torch activation (preact saved for bwd).
+    Bwd: dpreact via torch elementwise, dx/dW via gemm_nn/gemm_tn.
+    """
+    return LinearActFunc.apply(x, weight, bias, activation)
