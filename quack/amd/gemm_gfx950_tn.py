@@ -407,9 +407,17 @@ def _compile_tn_kernel(
             mfma_ = _OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
             ldg_ = _OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
             if ASYNC_COPY:
-                AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_TOTAL - 1) // LDG_TOTAL
+                # async-copy path: A via buffer_load_lds (no sts_a), but B
+                # still does ldg_b → sts_b. Include LDG_REG_B_COUNT dswr hints
+                # so the compiler schedules the B LDS writes against MFMA
+                # (was missing — MFMA idled during dswr previously).
+                LDG_STS_TOTAL = LDG_TOTAL + LDG_REG_B_COUNT
+                AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_STS_TOTAL - 1) // LDG_STS_TOTAL
                 for _ in range_constexpr(LDG_TOTAL):
                     rocdl.sched_vmem(ldg_.consume(1))
+                    rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
+                for _ in range_constexpr(LDG_REG_B_COUNT):
+                    rocdl.sched_dswr(1)
                     rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
             else:
                 LDG_STS_TOTAL = LDG_TOTAL + LDG_REG_A_COUNT_ + LDG_REG_B_COUNT

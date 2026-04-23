@@ -445,9 +445,18 @@ def _compile_nn_kernel(
             mfma_ = _OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
             ldg_ = _OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
             if ASYNC_COPY:
-                AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_TOTAL - 1) // LDG_TOTAL
+                # In the async-copy path, A goes HBM→LDS directly (no register
+                # round-trip, no explicit sts_a). But B still does ldg_b →
+                # sts_b, so we must include LDG_REG_B_COUNT dswr hints alongside
+                # the vmem hints — otherwise the compiler doesn't schedule the
+                # B LDS writes against MFMA, leaving MFMA idle during dswr.
+                LDG_STS_TOTAL = LDG_TOTAL + LDG_REG_B_COUNT
+                AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_STS_TOTAL - 1) // LDG_STS_TOTAL
                 for _ in range_constexpr(LDG_TOTAL):
                     rocdl.sched_vmem(ldg_.consume(1))
+                    rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
+                for _ in range_constexpr(LDG_REG_B_COUNT):
+                    rocdl.sched_dswr(1)
                     rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
             else:
                 LDG_STS_TOTAL = LDG_TOTAL + LDG_REG_A_COUNT_ + LDG_REG_B_COUNT
