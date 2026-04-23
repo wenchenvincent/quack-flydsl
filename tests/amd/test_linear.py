@@ -426,21 +426,50 @@ def test_linear_mxfp8_func_gradcheck():
 @pytest.mark.parametrize("activation", ["relu", "silu", "relu_sq", "gelu_tanh_approx"])
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_linear_mxfp8_func_autograd_with_activation(activation, use_bias):
-    """Autograd support for linear_mxfp8_func with fused bias + activation.
+    """Autograd coverage for ``linear_mxfp8_func`` with bias + activation.
 
-    Compares our backward to torch autograd running on the SAME mxfp8
-    preact — not a bf16 reference preact. Going through bf16 instead
-    would introduce sign-flip divergence near zero crossings for
-    relu-family activations (fp8 quantisation perturbs preact by ~5%
-    and flips which side of zero it sits on, making ``act'(preact)``
-    completely different between paths). Sharing the preact isolates
-    the backward-math correctness from forward-quantisation noise."""
+    Reference strategy: a minimal ``_ReferenceMXFP8Linear`` autograd.Function
+    that does fp8-quantise → mxfp8_gemm → standard linear backward, then
+    lets torch autograd handle the activation. This gives us independent
+    gradients via torch's own ``F.<act>`` backward (not the hand-coded
+    ``act'`` formula in ``_LinearMXFP8Function``). Both paths share the
+    SAME fp8-quantised preact (necessary — otherwise forward quant error
+    would flip sign near zero crossings for relu-family activations and
+    produce huge spurious mismatches). The test isolates the backward-math
+    correctness."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA/ROCm device")
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch build lacks fp8 support")
-    from quack.amd.mxfp8_ops import linear_mxfp8_func, quantize_mxfp8, _quantize_weight_with_block_scale
+    from quack.amd.mxfp8_ops import (
+        linear_mxfp8_func, quantize_mxfp8, _quantize_weight_with_block_scale,
+    )
     from quack.amd.gemm_gfx950_blockscaled import mxfp8_gemm
+    import torch.nn.functional as F
+
+    class _ReferenceMXFP8Linear(torch.autograd.Function):
+        """Independent reference: standard bf16 linear backward. Does not
+        use the hand-coded activation' derivatives that
+        _LinearMXFP8Function has — letting torch autograd derive them
+        gives us a genuine correctness oracle."""
+        @staticmethod
+        def forward(ctx, x, weight, bias):
+            ctx.save_for_backward(x, weight)
+            ctx.has_bias = bias is not None
+            x_fp8, sx = quantize_mxfp8(x, transpose_scale=True)
+            w_fp8, sw = _quantize_weight_with_block_scale(weight)
+            return mxfp8_gemm(
+                x_fp8, w_fp8, sx, sw, out_dtype=x.dtype,
+                bias=bias, activation="none",
+            )
+        @staticmethod
+        def backward(ctx, grad_out):
+            x, weight = ctx.saved_tensors
+            grad_x = torch.mm(grad_out, weight) if ctx.needs_input_grad[0] else None
+            grad_w = torch.mm(grad_out.t(), x) if ctx.needs_input_grad[1] else None
+            grad_b = grad_out.sum(dim=0).to(torch.float32) if ctx.has_bias and ctx.needs_input_grad[2] else None
+            return grad_x, grad_w, grad_b
+
     torch.manual_seed(0)
     M, N, K = 256, 256, 128
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -449,43 +478,39 @@ def test_linear_mxfp8_func_autograd_with_activation(activation, use_bias):
     if use_bias:
         b = (torch.randn(N, device="cuda", dtype=torch.float32) * 0.1).detach().requires_grad_(True)
 
+    # Our path: fully-fused autograd.Function with hand-coded act'.
     y = linear_mxfp8_func(x, w, bias=b, activation=activation)
     y.sum().backward()
     ours_dx, ours_dw = x.grad.clone(), w.grad.clone()
     ours_db = b.grad.clone() if use_bias else None
+    x.grad = None; w.grad = None
+    if use_bias: b.grad = None
 
-    # Reference: compute preact through the same mxfp8 path (no grad),
-    # then run torch autograd on preact → activation, using preact as
-    # the "leaf" for dpreact. Work backward from dpreact to dx, dw, db
-    # via explicit matmuls (same math linear_mxfp8_func.backward does).
-    with torch.no_grad():
-        x_fp8, sx = quantize_mxfp8(x.detach(), transpose_scale=True)
-        w_fp8, sw = _quantize_weight_with_block_scale(w.detach())
-        preact_actual = mxfp8_gemm(
-            x_fp8, w_fp8, sx, sw, out_dtype=x.dtype,
-            bias=b.detach() if use_bias else None,
-            activation="none",
-        )
-    # Torch autograd on preact → activation gives us dpreact exactly.
-    preact_leaf = preact_actual.detach().requires_grad_(True)
+    # Reference path: mxfp8 matmul via custom Function (independent
+    # backward), then torch's F.<act> (torch's independent backward).
+    xr = x.detach().clone().requires_grad_(True)
+    wr = w.detach().clone().requires_grad_(True)
+    br = b.detach().clone().requires_grad_(True) if use_bias else None
+    preact_r = _ReferenceMXFP8Linear.apply(xr, wr, br)
     if activation == "relu":
-        y_ref = torch.relu(preact_leaf)
+        y_ref = torch.relu(preact_r)
     elif activation == "silu":
-        y_ref = torch.nn.functional.silu(preact_leaf)
+        y_ref = F.silu(preact_r)
     elif activation == "relu_sq":
-        y_ref = torch.relu(preact_leaf) * preact_leaf
+        y_ref = torch.relu(preact_r) * preact_r
     elif activation == "gelu_tanh_approx":
-        y_ref = torch.nn.functional.gelu(preact_leaf, approximate="tanh")
+        y_ref = F.gelu(preact_r, approximate="tanh")
     y_ref.sum().backward()
-    dpreact_ref = preact_leaf.grad
-    ref_dx = torch.mm(dpreact_ref, w.detach())
-    ref_dw = torch.mm(dpreact_ref.t(), x.detach())
-    ref_db = dpreact_ref.sum(dim=0).to(torch.float32) if use_bias else None
 
-    torch.testing.assert_close(ours_dx, ref_dx, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(ours_dw, ref_dw, atol=1e-2, rtol=1e-2)
+    # Bit-exact match expected: both paths use the same fp8 quant, same
+    # kernel, same downstream math — only the act'(preact) derivation
+    # differs (our hand-coded vs torch's autograd). Any divergence flags
+    # a hand-coded-derivative bug.
+    torch.testing.assert_close(y.detach(), y_ref.detach(), atol=0, rtol=0)
+    torch.testing.assert_close(ours_dx, xr.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(ours_dw, wr.grad, atol=1e-3, rtol=1e-3)
     if use_bias:
-        torch.testing.assert_close(ours_db, ref_db, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(ours_db, br.grad, atol=1e-3, rtol=1e-3)
 
 
 def test_linear_mxfp8():
