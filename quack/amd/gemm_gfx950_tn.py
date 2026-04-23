@@ -233,26 +233,24 @@ def _compile_tn_kernel(
             return vecs
 
         def sts_a(vecs, lds_stage):
+            """Register → LDS (no swizzle; tr16_b64 read does intra-block transpose)."""
             for i in range_constexpr(LDG_REG_A_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 k_local_idx = global_tid // LDG_A_X_THREADS
                 m_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
-                col_in_bytes = m_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(k_local_idx, col_in_bytes, m_blocks16)
                 as_.vec_store(
-                    (fx.Index(lds_stage), k_local_idx, col_in_bytes // DTYPE_BYTES),
+                    (fx.Index(lds_stage), k_local_idx, m_local_idx),
                     vecs[i], LDG_VEC_SIZE,
                 )
 
         def ldg_sts_a_async(k_offset, lds_stage):
+            """Async HBM → LDS with no swizzle."""
             for i in range_constexpr(LDG_REG_A_COUNT_AS):
                 global_tid = BLOCK_THREADS * i + tid
                 k_local_idx = global_tid // LDG_A_X_THREADS_AS
                 m_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = m_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(k_local_idx, col_in_bytes, m_blocks16)
                 row_idx = fx.Index(k_offset + k_local_idx)
-                col_idx = m_offset + fx.Index(col_in_bytes // DTYPE_BYTES)
+                col_idx = m_offset + fx.Index(m_local_idx)
                 global_offset = A_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
                 lds_offset = as_.linear_offset(
@@ -272,24 +270,42 @@ def _compile_tn_kernel(
                 )
 
         def lds_matrix_a(lds_stage):
-            """Strided scalar loads — each lane reads FRAG K-values at its M column."""
+            """LDS → MFMA A fragment via ds_read_tr16_b64 — symmetric to NN's B-side."""
             s = fx.Index(lds_stage)
             a_frags = [0] * (WARP_K_STEPS * WARP_M_STEPS)
             FRAG = WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K
+            assert FRAG == 8
+            v4_type = T.vec(4, dtype_)
+            v8_type = T.vec(FRAG, dtype_)
+            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            lb = w_tid % WMMA_M
+            sg = lb // 4
+            pr = lb % 4
+            block_offset = w_tid // WMMA_M
             for kk in range_constexpr(WARP_K_STEPS):
                 for ii in range_constexpr(WARP_M_STEPS):
                     warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                     warp_atom_k_idx = kk * WARP_ATOM_K
-                    k_start = warp_atom_k_idx + ldmatrix_a_k_vec_idx
-                    m_col = warp_atom_m_idx + ldmatrix_a_m_idx
-                    values = []
-                    for ri in range_constexpr(FRAG):
-                        row = k_start + ri
-                        col_in_bytes = m_col * DTYPE_BYTES
-                        col_in_bytes = swizzle_xor16(row, col_in_bytes, m_blocks16)
-                        v = as_[s, fx.Index(row), fx.Index(col_in_bytes // DTYPE_BYTES)]
-                        values.append(v)
-                    vec = vector.from_elements(T.vec(FRAG, dtype_), values)
+                    halves = []
+                    for r in range_constexpr(2):
+                        row = warp_atom_k_idx + block_offset * 8 + r * 4 + sg
+                        col = warp_atom_m_idx + pr * 4
+                        lds_byte_offset = as_.linear_offset(
+                            (s, fx.Index(row), fx.Index(col))
+                        ) * DTYPE_BYTES
+                        lds_base = memref.extract_aligned_pointer_as_index(as_.memptr)
+                        lds_addr_idx = lds_base + lds_byte_offset
+                        lds_addr_i64 = arith.index_cast(T.i64, lds_addr_idx)
+                        lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_i64)
+                        v4 = rocdl.ds_read_tr16_b64(v4_type, lds_ptr).result
+                        halves.append(v4)
+                    elems = []
+                    for h in range_constexpr(2):
+                        for e in range_constexpr(4):
+                            elems.append(vector.extract(
+                                halves[h], static_position=[e], dynamic_position=[],
+                            ))
+                    vec = vector.from_elements(v8_type, elems)
                     a_frags[kk * WARP_M_STEPS + ii] = vec
             return a_frags
 
@@ -308,35 +324,53 @@ def _compile_tn_kernel(
             return vecs
 
         def sts_b(vecs, lds_stage):
+            """Register → LDS, no swizzle (ds_read_tr16_b64 does intra-block transpose)."""
             for i in range_constexpr(LDG_REG_B_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 k_local_idx = global_tid // LDG_B_X_THREADS
                 n_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-                col_in_bytes = n_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(k_local_idx, col_in_bytes, n_blocks16)
                 bs_.vec_store(
-                    (fx.Index(lds_stage), k_local_idx, col_in_bytes // DTYPE_BYTES),
+                    (fx.Index(lds_stage), k_local_idx, n_local_idx),
                     vecs[i], LDG_VEC_SIZE,
                 )
 
         def lds_matrix_b(lds_stage):
+            """LDS → MFMA B fragment via ds_read_tr16_b64 — see NN kernel for semantics."""
             s = fx.Index(lds_stage)
             b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS)
             FRAG = WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
+            assert FRAG == 8
+            v4_type = T.vec(4, dtype_)
+            v8_type = T.vec(FRAG, dtype_)
+            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            lb = w_tid % WMMA_N
+            sg = lb // 4
+            pr = lb % 4
+            block_offset = w_tid // WMMA_N
             for kk in range_constexpr(WARP_K_STEPS):
                 for jj in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
                     warp_atom_k_idx = kk * WARP_ATOM_K
-                    k_start = warp_atom_k_idx + ldmatrix_b_k_vec_idx
-                    n_col = warp_atom_n_idx + ldmatrix_b_n_idx
-                    values = []
-                    for ri in range_constexpr(FRAG):
-                        row = k_start + ri
-                        col_in_bytes = n_col * DTYPE_BYTES
-                        col_in_bytes = swizzle_xor16(row, col_in_bytes, n_blocks16)
-                        v = bs_[s, fx.Index(row), fx.Index(col_in_bytes // DTYPE_BYTES)]
-                        values.append(v)
-                    vec = vector.from_elements(T.vec(FRAG, dtype_), values)
+                    halves = []
+                    for r in range_constexpr(2):
+                        row = warp_atom_k_idx + block_offset * 8 + r * 4 + sg
+                        col = warp_atom_n_idx + pr * 4
+                        lds_byte_offset = bs_.linear_offset(
+                            (s, fx.Index(row), fx.Index(col))
+                        ) * DTYPE_BYTES
+                        lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr)
+                        lds_addr_idx = lds_base + lds_byte_offset
+                        lds_addr_i64 = arith.index_cast(T.i64, lds_addr_idx)
+                        lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_i64)
+                        v4 = rocdl.ds_read_tr16_b64(v4_type, lds_ptr).result
+                        halves.append(v4)
+                    elems = []
+                    for h in range_constexpr(2):
+                        for e in range_constexpr(4):
+                            elems.append(vector.extract(
+                                halves[h], static_position=[e], dynamic_position=[],
+                            ))
+                    vec = vector.from_elements(v8_type, elems)
                     b_frags[kk * WARP_N_STEPS + jj] = vec
             return b_frags
 
