@@ -236,4 +236,90 @@ def linear_residual(
     )
 
 
-__all__ = ["linear", "linear_gated", "linear_mxfp8", "linear_residual"]
+__all__ = [
+    "linear",
+    "linear_gated",
+    "linear_mxfp8",
+    "linear_residual",
+    "LinearFunc",
+    "linear_train",
+]
+
+
+# ---------------------------------------------------------------------------
+# Training autograd Function
+# ---------------------------------------------------------------------------
+#
+# Wires the three GEMM layouts (NT / NN / TN) to fwd / DX / DW:
+#   fwd: y = x @ W.T           → gemm_splitk (NT, existing — K-inner both)
+#   DX:  dx = dy @ W           → gemm_nn (Phase 3)
+#   DW:  dW = dy.T @ x         → gemm_tn (Phase 4)
+#
+# Without this autograd Function, calling ``linear(x, W).backward()`` goes
+# through torch's default autograd (which doesn't know about our custom ops)
+# and gradients either error out or fall back to an unoptimised path.
+# ``LinearFunc`` binds bwd to our NN/TN kernels directly.
+
+
+class LinearFunc(torch.autograd.Function):
+    """Autograd Function for plain linear (no bias, no activation).
+
+    Shape conventions match ``torch.nn.Linear``:
+      - ``x``: (..., in_features)
+      - ``weight``: (out_features, in_features)
+      - returns: (..., out_features)
+
+    Bias-fused and activation-fused variants are Phase 6 (fused epilogues).
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        from quack.amd.gemm_gfx950_splitk import gemm_splitk
+        batch_shape = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1]).contiguous()
+        # NT fwd: y = x @ W.T where W is (out, in)
+        out = gemm_splitk(x2, weight)
+        ctx.save_for_backward(x2, weight)
+        ctx.batch_shape = batch_shape
+        return out.reshape(*batch_shape, out.shape[-1])
+
+    @staticmethod
+    def backward(ctx, dout):
+        from quack.amd.gemm_gfx950_nn import gemm_nn
+        from quack.amd.gemm_gfx950_tn import gemm_tn
+
+        x, weight = ctx.saved_tensors
+        dout2 = dout.reshape(-1, dout.shape[-1]).contiguous()
+
+        dx = None
+        if ctx.needs_input_grad[0]:
+            # NN: dx = dout @ W. dout is (bs, out) row-major (K=out inner);
+            # W stored (out, in) row-major (in inner) — matches gemm_nn's
+            # (K, N) interpretation of B.
+            dx = gemm_nn(dout2, weight)
+            dx = dx.reshape(*ctx.batch_shape, dx.shape[-1])
+
+        dweight = None
+        if ctx.needs_input_grad[1]:
+            # TN: dW = dout.T @ x. gemm_tn treats axis 0 of both operands
+            # as contraction (= batch dim here); output is (out, in).
+            dweight = gemm_tn(dout2, x)
+
+        return dx, dweight
+
+
+def linear_train(x: Tensor, weight: Tensor) -> Tensor:
+    """Autograd-aware plain linear (``y = x @ W.T``) for training.
+
+    Routes forward through ``gemm_splitk`` (NT) and backward through
+    ``gemm_nn`` (DX) + ``gemm_tn`` (DW) via ``LinearFunc``. Use this when
+    ``torch.is_grad_enabled()`` and no bias/activation; the simpler
+    ``linear(...)`` entry above is forward-only and faster for inference.
+
+    Constraints (MVP — matches the Phase 3/4 kernel constraints):
+      - dtype ∈ {f16, bf16}
+      - x last dim (in_features) % 64 == 0
+      - weight.shape[0] (out_features) divisible by 256 (for DX's BLOCK_N=256)
+      - batch dim (after flatten) % 128 == 0
+    """
+    return LinearFunc.apply(x, weight)
