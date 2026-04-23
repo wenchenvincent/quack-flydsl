@@ -120,15 +120,49 @@ at typical training shapes.
 Correctness holds: bias + silu + f16 output passes the usual
 bf16-tolerance band at all tested shapes.
 
-### Remaining work to actually beat hipBLASLt
+## Session G2 — size-threshold tuning
 
-Even after this dispatch, we're 2-10× behind hipBLASLt.  Closing
-THAT gap is a kernel-tuning project across our whole AMD GEMM
-stack — not just stream-K.  Dominant costs documented above still
-apply.  A from-scratch production stream-K rewrite matching
-splitk's tile + LDS + scheduling would take several days and
-would at best match splitk, not beat hipBLASLt.
+G1's initial dispatch used M%128 + N%256 + K%64 compatibility only;
+that routed marginal shapes like 512³ K=256 to splitk even though
+splitk's ~85μs launch-overhead floor costs more than native
+streamk_prod at that size (native = 46μs).  Added a size threshold
+``M * N * K >= 512 * 1024 * 1024`` (512M MACs, ~1024² K=512 and up)
+based on the measured crossover.
 
-Session G1 is the pragmatic win; further perf requires either
-kernel-body tuning or replacing hipBLASLt as the comparison point
-(e.g., for the no-hipBLASLt fp8 path where we already win).
+Final perf, event-timed, f16 out:
+
+| shape             | dispatch | streamk ms | hip ms | SK/hip |
+|-------------------|----------|-----------:|-------:|-------:|
+| 256³ K=128        | native   | 0.044      | 0.015  |  2.89× |
+| 512³ K=256        | native   | 0.044      | 0.010  |  4.25× |
+| 1024² K=512       | splitk   | 0.079      | 0.014  |  5.61× |
+| 2048² K=512       | splitk   | 0.085      | 0.014  |  5.95× |
+| 4096³ K=1024      | splitk   | 0.086      | 0.036  |  2.39× |
+| 8192² K=1024      | splitk   | 0.169      | 0.128  |  1.32× |
+| **8192³**         | splitk   | 1.114      | 0.802  |  **1.39×** |
+
+At production-scale training shapes (8192²+) we're **~1.3-1.4× hipBLASLt
+— competitive**.  At small shapes we're 3-6× slower but this is
+universal across our AMD GEMM stack (not a stream-K-specific issue).
+
+Summary of the workstream:
+
+- Old demo ``gemm_streamk.py``:   **100-600× slower** than hipBLASLt
+- Sessions A-E (from-scratch rewrite): **3-12× slower**
+- Session G1 (dispatch to splitk): **2-10× slower** at mid shapes
+- Session G2 (size-threshold tuning): **1.3-6× slower**, with the
+  production shapes (8192²+) within 1.4×
+
+The remaining gap at 8192³ (1.39×) matches splitk's own perf vs
+hipBLASLt on bf16 matmul (~1.17× per the W3 journal).  Closing
+below that requires kernel-body tuning orthogonal to the stream-K
+scheduler — likely an LDS ping-pong overhaul, vec4 coalesced
+atomics, or matching hipBLASLt's small-shape assembly tuning.
+None of those are stream-K-shaped problems.
+
+For the original stream-K use case ("saturate CUs at small-M
+awkward grids"), the dispatch to splitk (with its adaptive
+``force_split_k`` heuristic already landed in W2) accomplishes
+the scheduling goal.  The native stream-K kernel remains as a
+correctness reference and as the fallback for shapes splitk
+can't handle.

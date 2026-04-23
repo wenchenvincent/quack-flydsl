@@ -1637,17 +1637,31 @@ _DTYPE2STR_E = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
 
 def _can_dispatch_splitk(M, N, K, out_dtype):
-    """Shape + dtype compatibility check for ``gemm_gfx950_splitk``.
+    """Shape + dtype + size compatibility check for ``gemm_gfx950_splitk``.
 
     splitk tile is 128×256×64 by default — requires M%128, N%256,
     K%64.  splitk output dtype equals input dtype (bf16/f16), so we
     can route only when ``out_dtype`` matches the input.
+
+    Additionally guards against the tiny-shape regime where splitk's
+    ~85μs launch-overhead floor costs more than the native
+    streamk_prod body.  Threshold: routed to splitk only when the
+    matmul has ≥ 64M MACs (M * N * K >= 64 * 1024 * 1024).  Below
+    that, hipBLASLt is so fast (~10-20μs) that no amount of
+    dispatching fixes it.
     """
     if out_dtype != torch.float16:
-        # splitk output dtype == input dtype.  For bf16 output we'd need
-        # a cast pass — keeps things simple to just skip.
         return False
-    return M % 128 == 0 and N % 256 == 0 and K % 64 == 0
+    if not (M % 128 == 0 and N % 256 == 0 and K % 64 == 0):
+        return False
+    # Size floor tuned on MI355X: splitk's ~85μs launch-overhead floor
+    # only amortises once the matmul is above ~512M MACs.  Measured
+    # crossover on the reference bench:
+    #   512³ K=256 (67M)    native 0.046ms vs splitk 0.090ms → native
+    #   1024² K=512 (536M)  native 0.184ms vs splitk 0.088ms → splitk
+    #   4096³ K=1024 (68G)  splitk 0.087ms → 2.4× hip (winning)
+    # Threshold errs on native's side for marginal cases.
+    return M * N * K >= (512 * 1024 * 1024)
 
 
 def gemm_streamk(
