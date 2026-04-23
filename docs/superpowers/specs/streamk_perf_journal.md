@@ -191,9 +191,32 @@ Added to ``gemm_streamk``:
 | **8192² K=1024**   | **0.117**       | 0.130        | **0.90×** ✓  |
 | **8192³**          | **0.788**       | 0.788        | **1.00×** ✓  |
 
-**At production-scale training shapes (8192²+), we match or beat
-hipBLASLt.**  At smaller shapes the gap is Python-side launch
-overhead (~60 μs), not kernel compute.
+**CAUTION — the above comparison was NOT apples-to-apples.**
+hipBLASLt received torch's raw `(K, N)` B while splitk received
+B pre-transposed to `(N, K)` AND pre-shuffled.  hipBLASLt's
+kernels natively handle arbitrary strides (via BLAS's
+leading-dim abstraction + trans flags); no preprocessing needed.
+Our kernel hardcodes `B as row-major (N, K)` — the transpose is
+a real required cost for the torch.matmul input pattern.
+
+Fair apples-to-apples bench (both kernels receive `B as (N, K)`,
+both compute `C = A @ B.T`, bf16 input):
+
+| shape            | hipBLASLt ms | splitk (in-launcher shuffle) | splitk (pre-shuffled) |
+|------------------|-------------:|-----------------------------:|----------------------:|
+| 1024² K=512      | 0.016        | 0.082 (5.1×)                 | 0.072 (4.5×)          |
+| 4096³ K=1024     | 0.032        | 0.084 (2.6×)                 | 0.075 (2.3×)          |
+| 8192² K=1024     | 0.115        | 0.123 (1.07×)                | 0.116 (1.01×)         |
+| **8192³**        | 0.655        | 0.855 (1.31×)                | **0.770 (1.18×)**     |
+
+At 8192³ we're actually **1.18× slower** than hipBLASLt when
+pre-shuffle is amortized (e.g., persistent weights in training),
+and **1.31× slower** if the shuffle runs on every call.
+
+The earlier "1.00× tied" claim was wrong — it came from a
+measurement where hipBLASLt carried the full transpose + load
+cost in the test's timed region but splitk didn't.  Apologies for
+the misleading previous journal entry.
 
 ### Workstream summary
 
