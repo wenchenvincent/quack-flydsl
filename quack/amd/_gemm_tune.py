@@ -38,23 +38,49 @@ CacheKey = Tuple[str, str, int, int, int]
 
 _CACHE: Dict[CacheKey, Config] = {}
 _AUTOTUNE_FIRST_CALL = False  # when True, tune on first call for new shape
+
+# Resolution order for the persistent cache path (first hit wins):
+#   1. $QUACK_AMD_TUNE_CACHE env var (explicit override, also used by the
+#      sweep script in tests/amd/tune_amd_gemm.py for writes)
+#   2. The committed default cache bundled with the package
+_DEFAULT_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_default_gemm_tune.json",
+)
 _CACHE_FILE = os.environ.get("QUACK_AMD_TUNE_CACHE", "").strip() or None
+_DEFAULT_CACHE_LOADED = False
+
+
+def _load_cache_from_path(path: str) -> int:
+    """Read entries from ``path``, return count loaded."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return 0
+    count = 0
+    for entry in data.get("entries", []):
+        key = tuple(entry["key"])
+        config = tuple(entry["config"])
+        if len(key) == 5 and len(config) == 5:
+            _CACHE[key] = config
+            count += 1
+    return count
 
 
 def _load_cache_from_disk():
-    """Best-effort load of the persistent cache at import time."""
-    if _CACHE_FILE is None:
+    """Best-effort load of the persistent cache at import time.
+
+    Prefers ``QUACK_AMD_TUNE_CACHE`` if set; otherwise falls back to the
+    committed default at ``quack/amd/_default_gemm_tune.json``.
+    """
+    global _DEFAULT_CACHE_LOADED
+    if _CACHE_FILE is not None:
+        _load_cache_from_path(_CACHE_FILE)
         return
-    try:
-        with open(_CACHE_FILE) as f:
-            data = json.load(f)
-        for entry in data.get("entries", []):
-            key = tuple(entry["key"])
-            config = tuple(entry["config"])
-            if len(key) == 5 and len(config) == 5:
-                _CACHE[key] = config
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        pass
+    # No env override — load the bundled default cache.
+    if os.path.exists(_DEFAULT_CACHE_PATH):
+        n = _load_cache_from_path(_DEFAULT_CACHE_PATH)
+        _DEFAULT_CACHE_LOADED = n > 0
 
 
 _load_cache_from_disk()
