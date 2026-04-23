@@ -569,6 +569,14 @@ def _compile_nn_kernel(
         bn = n // BLOCK_N
         nn_kernel._func.__name__ = KERNEL_NAME
         launcher = nn_kernel(C, A, B, m)
+        # Occupancy hint: 2 waves per EU lets the hardware scheduler keep
+        # more waves in flight to hide LDS / DMA latency. The c_frags alone
+        # hold 128 f32 values per wave (= ~32 vregs), so default auto-
+        # allocation tends toward 3-4 waves/EU anyway; pinning at 2 limits
+        # the per-wave register count ceiling so the compiler doesn't spill.
+        for op in ctx.gpu_module_body.operations:
+            if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)
         launcher.launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_nn_kernel

@@ -515,6 +515,11 @@ def _compile_tn_kernel(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
+        # Occupancy hint: matches NN kernel (see wave_per_eu comment there).
+        # Empirically best at 3 for our (128, 256, 64) tile on gfx950.
+        for op in ctx.gpu_module_body.operations:
+            if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)
         bm = m // BLOCK_M
         bn = n // BLOCK_N
         tn_kernel._func.__name__ = KERNEL_NAME
