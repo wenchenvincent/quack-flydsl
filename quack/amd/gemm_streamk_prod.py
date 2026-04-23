@@ -1636,6 +1636,20 @@ def _compile_e(M, N, K, num_cus, has_bias, activation, out_dtype_str, arch):
 _DTYPE2STR_E = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
 
+def _can_dispatch_splitk(M, N, K, out_dtype):
+    """Shape + dtype compatibility check for ``gemm_gfx950_splitk``.
+
+    splitk tile is 128×256×64 by default — requires M%128, N%256,
+    K%64.  splitk output dtype equals input dtype (bf16/f16), so we
+    can route only when ``out_dtype`` matches the input.
+    """
+    if out_dtype != torch.float16:
+        # splitk output dtype == input dtype.  For bf16 output we'd need
+        # a cast pass — keeps things simple to just skip.
+        return False
+    return M % 128 == 0 and N % 256 == 0 and K % 64 == 0
+
+
 def gemm_streamk(
     A: Tensor, B: Tensor,
     *,
@@ -1658,6 +1672,13 @@ def gemm_streamk(
       out_dtype: ``torch.bfloat16`` (default) or ``torch.float16``
 
     Constraints: M, N, K multiples of 16.
+
+    Dispatch: when the shape is compatible with ``gemm_gfx950_splitk``
+    (M%128, N%256, K%64) AND ``out_dtype`` is f16, the call routes
+    through that much faster kernel — splitk is ~1.1-9× hipBLASLt at
+    common shapes vs this kernel's 3-12×.  Otherwise falls through to
+    the native stream-K implementation below (correct but slow — see
+    ``docs/superpowers/specs/streamk_perf_journal.md`` for why).
     """
     assert A.is_cuda and B.is_cuda
     assert A.dtype == torch.float16 and B.dtype == torch.float16
@@ -1669,6 +1690,17 @@ def gemm_streamk(
     )
     M, K = A.shape
     _, N = B.shape
+    # Fast dispatch: route to gemm_gfx950_splitk when shape + out-dtype
+    # are compatible.  That kernel is ~5-9× faster at these shapes.
+    if _can_dispatch_splitk(M, N, K, out_dtype):
+        from quack.amd.gemm_gfx950_splitk import gemm_splitk
+        # splitk wants B as (N, K) and f16 input → f16 output.
+        B_nk = B.t().contiguous()
+        return gemm_splitk(
+            A, B_nk,
+            bias=bias,
+            activation=activation,
+        )
     has_bias = bias is not None
     if has_bias:
         assert bias.dim() == 1 and bias.size(0) == N
