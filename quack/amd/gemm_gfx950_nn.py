@@ -600,7 +600,16 @@ def _gemm_nn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.dtype == b.dtype == out.dtype
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.stride(-1) == 1
     dtype_str = _DTYPE2STR[a.dtype]
-    _compile_nn_kernel(dtype_str, K, N, _m_hint=M)(out, a, b, M)
+    # Shape-aware tile config: (256, 128, 64, 2, 2) is ~5% faster at medium
+    # shapes when M is a multiple of 256 AND N is a multiple of 128, but
+    # falls back to (128, 256, 64, 1, 4) when M is small or N < 256.
+    if M % 256 == 0 and N % 128 == 0 and N >= 128:
+        tile_kwargs = dict(TILE_M=256, TILE_N=128, TILE_K=64,
+                           BLOCK_M_WARPS=2, BLOCK_N_WARPS=2)
+    else:
+        tile_kwargs = dict(TILE_M=128, TILE_N=256, TILE_K=64,
+                           BLOCK_M_WARPS=1, BLOCK_N_WARPS=4)
+    _compile_nn_kernel(dtype_str, K, N, _m_hint=M, **tile_kwargs)(out, a, b, M)
 
 
 @_gemm_nn_out.register_fake

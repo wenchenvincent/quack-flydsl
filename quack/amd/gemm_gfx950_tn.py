@@ -547,7 +547,16 @@ def _gemm_tn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.dtype == b.dtype == out.dtype
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.stride(-1) == 1
     dtype_str = _DTYPE2STR[a.dtype]
-    _compile_tn_kernel(dtype_str, K, M, N)(out, a, b)
+    # Shape-aware tile: (256, 128, 64, 2x2) gives small win on medium/large
+    # TN shapes but regresses at small (K=2048 M=4096 N=1024), so gate on M
+    # being large enough that the bigger output-M tile keeps tiles/CU > 2.
+    if M >= 8192 and M % 256 == 0 and N % 128 == 0:
+        tile_kwargs = dict(TILE_M=256, TILE_N=128, TILE_K=64,
+                           BLOCK_M_WARPS=2, BLOCK_N_WARPS=2)
+    else:
+        tile_kwargs = dict(TILE_M=128, TILE_N=256, TILE_K=64,
+                           BLOCK_M_WARPS=1, BLOCK_N_WARPS=4)
+    _compile_tn_kernel(dtype_str, K, M, N, **tile_kwargs)(out, a, b)
 
 
 @_gemm_tn_out.register_fake
