@@ -15,16 +15,15 @@ kernel.  Phases (each commit adds one):
       ``wg_id + step * num_cus``.
   Session C — True stream-K (tile crossing) (DONE).  Running
       accumulator + flush-on-tile-change.
-  Session D — Last-partial counter sync + optional fused bias (THIS
-      COMMIT).  Per-tile int32 counter; each contributor atomic-incs
-      after its partial lands.  The WG that is the "last contributor"
-      for a tile (the WG whose iter-range covers the tile's last
-      iteration) spins until counter reaches num_contributors, then
-      applies a simple epilogue (optional bias add) to the summed
-      output.  Sets up the sync scaffolding that Session E builds on
-      for full fused act + dtype cast.
+  Session D — Last-partial counter sync + optional fused bias (DONE).
   Session E — Full fused epilogue (bias + activation + bf16/f16
-      output) + dispatch wiring + bench.
+      output) + public API (THIS COMMIT).  Adds activation
+      (relu / silu / relu_sq / gelu_tanh_approx) applied in f32 after
+      bias, then truncates to the final output dtype (bf16 or f16).
+      Partials still accumulate in a separate f32 scratch buffer
+      (atomic-fadd guarantees aren't reliable for bf16 on CDNA4
+      HBM).  Public ``gemm_streamk`` launcher picks the scratch +
+      epi-write path.
 
 The dtype / tile scope (f16 × f16 → f32, 16×16 MFMA) matches
 ``gemm_persistent`` so each phase can be diffed against the static
@@ -1188,9 +1187,516 @@ def gemm_f16_streamk_prod_d(
     return C
 
 
+# ---------------------------------------------------------------------------
+# Session E — Full fused epilogue (bias + activation + bf16 output).
+# ---------------------------------------------------------------------------
+
+
+_E_ALLOWED_ACTIVATIONS = ("none", "relu", "relu_sq", "silu", "gelu_tanh_approx")
+
+
+def _build_gemm_streamk_e_f16(
+    *, M, N, K, num_cus, has_bias, activation, out_dtype_str, arch,
+):
+    """Session E build: full fused epilogue + bf16/f16 output cast.
+
+    Partials still accumulate in a zero-init f32 scratch buffer ``C``
+    (atomic-fadd semantics on bf16 HBM aren't reliable on CDNA4 — stick
+    to f32 for the combine).  The last-contributor WG reads the
+    complete f32 sum, adds bias (optional), applies activation, and
+    buffer_stores the cast-down bf16 / f16 result to a separate final
+    output ``D``.
+
+    Non-owner WGs never touch ``D`` — their only output is the atomic
+    fadd into ``C`` + the counter inc.
+    """
+    assert M % _MFMA_M == 0 and N % _MFMA_N == 0 and K % _MFMA_K == 0
+    assert activation in _E_ALLOWED_ACTIVATIONS
+    assert out_dtype_str in ("bf16", "f16")
+    tiles_m = M // _MFMA_M
+    tiles_n = N // _MFMA_N
+    total_tiles = tiles_m * tiles_n
+    iters_per_tile = K // _MFMA_K
+    total_iters = total_tiles * iters_per_tile
+    iters_per_wg = (total_iters + num_cus - 1) // num_cus
+    max_iters = iters_per_wg
+
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=(
+            f"quack_amd_gemm_streamk_prod_E_f16_{M}_{N}_{K}_{num_cus}"
+            f"_{'bias' if has_bias else 'nobias'}_{activation}_{out_dtype_str}_smem"
+        ),
+    )
+
+    @flyc.kernel
+    def kernel(A: fx.Tensor, B: fx.Tensor,
+               C: fx.Tensor, D: fx.Tensor,
+               CTR: fx.Tensor, BIAS: fx.Tensor):
+        # Must be evaluated inside the kernel body (requires MLIR context).
+        out_elem_type = T.bf16 if out_dtype_str == "bf16" else T.f16
+        wg_id = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        lane_row = tid % fx.Int32(16)
+        lane_k_group = tid // fx.Int32(16)
+
+        A_buf = fx.rocdl.make_buffer_tensor(A)
+        B_buf = fx.rocdl.make_buffer_tensor(B)
+        D_buf = fx.rocdl.make_buffer_tensor(D)
+        if has_bias:
+            BIAS_buf = fx.rocdl.make_buffer_tensor(BIAS)
+
+        _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+        _i64_type = T.i64
+        c_raw = C.__fly_values__()[0]
+        c_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, c_raw)
+        c_base_i64 = _llvm_d.PtrToIntOp(_i64_type, c_base_ptr_idx).result
+        ctr_raw = CTR.__fly_values__()[0]
+        ctr_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, ctr_raw)
+        ctr_base_i64 = _llvm_d.PtrToIntOp(_i64_type, ctr_base_ptr_idx).result
+
+        ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
+        ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
+        ca_out = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_elem_type)
+        h_reg_ty = fx.MemRefType.get(T.f16, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        out_reg_ty = fx.MemRefType.get(out_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+        reg_lay = fx.make_layout(1, 1)
+
+        def _load_h(div, idx):
+            r = fx.memref_alloca(h_reg_ty, reg_lay)
+            fx.copy_atom_call(ca_h, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _load_f(div, idx):
+            r = fx.memref_alloca(f_reg_ty, reg_lay)
+            fx.copy_atom_call(ca_f, fx.slice(div, (None, idx)), r)
+            return fx.memref_load_vec(r)[0].ir_value()
+
+        def _store_out(div, idx, val_cast):
+            from flydsl.expr.vector import full as _vfull
+            r = fx.memref_alloca(out_reg_ty, reg_lay)
+            elem_py = Float32  # placeholder — need proper cast below
+            # val_cast is already the right ir.Value with type out_elem_type.
+            # Use vector.from_elements to build a 1-element vector for store.
+            one_vec = vector.from_elements(T.vec(1, out_elem_type), [val_cast])
+            fx.memref_store_vec(one_vec, r)
+            fx.copy_atom_call(ca_out, r, fx.slice(div, (None, idx)))
+
+        acc_ty = T.vec(_FRAG_C, T.f32)
+        zero_i32 = arith.constant(0, type=T.i32)
+        one_i32 = arith.constant(1, type=T.i32)
+        zero_f = arith.constant(0.0, type=T.f32)
+        init_acc = vector.from_elements(acc_ty, [zero_f] * _FRAG_C)
+
+        c_iters_per_tile = fx.Int32(iters_per_tile)
+        c_iters_per_wg = fx.Int32(iters_per_wg)
+        c_total_iters = fx.Int32(total_iters)
+        c_tiles_n = fx.Int32(tiles_n)
+        c_N = fx.Int32(N)
+
+        start_iter = ArithValue(wg_id) * c_iters_per_wg
+        end_raw = start_iter + c_iters_per_wg
+        end_lt_total = arith.cmpi(
+            arith.CmpIPredicate.slt,
+            ArithValue(end_raw).ir_value() if hasattr(end_raw, "ir_value") else end_raw,
+            c_total_iters.ir_value() if hasattr(c_total_iters, "ir_value") else c_total_iters,
+        )
+        end_iter = arith.select(
+            end_lt_total,
+            end_raw.ir_value() if hasattr(end_raw, "ir_value") else end_raw,
+            c_total_iters.ir_value() if hasattr(c_total_iters, "ir_value") else c_total_iters,
+        )
+
+        init_tile_idx = arith.divsi(
+            start_iter.ir_value() if hasattr(start_iter, "ir_value") else start_iter,
+            c_iters_per_tile.ir_value() if hasattr(c_iters_per_tile, "ir_value") else c_iters_per_tile,
+        )
+
+        def _flush_acc(tile_idx_v, acc_vec):
+            bid_m = ArithValue(tile_idx_v) // c_tiles_n
+            bid_n = ArithValue(tile_idx_v) % c_tiles_n
+            m_base_v = ArithValue(bid_m) * fx.Int32(_MFMA_M)
+            n_base_v = ArithValue(bid_n) * fx.Int32(_MFMA_N)
+            for i in range_constexpr(_FRAG_C):
+                out_row = ArithValue(m_base_v) + ArithValue(lane_k_group) * fx.Int32(_FRAG_C) + fx.Int32(i)
+                out_col = ArithValue(n_base_v) + ArithValue(lane_row)
+                val_i = vector.extract(acc_vec, static_position=[i], dynamic_position=[])
+                c_flat = ArithValue(out_row) * c_N + ArithValue(out_col)
+                c_byte_off = ArithValue(c_flat) * fx.Int32(4)
+                c_off_i64 = arith.index_cast(
+                    _i64_type, ArithValue(c_byte_off).index_cast(T.index),
+                )
+                c_addr_i64 = _llvm_d.AddOp(
+                    c_base_i64, c_off_i64, _llvm_d.IntegerOverflowFlags(0),
+                ).result
+                c_addr = _llvm_d.IntToPtrOp(_ptr_type, c_addr_i64).result
+                val_iv = val_i.ir_value() if hasattr(val_i, "ir_value") else val_i
+                _llvm_d.AtomicRMWOp(
+                    _llvm_d.AtomicBinOp.fadd,
+                    c_addr, val_iv,
+                    _llvm_d.AtomicOrdering.monotonic,
+                    syncscope="agent", alignment=4,
+                )
+
+        def _apply_epi_and_store_final(tile_idx_v):
+            """Last-contributor path: read C[tile] (full sum), apply
+            bias + activation in f32, cast to out_dtype, store to D.
+            """
+            bid_m = ArithValue(tile_idx_v) // c_tiles_n
+            bid_n = ArithValue(tile_idx_v) % c_tiles_n
+            m_base_v = ArithValue(bid_m) * fx.Int32(_MFMA_M)
+            n_base_v = ArithValue(bid_n) * fx.Int32(_MFMA_N)
+            for i in range_constexpr(_FRAG_C):
+                out_row = ArithValue(m_base_v) + ArithValue(lane_k_group) * fx.Int32(_FRAG_C) + fx.Int32(i)
+                out_col = ArithValue(n_base_v) + ArithValue(lane_row)
+                # Monotonic f32 read of C[tile, m, n] via atomicrmw fadd 0.
+                c_flat = ArithValue(out_row) * c_N + ArithValue(out_col)
+                c_byte_off = ArithValue(c_flat) * fx.Int32(4)
+                c_off_i64 = arith.index_cast(
+                    _i64_type, ArithValue(c_byte_off).index_cast(T.index),
+                )
+                c_addr_i64 = _llvm_d.AddOp(
+                    c_base_i64, c_off_i64, _llvm_d.IntegerOverflowFlags(0),
+                ).result
+                c_addr = _llvm_d.IntToPtrOp(_ptr_type, c_addr_i64).result
+                load_zero_f = arith.constant(0.0, type=T.f32)
+                current_f = _llvm_d.AtomicRMWOp(
+                    _llvm_d.AtomicBinOp.fadd,
+                    c_addr, load_zero_f,
+                    _llvm_d.AtomicOrdering.monotonic,
+                    syncscope="agent", alignment=4,
+                ).result
+                # Use ArithValue ops (operator overloading) for the
+                # epi math so we can mix with _fm.exp's ArithValue
+                # return type cleanly.  Raw `arith.*` ops return
+                # ir.Value which doesn't mix.
+                v_av = ArithValue(current_f)
+                if has_bias:
+                    bias_div = fx.logical_divide(BIAS_buf, fx.make_layout(1, 1))
+                    b_val = _load_f(bias_div, out_col)
+                    v_av = v_av + ArithValue(b_val)
+                if activation == "relu":
+                    v_av = v_av.maximumf(ArithValue(Float32(0.0)))
+                elif activation == "relu_sq":
+                    rv = v_av.maximumf(ArithValue(Float32(0.0)))
+                    v_av = rv * v_av
+                elif activation == "silu":
+                    from flydsl.expr import math as _fm
+                    one_av = ArithValue(Float32(1.0))
+                    exp_neg = _fm.exp(-v_av, fastmath="fast")
+                    v_av = v_av / (one_av + exp_neg)
+                elif activation == "gelu_tanh_approx":
+                    import math as _py_math
+                    from flydsl.expr import math as _fm
+                    c1 = ArithValue(Float32(_py_math.sqrt(2.0 / _py_math.pi)))
+                    c2 = ArithValue(Float32(0.044715 * _py_math.sqrt(2.0 / _py_math.pi)))
+                    half = ArithValue(Float32(0.5))
+                    one_av = ArithValue(Float32(1.0))
+                    two = ArithValue(Float32(2.0))
+                    x_sq = v_av * v_av
+                    z_v = v_av * (c1 + c2 * x_sq)
+                    tanh_z = one_av - two / (one_av + _fm.exp(two * z_v, fastmath="fast"))
+                    v_av = v_av * (half + half * tanh_z)
+                # Cast ArithValue → underlying ir.Value, then truncf to out dtype.
+                v_iv = v_av.ir_value() if hasattr(v_av, "ir_value") else v_av
+                v_cast = arith.trunc_f(out_elem_type, v_iv)
+                # Store to D[out_row, out_col].
+                row_d = fx.slice(D_buf, (out_row, None))
+                d_div = fx.logical_divide(row_d, fx.make_layout(1, 1))
+                _store_out(d_div, out_col, v_cast)
+
+        def _ctr_inc(tile_idx_v):
+            ctr_off = ArithValue(tile_idx_v) * fx.Int32(4)
+            ctr_off_i64 = arith.index_cast(
+                _i64_type, ArithValue(ctr_off).index_cast(T.index),
+            )
+            ctr_addr_i64 = _llvm_d.AddOp(
+                ctr_base_i64, ctr_off_i64, _llvm_d.IntegerOverflowFlags(0),
+            ).result
+            ctr_addr = _llvm_d.IntToPtrOp(_ptr_type, ctr_addr_i64).result
+            _llvm_d.AtomicRMWOp(
+                _llvm_d.AtomicBinOp.add,
+                ctr_addr, one_i32,
+                _llvm_d.AtomicOrdering.monotonic,
+                syncscope="agent", alignment=4,
+            )
+
+        def _ctr_spin_until(tile_idx_v, target_v):
+            ctr_off = ArithValue(tile_idx_v) * fx.Int32(4)
+            ctr_off_i64 = arith.index_cast(
+                _i64_type, ArithValue(ctr_off).index_cast(T.index),
+            )
+            ctr_addr_i64 = _llvm_d.AddOp(
+                ctr_base_i64, ctr_off_i64, _llvm_d.IntegerOverflowFlags(0),
+            ).result
+            ctr_addr = _llvm_d.IntToPtrOp(_ptr_type, ctr_addr_i64).result
+            from flydsl._mlir.dialects import scf as _scf_d
+            w = _scf_d.WhileOp([T.i32], [zero_i32])
+            before = ir.Block.create_at_start(w.before, [T.i32])
+            after = ir.Block.create_at_start(w.after, [T.i32])
+            with ir.InsertionPoint(before):
+                cur = before.arguments[0]
+                need_wait = arith.cmpi(
+                    arith.CmpIPredicate.slt, cur, target_v,
+                )
+                _scf_d.ConditionOp(need_wait, [cur])
+            with ir.InsertionPoint(after):
+                reread = _llvm_d.AtomicRMWOp(
+                    _llvm_d.AtomicBinOp.add,
+                    ctr_addr, zero_i32,
+                    _llvm_d.AtomicOrdering.monotonic,
+                    syncscope="agent", alignment=4,
+                ).result
+                _scf_d.YieldOp([reread])
+
+        def _is_last_contributor(tile_idx_v):
+            t_plus_1 = arith.addi(tile_idx_v, one_i32)
+            last_iter = arith.subi(
+                arith.muli(
+                    t_plus_1,
+                    c_iters_per_tile.ir_value() if hasattr(c_iters_per_tile, "ir_value") else c_iters_per_tile,
+                ),
+                one_i32,
+            )
+            last_wg_for_tile = arith.divsi(
+                last_iter,
+                c_iters_per_wg.ir_value() if hasattr(c_iters_per_wg, "ir_value") else c_iters_per_wg,
+            )
+            wg_iv = wg_id.ir_value() if hasattr(wg_id, "ir_value") else wg_id
+            return arith.cmpi(arith.CmpIPredicate.eq, wg_iv, last_wg_for_tile)
+
+        def _num_contributors(tile_idx_v):
+            first_iter = arith.muli(
+                tile_idx_v,
+                c_iters_per_tile.ir_value() if hasattr(c_iters_per_tile, "ir_value") else c_iters_per_tile,
+            )
+            t_plus_1 = arith.addi(tile_idx_v, one_i32)
+            last_iter = arith.subi(
+                arith.muli(
+                    t_plus_1,
+                    c_iters_per_tile.ir_value() if hasattr(c_iters_per_tile, "ir_value") else c_iters_per_tile,
+                ),
+                one_i32,
+            )
+            first_wg = arith.divsi(
+                first_iter,
+                c_iters_per_wg.ir_value() if hasattr(c_iters_per_wg, "ir_value") else c_iters_per_wg,
+            )
+            last_wg = arith.divsi(
+                last_iter,
+                c_iters_per_wg.ir_value() if hasattr(c_iters_per_wg, "ir_value") else c_iters_per_wg,
+            )
+            return arith.addi(arith.subi(last_wg, first_wg), one_i32)
+
+        def _flush_and_maybe_epi(tile_idx_v, acc_vec):
+            _flush_acc(tile_idx_v, acc_vec)
+            fx.rocdl.s_waitcnt(0)
+            _ctr_inc(tile_idx_v)
+            is_last = _is_last_contributor(tile_idx_v)
+            from flydsl._mlir.dialects import scf as _scf_d
+            epi_if = _scf_d.IfOp(is_last, results_=[], has_else=False)
+            with ir.InsertionPoint(epi_if.then_block):
+                target_ctr = _num_contributors(tile_idx_v)
+                _ctr_spin_until(tile_idx_v, target_ctr)
+                _apply_epi_and_store_final(tile_idx_v)
+                _scf_d.YieldOp([])
+
+        init_state = [
+            start_iter.ir_value() if hasattr(start_iter, "ir_value") else start_iter,
+            init_acc,
+            init_tile_idx,
+            zero_i32,
+        ]
+
+        for step, state in range(0, max_iters, init=init_state):
+            cur_iter = state[0]
+            acc_in = state[1]
+            tile_idx_in = state[2]
+            has_partial_in = state[3]
+
+            in_range = arith.cmpi(
+                arith.CmpIPredicate.slt, cur_iter, end_iter,
+            )
+            t = arith.divsi(
+                cur_iter,
+                c_iters_per_tile.ir_value() if hasattr(c_iters_per_tile, "ir_value") else c_iters_per_tile,
+            )
+            iter_in_tile = arith.remsi(
+                cur_iter,
+                c_iters_per_tile.ir_value() if hasattr(c_iters_per_tile, "ir_value") else c_iters_per_tile,
+            )
+
+            tile_ne = arith.cmpi(arith.CmpIPredicate.ne, t, tile_idx_in)
+            has_partial_i1 = arith.cmpi(
+                arith.CmpIPredicate.ne, has_partial_in, zero_i32,
+            )
+            do_flush = arith.andi(
+                in_range, arith.andi(has_partial_i1, tile_ne),
+            )
+
+            from flydsl._mlir.dialects import scf as _scf_d
+            flush_if = _scf_d.IfOp(do_flush, results_=[], has_else=False)
+            with ir.InsertionPoint(flush_if.then_block):
+                _flush_and_maybe_epi(tile_idx_in, acc_in)
+                _scf_d.YieldOp([])
+
+            bid_m = arith.divsi(
+                t,
+                c_tiles_n.ir_value() if hasattr(c_tiles_n, "ir_value") else c_tiles_n,
+            )
+            bid_n = arith.remsi(
+                t,
+                c_tiles_n.ir_value() if hasattr(c_tiles_n, "ir_value") else c_tiles_n,
+            )
+            m_base = ArithValue(bid_m) * fx.Int32(_MFMA_M)
+            n_base = ArithValue(bid_n) * fx.Int32(_MFMA_N)
+            a_row = ArithValue(m_base) + ArithValue(lane_row)
+            b_col = ArithValue(n_base) + ArithValue(lane_row)
+            k_tile_base = ArithValue(iter_in_tile) * fx.Int32(_MFMA_K)
+            lane_k_base = ArithValue(lane_k_group) * fx.Int32(_FRAG_C) + ArithValue(k_tile_base)
+
+            row_a = fx.slice(A_buf, (a_row, None))
+            a_div = fx.logical_divide(row_a, fx.make_layout(1, 1))
+            a_vals = []
+            for i in range_constexpr(_FRAG_C):
+                a_vals.append(_load_h(a_div, ArithValue(lane_k_base) + fx.Int32(i)))
+            a_frag = vector.from_elements(T.vec(_FRAG_C, T.f16), a_vals)
+
+            b_vals = []
+            for i in range_constexpr(_FRAG_C):
+                row_b_k = fx.slice(B_buf, (ArithValue(lane_k_base) + fx.Int32(i), None))
+                b_div = fx.logical_divide(row_b_k, fx.make_layout(1, 1))
+                b_vals.append(_load_h(b_div, b_col))
+            b_frag = vector.from_elements(T.vec(_FRAG_C, T.f16), b_vals)
+
+            acc_base = arith.select(do_flush, init_acc, acc_in)
+            acc_mfma = fx.rocdl.mfma_f32_16x16x16f16(
+                acc_ty, [a_frag, b_frag, acc_base, 0, 0, 0],
+            )
+
+            new_acc = arith.select(in_range, acc_mfma, acc_in)
+            new_tile_idx = arith.select(in_range, t, tile_idx_in)
+            new_has_partial = arith.select(in_range, one_i32, has_partial_in)
+            new_cur_iter = arith.select(
+                in_range,
+                arith.addi(cur_iter, one_i32),
+                cur_iter,
+            )
+
+            results = yield [new_cur_iter, new_acc, new_tile_idx, new_has_partial]
+
+        final_acc = results[1]
+        final_tile_idx = results[2]
+        final_has_partial = results[3]
+        from flydsl._mlir.dialects import scf as _scf_d2
+        final_has_partial_i1 = arith.cmpi(
+            arith.CmpIPredicate.ne, final_has_partial, zero_i32,
+        )
+        flush_final_if = _scf_d2.IfOp(
+            final_has_partial_i1, results_=[], has_else=False,
+        )
+        with ir.InsertionPoint(flush_final_if.then_block):
+            _flush_and_maybe_epi(final_tile_idx, final_acc)
+            _scf_d2.YieldOp([])
+
+    @flyc.jit
+    def launch(A: fx.Tensor, B: fx.Tensor,
+               C: fx.Tensor, D: fx.Tensor,
+               CTR: fx.Tensor, BIAS: fx.Tensor,
+               stream: fx.Stream = fx.Stream(None)):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        kernel(A, B, C, D, CTR, BIAS).launch(
+            grid=(num_cus, 1, 1), block=(64, 1, 1), stream=stream,
+        )
+
+    return launch
+
+
+_kernel_cache_e: dict = {}
+
+
+def _compile_e(M, N, K, num_cus, has_bias, activation, out_dtype_str, arch):
+    key = (M, N, K, num_cus, has_bias, activation, out_dtype_str, arch)
+    got = _kernel_cache_e.get(key)
+    if got is None:
+        got = _build_gemm_streamk_e_f16(
+            M=M, N=N, K=K, num_cus=num_cus,
+            has_bias=has_bias, activation=activation,
+            out_dtype_str=out_dtype_str, arch=arch,
+        )
+        _kernel_cache_e[key] = got
+    return got
+
+
+_DTYPE2STR_E = {torch.bfloat16: "bf16", torch.float16: "f16"}
+
+
+def gemm_streamk(
+    A: Tensor, B: Tensor,
+    *,
+    bias: "Tensor | None" = None,
+    activation: str = "none",
+    out_dtype: "torch.dtype | None" = None,
+) -> Tensor:
+    """Production stream-K GEMM (public API): f16 × f16 → bf16/f16.
+
+    Computes ``D = activation(A @ B + bias)``.  Partials accumulate in
+    a zero-init f32 scratch via atomic-fadd; the last-contributor WG
+    per tile applies bias + activation and casts to the final dtype.
+
+    Args:
+      A: (M, K) f16
+      B: (K, N) f16
+      bias: optional (N,) f32
+      activation: one of ``"none", "relu", "relu_sq", "silu",
+                  "gelu_tanh_approx"``
+      out_dtype: ``torch.bfloat16`` (default) or ``torch.float16``
+
+    Constraints: M, N, K multiples of 16.
+    """
+    assert A.is_cuda and B.is_cuda
+    assert A.dtype == torch.float16 and B.dtype == torch.float16
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    assert out_dtype in (torch.bfloat16, torch.float16)
+    assert activation in _E_ALLOWED_ACTIVATIONS, (
+        f"activation must be in {_E_ALLOWED_ACTIVATIONS}, got {activation!r}"
+    )
+    M, K = A.shape
+    _, N = B.shape
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.dim() == 1 and bias.size(0) == N
+        assert bias.dtype == torch.float32
+        bias_arg = bias
+    else:
+        bias_arg = torch.empty(1, device=A.device, dtype=torch.float32)
+    arch = get_rocm_arch()
+    num_cus = get_num_cus(arch)
+    tiles_m = M // _MFMA_M
+    tiles_n = N // _MFMA_N
+    total_tiles = tiles_m * tiles_n
+    # f32 scratch for atomic-fadd combine.
+    C_scratch = torch.zeros(M, N, device=A.device, dtype=torch.float32)
+    # Final output.
+    D = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    ctr = torch.zeros(total_tiles, device=A.device, dtype=torch.int32)
+    _compile_e(
+        M, N, K, num_cus, has_bias, activation,
+        _DTYPE2STR_E[out_dtype], arch,
+    )(A, B, C_scratch, D, ctr, bias_arg)
+    return D
+
+
 __all__ = [
     "gemm_f16_streamk_prod",
     "gemm_f16_streamk_prod_b",
     "gemm_f16_streamk_prod_c",
     "gemm_f16_streamk_prod_d",
+    "gemm_streamk",
 ]
