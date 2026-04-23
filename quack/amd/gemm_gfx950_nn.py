@@ -610,6 +610,10 @@ def _gemm_nn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     # happen in practice since N%256 was the MVP constraint — N%128 is more
     # permissive).
     if M % 128 == 0 and N % 128 == 0:
+        # 1x4 warps outperforms 2x2 on NN medium (0.55× vs 0.50× hipBLASLt);
+        # TN prefers 2x2 since both sides use tr16_b64 which benefits from
+        # symmetric warp decomposition, but NN's K-inner A vec_load favours
+        # the 1x4 pattern's register-access distribution.
         tile_kwargs = dict(TILE_M=128, TILE_N=128, TILE_K=64,
                            BLOCK_M_WARPS=1, BLOCK_N_WARPS=4)
     else:
