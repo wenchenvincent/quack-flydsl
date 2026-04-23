@@ -153,6 +153,16 @@ def _compile_tn_kernel(
     LDG_A_X_THREADS_AS = BLOCK_M // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
 
+    # LDS B pad: break the 4-way bank conflict on MFMA B-fragment reads.
+    # Matches the NN kernel's fix — 8 f16 of pad makes BLOCK_N_BYTES+16=544
+    # mismatch the 128-byte bank period, so stride-8 rows across k_groups
+    # land on different banks.
+    # A-side pad is deferred: the existing swizzle_xor16(row, col, m_blocks16)
+    # key depends on BLOCK_M_BYTES; padding A's M stride without re-deriving
+    # the swizzle breaks correctness. Future tune-in.
+    B_LDS_PAD = 8 if (BLOCK_N * DTYPE_BYTES) % 128 == 0 else 0
+    BS_N_STRIDE = BLOCK_N + B_LDS_PAD
+
     allocator = SmemAllocator(
         None, arch=GPU_ARCH,
         global_sym_name=f"tn_smem_{dtype}_{k}_{m}_{n}",
@@ -162,7 +172,7 @@ def _compile_tn_kernel(
     AS_BYTES = max(AS_BYTES, BLOCK_M * BLOCK_N * DTYPE_BYTES)
     allocator.ptr = smem_a_offset + AS_BYTES
     smem_b_offset = allocator._align(allocator.ptr, 16)
-    BS_BYTES = STAGES * BLOCK_K * BLOCK_N * DTYPE_BYTES
+    BS_BYTES = STAGES * BLOCK_K * BS_N_STRIDE * DTYPE_BYTES
     allocator.ptr = smem_b_offset + BS_BYTES
 
     KERNEL_NAME = f"tn_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}"
@@ -180,8 +190,8 @@ def _compile_tn_kernel(
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_K * BLOCK_M,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_K, BLOCK_M))
-        smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_K * BLOCK_N,))
-        bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_K, BLOCK_N))
+        smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_K * BS_N_STRIDE,))
+        bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_K, BS_N_STRIDE))
         smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
 
