@@ -63,6 +63,7 @@ from quack.amd.gemm_gfx950_mfma_core import (
     _WmmaHalfK32,
     swizzle_xor16,
 )
+from quack.amd import _gemm_tune
 
 
 _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
@@ -582,6 +583,107 @@ def _compile_nn_kernel(
     return launch_nn_kernel
 
 
+# ---------- Per-shape autotune ----------
+#
+# Heuristic + autotune hybrid: a fast shape-keyed lookup picks a known-good
+# config by divisibility rules; callers that need the best perf can opt
+# into autotune which benches candidate configs and caches the winner.
+
+
+# Candidate configs tried during autotune — empirically the top performers
+# from the tune-in sweep. Order matters: the first candidate that satisfies
+# the shape's divisibility is the heuristic default.
+_NN_CANDIDATES = [
+    # (TILE_M, TILE_N, TILE_K, BMW, BNW)
+    (128, 128, 64, 1, 4),  # default for M%128 && N%128 — 2 waves/EU unlock
+    (128, 128, 64, 2, 2),  # marginally better at some small shapes
+    (256, 128, 64, 2, 2),  # for M%256 && N%128, sometimes wins
+    (128, 256, 64, 1, 4),  # MVP-era default — N%256 required
+]
+
+
+def _shape_fits(M: int, N: int, cfg: _gemm_tune.Config) -> bool:
+    tm, tn, _, _, _ = cfg
+    return M % tm == 0 and N % tn == 0 and M >= tm and N >= tn
+
+
+def _heuristic_config(M: int, N: int) -> _gemm_tune.Config:
+    """Fast config pick without benchmarking — first candidate that fits."""
+    for cfg in _NN_CANDIDATES:
+        if _shape_fits(M, N, cfg):
+            return cfg
+    # Last-resort fallback: the broadest-fit config.
+    return (128, 256, 64, 1, 4)
+
+
+def _pick_config(
+    dtype_str: str, M: int, K: int, N: int,
+    a: Tensor, b: Tensor, out: Tensor,
+) -> _gemm_tune.Config:
+    """Check cache → autotune on miss (if enabled) → heuristic fallback."""
+    key = ("nn", dtype_str, M, K, N)
+    cached = _gemm_tune.get_cached_config(key)
+    if cached is not None:
+        return cached
+    if _gemm_tune.get_autotune():
+        cfg, _ = _autotune_nn_impl(dtype_str, M, K, N, a, b, out, verbose=False)
+        _gemm_tune.set_cached_config(key, cfg)
+        return cfg
+    return _heuristic_config(M, N)
+
+
+def _autotune_nn_impl(
+    dtype_str: str, M: int, K: int, N: int,
+    a: Tensor, b: Tensor, out: Tensor,
+    verbose: bool = False,
+) -> tuple:
+    """Search _NN_CANDIDATES on the given (a, b, out) tensors; return (best_cfg, best_time)."""
+    candidates = [c for c in _NN_CANDIDATES if _shape_fits(M, N, c)]
+    if not candidates:
+        return _heuristic_config(M, N), float("inf")
+
+    def launch_factory(cfg):
+        tm, tn, tk, bmw, bnw = cfg
+        k_fn = _compile_nn_kernel(
+            dtype_str, K, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
+            BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw, _m_hint=M,
+        )
+        return lambda: k_fn(out, a, b, M)
+
+    return _gemm_tune.search_best_config(
+        "nn", dtype_str, M, K, N, candidates, launch_factory, verbose=verbose,
+    )
+
+
+def autotune_nn(
+    a: Tensor, b: Tensor, out: Optional[Tensor] = None, verbose: bool = False,
+) -> _gemm_tune.Config:
+    """Explicitly autotune ``gemm_nn(a, b)`` for this shape, cache the winner.
+
+    Benches each candidate config against the given tensors and stores
+    the fastest in the tune cache. Subsequent ``gemm_nn`` calls on the
+    same (dtype, M, K, N) hit the cache and use the chosen config with
+    no bench overhead.
+
+    Returns the chosen config tuple ``(TILE_M, TILE_N, TILE_K, BMW, BNW)``.
+    """
+    assert a.is_cuda and b.is_cuda
+    assert a.dim() == 2 and b.dim() == 2
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2
+    if out is None:
+        out = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    dtype_str = _DTYPE2STR[a.dtype]
+    cfg, t = _autotune_nn_impl(dtype_str, M, K, N, a, b, out, verbose=verbose)
+    _gemm_tune.set_cached_config(("nn", dtype_str, M, K, N), cfg)
+    if verbose:
+        flops = 2 * M * N * K / 1e12
+        tf = flops / t if t > 0 else 0
+        print(f"autotune_nn {dtype_str} {M}×{N}×{K} → {cfg} at {tf:.1f} TF/s ({t*1e6:.1f} μs)")
+    return cfg
+
+
 # ---------- Public API + torch.library registration ----------
 
 
@@ -600,26 +702,12 @@ def _gemm_nn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.dtype == b.dtype == out.dtype
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.stride(-1) == 1
     dtype_str = _DTYPE2STR[a.dtype]
-    # Shape-aware tile config. The (128, 128, 64, 1×4 warps) tile is the
-    # sweet spot for most shapes — halves output tile area vs (128, 256)
-    # which doubles the grid-dim count to 2× the workgroups per shape and
-    # drops register-pressure-per-wave enough for the compiler to achieve
-    # 2 waves per EU (vs 1). Big latency-hiding win from the extra waves.
-    # Verified: NN bf16 medium 688 → 894 TF/s (+30%), bf16 small 237 → 307.
-    # Fallback to (128, 256) only when N is too small for 128-tile (shouldn't
-    # happen in practice since N%256 was the MVP constraint — N%128 is more
-    # permissive).
-    if M % 128 == 0 and N % 128 == 0:
-        # 1x4 warps outperforms 2x2 on NN medium (0.55× vs 0.50× hipBLASLt);
-        # TN prefers 2x2 since both sides use tr16_b64 which benefits from
-        # symmetric warp decomposition, but NN's K-inner A vec_load favours
-        # the 1x4 pattern's register-access distribution.
-        tile_kwargs = dict(TILE_M=128, TILE_N=128, TILE_K=64,
-                           BLOCK_M_WARPS=1, BLOCK_N_WARPS=4)
-    else:
-        tile_kwargs = dict(TILE_M=128, TILE_N=256, TILE_K=64,
-                           BLOCK_M_WARPS=1, BLOCK_N_WARPS=4)
-    _compile_nn_kernel(dtype_str, K, N, _m_hint=M, **tile_kwargs)(out, a, b, M)
+    config = _pick_config(dtype_str, M, K, N, a, b, out)
+    tm, tn, tk, bmw, bnw = config
+    _compile_nn_kernel(
+        dtype_str, K, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
+        BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw, _m_hint=M,
+    )(out, a, b, M)
 
 
 @_gemm_nn_out.register_fake
@@ -645,4 +733,4 @@ def gemm_nn(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
     return out
 
 
-__all__ = ["gemm_nn"]
+__all__ = ["gemm_nn", "autotune_nn"]

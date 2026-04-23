@@ -66,6 +66,7 @@ from quack.amd.gemm_gfx950_mfma_core import (
     _WmmaHalfK32,
     swizzle_xor16,
 )
+from quack.amd import _gemm_tune
 
 
 _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
@@ -529,6 +530,87 @@ def _compile_tn_kernel(
     return launch_tn_kernel
 
 
+# ---------- Per-shape autotune (see gemm_gfx950_nn.py for full docstrings) ----------
+
+
+_TN_CANDIDATES = [
+    (128, 128, 64, 2, 2),  # default for M%128 && N%128 — 2 waves/EU unlock
+    (128, 128, 64, 1, 4),
+    (256, 128, 64, 2, 2),  # sometimes wins at M>=8192
+    (128, 256, 64, 1, 4),  # MVP-era default
+]
+
+
+def _shape_fits_tn(M: int, N: int, cfg: _gemm_tune.Config) -> bool:
+    tm, tn, _, _, _ = cfg
+    return M % tm == 0 and N % tn == 0 and M >= tm and N >= tn
+
+
+def _heuristic_config_tn(M: int, N: int) -> _gemm_tune.Config:
+    for cfg in _TN_CANDIDATES:
+        if _shape_fits_tn(M, N, cfg):
+            return cfg
+    return (128, 256, 64, 1, 4)
+
+
+def _pick_config_tn(
+    dtype_str: str, M: int, K: int, N: int,
+    a: Tensor, b: Tensor, out: Tensor,
+) -> _gemm_tune.Config:
+    key = ("tn", dtype_str, M, K, N)
+    cached = _gemm_tune.get_cached_config(key)
+    if cached is not None:
+        return cached
+    if _gemm_tune.get_autotune():
+        cfg, _ = _autotune_tn_impl(dtype_str, M, K, N, a, b, out, verbose=False)
+        _gemm_tune.set_cached_config(key, cfg)
+        return cfg
+    return _heuristic_config_tn(M, N)
+
+
+def _autotune_tn_impl(
+    dtype_str: str, M: int, K: int, N: int,
+    a: Tensor, b: Tensor, out: Tensor,
+    verbose: bool = False,
+) -> tuple:
+    candidates = [c for c in _TN_CANDIDATES if _shape_fits_tn(M, N, c)]
+    if not candidates:
+        return _heuristic_config_tn(M, N), float("inf")
+
+    def launch_factory(cfg):
+        tm, tn, tk, bmw, bnw = cfg
+        k_fn = _compile_tn_kernel(
+            dtype_str, K, M, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
+            BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw,
+        )
+        return lambda: k_fn(out, a, b)
+
+    return _gemm_tune.search_best_config(
+        "tn", dtype_str, M, K, N, candidates, launch_factory, verbose=verbose,
+    )
+
+
+def autotune_tn(
+    a: Tensor, b: Tensor, out: Optional[Tensor] = None, verbose: bool = False,
+) -> _gemm_tune.Config:
+    """Autotune ``gemm_tn(a, b)`` — see ``autotune_nn`` for full docstring."""
+    assert a.is_cuda and b.is_cuda
+    assert a.dim() == 2 and b.dim() == 2
+    K, M = a.shape
+    K2, N = b.shape
+    assert K == K2
+    if out is None:
+        out = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    dtype_str = _DTYPE2STR[a.dtype]
+    cfg, t = _autotune_tn_impl(dtype_str, M, K, N, a, b, out, verbose=verbose)
+    _gemm_tune.set_cached_config(("tn", dtype_str, M, K, N), cfg)
+    if verbose:
+        flops = 2 * M * N * K / 1e12
+        tf = flops / t if t > 0 else 0
+        print(f"autotune_tn {dtype_str} K={K} {M}×{N} → {cfg} at {tf:.1f} TF/s ({t*1e6:.1f} μs)")
+    return cfg
+
+
 # ---------- Public API ----------
 
 
@@ -547,19 +629,12 @@ def _gemm_tn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     assert a.dtype == b.dtype == out.dtype
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.stride(-1) == 1
     dtype_str = _DTYPE2STR[a.dtype]
-    # Shape-aware tile: (128, 128, 64, 2×2 warps) is the sweet spot for TN,
-    # mirroring the NN kernel's discovery but with 2×2 warp layout (vs 1×4
-    # on NN) — TN's tr16_b64 on BOTH sides benefits from the more symmetric
-    # warp decomposition. Win: small 277 → 396 TF/s (+43%), medium 527 → 698
-    # TF/s (+32%). The smaller output tile also lets the compiler hit 2
-    # waves/EU.
-    if M % 128 == 0 and N % 128 == 0:
-        tile_kwargs = dict(TILE_M=128, TILE_N=128, TILE_K=64,
-                           BLOCK_M_WARPS=2, BLOCK_N_WARPS=2)
-    else:
-        tile_kwargs = dict(TILE_M=128, TILE_N=256, TILE_K=64,
-                           BLOCK_M_WARPS=1, BLOCK_N_WARPS=4)
-    _compile_tn_kernel(dtype_str, K, M, N, **tile_kwargs)(out, a, b)
+    config = _pick_config_tn(dtype_str, M, K, N, a, b, out)
+    tm, tn, tk, bmw, bnw = config
+    _compile_tn_kernel(
+        dtype_str, K, M, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
+        BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw,
+    )(out, a, b)
 
 
 @_gemm_tn_out.register_fake
@@ -589,4 +664,4 @@ def gemm_tn(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
     return out
 
 
-__all__ = ["gemm_tn"]
+__all__ = ["gemm_tn", "autotune_tn"]

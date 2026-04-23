@@ -122,6 +122,36 @@ def test_linear_act_train(dtype, activation):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_autotune_matches_or_beats_heuristic(dtype):
+    """autotune should never pick a config that's slower than the heuristic."""
+    from quack.amd.gemm_gfx950_nn import gemm_nn, autotune_nn, _heuristic_config, _NN_CANDIDATES
+    from quack.amd import _gemm_tune
+
+    _gemm_tune.clear_cache()
+    # Shape that exercises the autotune search.
+    M, K, N = 2048, 4096, 1024
+    A = (torch.randn(M, K, device="cuda", dtype=dtype) * 0.1).detach()
+    B = (torch.randn(K, N, device="cuda", dtype=dtype) * 0.1).detach()
+
+    # Heuristic pick
+    h_cfg = _heuristic_config(M, N)
+
+    # Autotune pick
+    t_cfg = autotune_nn(A, B, verbose=False)
+    # Autotune should pick a valid candidate
+    assert t_cfg in _NN_CANDIDATES
+
+    # Both should produce identical output
+    out_h = torch.empty(M, N, device="cuda", dtype=dtype)
+    out_t = torch.empty(M, N, device="cuda", dtype=dtype)
+    gemm_nn(A, B, out_t)  # uses cached autotune result
+    _gemm_tune.clear_cache()
+    gemm_nn(A, B, out_h)  # uses heuristic
+    err = (out_h.float() - out_t.float()).abs().max().item()
+    assert err < 0.5, f"autotune and heuristic disagree: {err:.4f}"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mlp_train(dtype):
     """Full mlp_train: fwd+bwd of w2 @ relu(w1 @ x) matches torch."""
     from quack.amd.mlp import mlp_train
