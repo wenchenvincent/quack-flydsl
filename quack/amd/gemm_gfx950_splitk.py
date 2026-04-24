@@ -867,6 +867,65 @@ def shuffle_b(x: Tensor, layout=(16, 16), k_steps=2) -> Tensor:
     return x
 
 
+_CU_COUNT_CACHE: Optional[int] = None
+
+
+def _get_cu_count() -> int:
+    """Multi-processor (CU) count of the current device; memoised."""
+    global _CU_COUNT_CACHE
+    if _CU_COUNT_CACHE is None:
+        _CU_COUNT_CACHE = torch.cuda.get_device_properties(0).multi_processor_count
+    return _CU_COUNT_CACHE
+
+
+def pick_auto_split_k(m: int, n: int, k: int, tile_m: int, tile_n: int, tile_k: int) -> int:
+    """OGS-style split-K picker for CU utilisation balancing.
+
+    When ``grid_m * grid_n << n_cu`` the matmul leaves CUs idle. Splitting
+    K distributes the same (m, n) tile across multiple CUs, each computing
+    a partial sum that's atomic-fadd'd into the output. Rule mirrors
+    ``triton_kernels/matmul_ogs_details/opt_flags_amd.py``:
+
+        split_k = max(1, n_cu // grid_size)
+
+    Constraints:
+      * must divide k (matmul asserts ``k % SPLIT_K == 0``)
+      * ``k // SPLIT_K`` must be ≥ ``tile_k``
+      * counter-buffer: ``grid_m * grid_n ≤ SPLIT_K_COUNTER_MAX_LEN``
+      * capped at 8 — diminishing returns from atomic-fadd contention.
+
+    Returned SPLIT_K > 1 introduces ulp-level numerical non-determinism
+    (atomic-fadd of per-CU partials). Caller is responsible for the
+    determinism/perf trade-off; see ``gemm_splitk(force_split_k=...)``.
+
+    Measured on MI355X at training-typical shapes (see commit log):
+      * +314% on 512×32768×512 (extreme skinny, grid=8)
+      * +49% on 1024×16384×1024 (skinny-K, grid=64)
+      * +5-10% on 4096×8192×2048 (mid)
+      * -5 to -10% on 2048×4096×1024 (counter overhead > balance win)
+      * no-op on 8192×16384×4096 (grid fully fills CUs)
+    """
+    grid_m = (m + tile_m - 1) // tile_m
+    grid_n = (n + tile_n - 1) // tile_n
+    grid_size = grid_m * grid_n
+    if grid_size > SPLIT_K_COUNTER_MAX_LEN:
+        return 1
+    n_cu = _get_cu_count()
+    raw = max(1, n_cu // grid_size)
+    if raw == 1:
+        return 1
+    # Find the largest power-of-2 ≤ raw that satisfies all constraints.
+    for candidate in (8, 4, 2):
+        if candidate > raw:
+            continue
+        if k % candidate != 0:
+            continue
+        if k // candidate < tile_k:
+            continue
+        return candidate
+    return 1
+
+
 def _default_kwargs(m: int, n: int, k: int):
     kwargs = dict(
         TILE_M=128, TILE_N=256, TILE_K=64, SPLIT_K=1,
@@ -1284,6 +1343,7 @@ def gemm_splitk(
     dgated_postact_out: Optional[Tensor] = None,
     splitk_epi_mode: Optional[str] = None,
     force_split_k: Optional[int] = None,
+    auto_split_k: bool = False,
 ) -> Tensor:
     """Stream-K-capable NT GEMM: ``c = act(a @ b.T + bias)`` on gfx950.
 
@@ -1305,6 +1365,15 @@ def gemm_splitk(
             ``dgated_emit_postact=True`` (or ``dgated_postact_out`` is
             supplied), also emits ``postact = act(g) * u`` of shape
             ``(M, hidden)``; in that case returns ``(dpreact, postact)``.
+      auto_split_k: if ``True`` and ``force_split_k`` is unset, run the
+            OGS-style CU-utilisation picker (see ``pick_auto_split_k()``)
+            and dispatch with the picked SPLIT_K. Off by default — introduces
+            ulp-level non-determinism (atomic-fadd partial reduction).
+            Big win on skinny / extreme-K shapes where the baseline grid
+            leaves CUs idle; small loss on shapes with moderate under-
+            utilisation where the counter overhead exceeds the balance
+            win. Callers that trade deterministic output for perf on
+            small-grid shapes should opt in here.
 
     Fused epilogue compiles a distinct kernel per ``(has_bias, activation)``
     combination — the bias-less, no-activation default matches the original
@@ -1318,6 +1387,15 @@ def gemm_splitk(
     assert dgated_gate_type in _ALLOWED_DGATED
     M, K = a.shape
     N, _ = b.shape
+    if auto_split_k and force_split_k is None:
+        # Pick SPLIT_K using the default tile config. The picker may
+        # return 1 (keep deterministic path); only override when >1.
+        base = _default_kwargs(M, N, K)
+        picked = pick_auto_split_k(
+            M, N, K, base["TILE_M"], base["TILE_N"], base["TILE_K"],
+        )
+        if picked > 1:
+            force_split_k = picked
     is_gated = gate_type != "none"
     is_dgated = dgated_gate_type != "none"
     if is_dgated:
@@ -1346,4 +1424,7 @@ def gemm_splitk(
     return out
 
 
-__all__ = ["gemm_splitk", "shuffle_b", "interleave_gated_weight"]
+__all__ = [
+    "gemm_splitk", "shuffle_b", "interleave_gated_weight",
+    "pick_auto_split_k",
+]
