@@ -1,43 +1,44 @@
 # Copyright (c) 2026, AMD.
 
-"""NN-layout f16/bf16 GEMM for gfx950 (CDNA4) — training DX.
+"""NN-layout GEMM — 256×256 tile with 8 MFMA warps (OGS-style).
 
-Computes ``C[M, N] = A[M, K] @ B[K, N]`` with both operands row-major:
-A has K stride-1 (inner), B has N stride-1 (inner). Matches what
-``dx = dy @ W`` produces during training — dy is (bs, out) row-major
-and W is (out, in) row-major (``nn.Linear.weight``, used transposed
-for fwd: ``x @ W.T``). For bwd DX, ``dy`` plays the A role and ``W``
-plays the B role.
+Companion to ``gemm_gfx950_nn.py``: same kernel pattern, but with a
+2× larger output tile (256×256 vs 128×128) and 2× more warps per WG
+(8 vs 4) to match the OGS ``triton_kernels/matmul_ogs`` default for
+large-M, large-N shapes on CDNA4. Targets the shape regime where the
+4-warp 128×128 path loses to hipBLASLt / OGS (e.g. M=8192, K=16384,
+N=4096 where OGS is 1.27× faster — see commits ce30767, 884996d for
+the profile data that motivated this variant).
 
-Architecture (default 128×256×64 tile, 4-warp WG):
-  - Output tile: 128 × 256
-  - MFMA: 16×16×32 f16/bf16 (gfx950 K=32 per issue)
-  - Warps/WG: 1×4 along M/N → 256 threads, each wave owns a 128×64 sub-tile
-  - LDS: STAGES=2 ping-pong for BOTH A and B (A is K-inner, B is N-inner)
-    - A in LDS: ``(STAGES, BLOCK_M, BLOCK_K)`` XOR-swizzled on K-bytes.
-      Same layout as the NT kernel's A.
-    - B in LDS: ``(STAGES, BLOCK_K, BLOCK_N)`` XOR-swizzled on N-bytes.
-      Write is vectorised (N-contiguous). Read is STRIDED: each MFMA
-      lane needs 4 (gfx942) or 8 (gfx950) K-values at one N-column,
-      which in an N-inner LDS layout requires that many separate scalar
-      loads with stride ``BLOCK_N``. Matches the pattern hipBLASLt uses
-      for its own NN kernel (confirmed by rocprofv3: both our NN and
-      hipBLASLt's NN issue ~2× LDS ops per MFMA vs the NT kernels).
-  - Async DMA on A (raw_ptr_buffer_load_lds), gfx950 only. B uses sync
-    ``buffer_load`` into registers, then ``vec_store`` to LDS.
-  - Scheduler: sched_vmem / sched_mfma interleaves via ``_OnlineScheduler``.
+Why a separate file: making 256×256 fit the 160 KB LDS cap required
+halving the C-staging allocation and splitting the write-back into
+two passes, which the 128×128 path doesn't benefit from. Keeping the
+two kernels in separate files keeps each hot-loop body focused.
 
-MVP scope (this module): plain matmul only. No fused bias, no activation,
-no split-K. Phase 6 adds fused epilogues (see
-``gemm_gfx950_mfma_core._apply_epilogue`` which is already layout-agnostic
-and will be called from the NN write-back).
+LDS budget (128 KB < 160 KB cap):
+    A: STAGES=2 × 256 × 64 × 2B = 64 KB
+    B: STAGES=2 × 64 × 264    × 2B = 66 KB (264 = 256 + 8 pad)
+    C staging: 256 × 128 × 2B     = 64 KB   (half of full BM×BN)
+    Total = max(A_single, C) + B = 64 + 66 = 130 KB ✓
+
+2-pass write-back: stmatrix_c emits only the N-left-half frags to LDS,
+barrier, vec_store to HBM at cols [0, BN/2); then the same for
+[BN/2, BN). With BNW=4 warps across N, each warp's 64-col range falls
+cleanly inside exactly one half.
+
+Workgroup size: 8 warps × 64 lanes = 512 threads/WG. Declared on the
+``@flyc.kernel`` via ``known_block_size=[512, 1, 1]`` to raise the
+default 256-thread cap.
 
 Public API:
 
-    gemm_nn(a, b, out=None)
-        a:  (M, K) f16/bf16, K stride-1
-        b:  (K, N) f16/bf16, N stride-1
-        out: optional preallocated (M, N) in same dtype as ``a``
+    gemm_nn_big(a, b, out=None)
+        a: (M, K) f16/bf16, K stride-1 (inner)
+        b: (K, N) f16/bf16, N stride-1 (inner)
+        out: optional preallocated (M, N) in same dtype
+
+    Also dispatched from ``gemm_gfx950_nn.gemm_nn`` when ``_pick_config``
+    returns a (256, 256, *) tile for a shape.
 """
 
 import functools
@@ -63,21 +64,20 @@ from quack.amd.gemm_gfx950_mfma_core import (
     _WmmaHalfK32,
     swizzle_xor16,
 )
-from quack.amd import _gemm_tune
 
 
 _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
 
 @functools.lru_cache(maxsize=1024)
-def _compile_nn_kernel(
+def _compile_nn_big_kernel(
     dtype: str,
     k: int,
     n: int,
-    TILE_M: int = 128,
+    TILE_M: int = 256,
     TILE_N: int = 256,
     TILE_K: int = 64,
-    BLOCK_M_WARPS: int = 1,
+    BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 4,
     # Grid swizzle (OGS matmul_ogs pattern):
     #   XCD_SWIZZLE — redistribute adjacent pids across chiplets (MI355X
@@ -151,6 +151,12 @@ def _compile_nn_kernel(
     assert BLOCK_NK_SIZE % BLOCK_VECS == 0
     assert BLOCK_MN_SIZE % BLOCK_VECS == 0
 
+    # Per-pass write-back fanout (LDS → HBM).
+    LDG_C_X_THREADS_H = (BLOCK_N // 2) // LDG_VEC_SIZE
+    LDG_REG_C_HALF = (BLOCK_M * (BLOCK_N // 2)) // BLOCK_VECS
+    assert LDG_REG_C_HALF >= 1
+    assert (BLOCK_M * (BLOCK_N // 2)) % BLOCK_VECS == 0
+
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
     BLOCK_N_BYTES = BLOCK_N * DTYPE_BYTES
 
@@ -173,24 +179,33 @@ def _compile_nn_kernel(
     B_LDS_PAD = 8 if (BLOCK_N * DTYPE_BYTES) % 128 == 0 else 0
     BS_N_STRIDE = BLOCK_N + B_LDS_PAD
 
+    # C staging halved — we write the N-left-half in pass 1, then
+    # N-right-half in pass 2, reusing the same LDS region. This keeps
+    # the 256×256 tile under the 160 KB LDS cap (see module docstring).
+    assert BLOCK_N % 2 == 0, "halved C-staging requires BLOCK_N even"
+    C_LDS_N = BLOCK_N // 2
+    C_LDS_BYTES = BLOCK_M * C_LDS_N * DTYPE_BYTES
+
     allocator = SmemAllocator(
         None, arch=GPU_ARCH,
-        global_sym_name=f"nn_smem_{dtype}_{k}_{n}",
+        global_sym_name=f"nn_big_smem_{dtype}_{k}_{n}_{BLOCK_M}_{BLOCK_N}",
     )
     smem_a_offset = allocator._align(allocator.ptr, 16)
     AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    # C staging (writeback) reuses A's LDS region but needs BLOCK_M*BLOCK_N
-    # bytes which may exceed BLOCK_M*BLOCK_K — take the max.
-    AS_BYTES = max(AS_BYTES, BLOCK_M * BLOCK_N * DTYPE_BYTES)
+    # C staging aliases the A region. For the big kernel we only need
+    # ``BLOCK_M × BLOCK_N/2`` bytes per pass, which for 256×256 is 64 KB
+    # — within single-stage A's 32 KB? No: max(32K, 64K) = 64K. Still
+    # wins vs the full 128 KB that would blow the LDS cap.
+    AS_BYTES = max(AS_BYTES, C_LDS_BYTES)
     allocator.ptr = smem_a_offset + AS_BYTES
     smem_b_offset = allocator._align(allocator.ptr, 16)
     BS_BYTES = STAGES * BLOCK_K * BS_N_STRIDE * DTYPE_BYTES
     allocator.ptr = smem_b_offset + BS_BYTES
 
-    KERNEL_NAME = f"nn_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}"
+    KERNEL_NAME = f"nn_big_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}"
     KERNEL_NAME += "_AS" if ASYNC_COPY else "_NA"
 
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def nn_kernel(C: fx.Tensor, A: fx.Tensor, B: fx.Tensor, m: fx.Int32):
         dtype_ = get_dtype_in_kernel(dtype)
         c_zero_d = arith.constant(0.0, type=dtype_)
@@ -209,9 +224,11 @@ def _compile_nn_kernel(
         # Last dim is BS_N_STRIDE (= BLOCK_N + PAD); the pad slots are never
         # written/read but break the row-stride-to-bank-stride alignment.
         bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_K, BS_N_STRIDE))
-        # C writeback-time LDS (aliases A's region, BLOCK_M × BLOCK_N)
-        smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
-        cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
+        # C writeback-time LDS (aliases A's region). Shape is BM × (BN/2)
+        # since we run writeback in two passes over the N dim to halve
+        # LDS use and fit the 160 KB cap.
+        smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * C_LDS_N,))
+        cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, C_LDS_N))
 
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -566,43 +583,89 @@ def _compile_nn_kernel(
         b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
         block_mma_sync(a_frags, b_frags, c_frags)
 
-        # ---------- Write-back (acc → LDS → HBM) ----------
-
-        # Acc regs → LDS (BLOCK_M × BLOCK_N). Each MFMA C-fragment lane owns 4
-        # M-contiguous values at its N column (standard CDNA C-layout).
+        # ---------- Write-back — 2-pass over N ----------
+        #
+        # LDS C staging is halved (BM × BN/2). Each pass:
+        #   (a) active warps (whose warp_n_idx falls in this pass's N-half)
+        #       write their c_frags to LDS;
+        #   (b) all threads vec_load from LDS and vec_store to HBM at
+        #       the correct N offset.
+        #
+        # With the (BMW=2, BNW=4) layout and WARP_N=TILE_N/BNW, each warp's
+        # N-range (WARP_N wide) falls cleanly inside one pass's BN/2 slab
+        # whenever WARP_N divides BN/2 — holds for 256×256 / (2,4). The
+        # runtime ``my_warp_pass`` compare just selects 2 of the 4 N-warps.
+        from flydsl._mlir.dialects import scf
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
         stmatrix_c_n_idx = w_tid % WMMA_N
-        gpu.barrier()
-        for ii in range_constexpr(WARP_M_STEPS):
-            warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
-            for jj in range_constexpr(WARP_N_STEPS):
-                warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
-                for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                    lds_m_idx = fx.Index(warp_atom_m_idx + stmatrix_c_m_vec_idx + kk)
-                    lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                    val = vector.extract(
-                        c_frags[ii * WARP_N_STEPS + jj],
-                        static_position=[kk], dynamic_position=[],
-                    )
-                    cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+        my_wn = wid % fx.Int32(BLOCK_N_WARPS)
+        # pass id of this warp's N-range: (wn * WARP_N) // (BN/2)
+        my_warp_pass = (my_wn * fx.Int32(WARP_N)) // fx.Int32(C_LDS_N)
 
-        gpu.barrier()
+        for pass_idx in range_constexpr(2):
+            PASS_N_START = pass_idx * C_LDS_N
 
-        # LDS → HBM. Each thread writes LDG_VEC_SIZE N-contig values.
-        for i in range_constexpr(LDG_REG_C_COUNT):
-            global_tid = BLOCK_THREADS * i + tid
-            m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-            n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-            m_global_idx = m_offset + m_local_idx
-            cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
-            from flydsl._mlir.dialects import scf
-            cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_boundary_if.then_block):
-                vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                C_.vec_store(
-                    (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE,
-                )
+            gpu.barrier()
+
+            # (a) MFMA fragments → LDS, only for warps whose N-range is in
+            # this pass. The cond is uniform within a warp so scf.if on
+            # arith.cmpi is lane-safe (see AGENTS.md note).
+            in_pass = arith.cmpi(
+                arith.CmpIPredicate.eq, my_warp_pass, fx.Int32(pass_idx),
+            )
+            wrote_if = scf.IfOp(in_pass, results_=[], has_else=False)
+            with ir.InsertionPoint(wrote_if.then_block):
+                for ii in range_constexpr(WARP_M_STEPS):
+                    warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
+                    for jj in range_constexpr(WARP_N_STEPS):
+                        warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
+                        # Subtract PASS_N_START so LDS cs_ indices live in
+                        # [0, C_LDS_N).
+                        warp_atom_n_lds = (
+                            warp_atom_n_idx - fx.Int32(PASS_N_START)
+                        )
+                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
+                            lds_m_idx = fx.Index(
+                                warp_atom_m_idx + stmatrix_c_m_vec_idx + kk,
+                            )
+                            lds_n_idx = fx.Index(
+                                warp_atom_n_lds + stmatrix_c_n_idx,
+                            )
+                            val = vector.extract(
+                                c_frags[ii * WARP_N_STEPS + jj],
+                                static_position=[kk], dynamic_position=[],
+                            )
+                            cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
                 scf.YieldOp([])
+
+            gpu.barrier()
+
+            # (b) LDS → HBM; all threads write this pass's N-half.
+            for i in range_constexpr(LDG_REG_C_HALF):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS_H)
+                n_local_idx = fx.Index(
+                    global_tid % LDG_C_X_THREADS_H * LDG_VEC_SIZE,
+                )
+                m_global_idx = m_offset + m_local_idx
+                cond_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m),
+                )
+                cond_boundary_if = scf.IfOp(
+                    cond_boundary, results_=[], has_else=False,
+                )
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    vec = cs_.vec_load(
+                        (m_local_idx, n_local_idx), LDG_VEC_SIZE,
+                    )
+                    C_.vec_store(
+                        (
+                            m_global_idx,
+                            n_offset + fx.Index(PASS_N_START) + n_local_idx,
+                        ),
+                        vec, LDG_VEC_SIZE,
+                    )
+                    scf.YieldOp([])
 
     @flyc.jit
     def launch_nn_kernel(
@@ -636,190 +699,34 @@ def _compile_nn_kernel(
     return launch_nn_kernel
 
 
-# ---------- Per-shape autotune ----------
-#
-# Heuristic + autotune hybrid: a fast shape-keyed lookup picks a known-good
-# config by divisibility rules; callers that need the best perf can opt
-# into autotune which benches candidate configs and caches the winner.
+# ---------- Public API ----------
 
 
-# Candidate configs tried during autotune. Ordered so the first that
-# fits a shape is the heuristic default. Broader sweep also covers
-# smaller tiles (win when shape is bank/occupancy-bound) and bigger
-# BLOCK_K (win when shape is LDS-read-bound).
-_NN_CANDIDATES = [
-    # (TILE_M, TILE_N, TILE_K, BMW, BNW)
-    (128, 128, 64, 1, 4),   # default for M%128 && N%128 — 2 waves/EU unlock
-    (128, 128, 64, 2, 2),   # symmetric warps — marginal difference
-    (256, 128, 64, 2, 2),   # for M%256 shapes
-    (128, 256, 64, 1, 4),   # MVP-era — widest N fit
-    (128, 128, 128, 1, 2),  # deeper BLOCK_K, 2 warps
-    (128, 128, 128, 2, 2),  # deeper BLOCK_K, 4 warps
-    (128, 64, 64, 2, 2),    # smaller N tile, wins at very small N
-    (64, 128, 64, 1, 4),    # smaller M tile
-    (64, 256, 64, 1, 4),    # thin-M, wide-N
-    (256, 64, 64, 2, 2),    # wide-M, thin-N
-]
+def gemm_nn_big(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
+    """256×256×64 / 8-warp NN-layout GEMM. Same semantics as ``gemm_nn`` —
+    for large-M, large-N shapes where the 4-warp 128×128 path loses to
+    hipBLASLt / OGS.
 
-
-def _shape_fits(M: int, N: int, cfg: _gemm_tune.Config) -> bool:
-    tm, tn, _, _, _ = cfg
-    return M % tm == 0 and N % tn == 0 and M >= tm and N >= tn
-
-
-def _heuristic_config(M: int, N: int) -> _gemm_tune.Config:
-    """Fast config pick without benchmarking — first candidate that fits."""
-    for cfg in _NN_CANDIDATES:
-        if _shape_fits(M, N, cfg):
-            return cfg
-    # Last-resort fallback: the broadest-fit config.
-    return (128, 256, 64, 1, 4)
-
-
-def _pick_config(
-    dtype_str: str, M: int, K: int, N: int,
-    a: Tensor, b: Tensor, out: Tensor,
-) -> _gemm_tune.Config:
-    """Check cache → autotune on miss (if enabled) → heuristic fallback."""
-    key = ("nn", dtype_str, M, K, N)
-    cached = _gemm_tune.get_cached_config(key)
-    if cached is not None:
-        return cached
-    if _gemm_tune.get_autotune():
-        cfg, _ = _autotune_nn_impl(dtype_str, M, K, N, a, b, out, verbose=False)
-        _gemm_tune.set_cached_config(key, cfg)
-        return cfg
-    return _heuristic_config(M, N)
-
-
-def _autotune_nn_impl(
-    dtype_str: str, M: int, K: int, N: int,
-    a: Tensor, b: Tensor, out: Tensor,
-    verbose: bool = False,
-) -> tuple:
-    """Search _NN_CANDIDATES on the given (a, b, out) tensors; return (best_cfg, best_time)."""
-    candidates = [c for c in _NN_CANDIDATES if _shape_fits(M, N, c)]
-    if not candidates:
-        return _heuristic_config(M, N), float("inf")
-
-    def launch_factory(cfg):
-        tm, tn, tk, bmw, bnw = cfg
-        k_fn = _compile_nn_kernel(
-            dtype_str, K, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
-            BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw, _m_hint=M,
-        )
-        return lambda: k_fn(out, a, b, M)
-
-    return _gemm_tune.search_best_config(
-        "nn", dtype_str, M, K, N, candidates, launch_factory, verbose=verbose,
-    )
-
-
-def autotune_nn(
-    a: Tensor, b: Tensor, out: Optional[Tensor] = None, verbose: bool = False,
-) -> _gemm_tune.Config:
-    """Explicitly autotune ``gemm_nn(a, b)`` for this shape, cache the winner.
-
-    Benches each candidate config against the given tensors and stores
-    the fastest in the tune cache. Subsequent ``gemm_nn`` calls on the
-    same (dtype, M, K, N) hit the cache and use the chosen config with
-    no bench overhead.
-
-    Returns the chosen config tuple ``(TILE_M, TILE_N, TILE_K, BMW, BNW)``.
+    Constraints: M % 256 == 0 and N % 256 == 0; K % 64 == 0.
     """
     assert a.is_cuda and b.is_cuda
     assert a.dim() == 2 and b.dim() == 2
     M, K = a.shape
     K2, N = b.shape
-    assert K == K2
+    assert K == K2, f"inner dims must match: {a.shape} @ {b.shape}"
+    assert a.dtype == b.dtype and a.dtype in _DTYPE2STR
+    assert M % 256 == 0 and N % 256 == 0 and K % 64 == 0, (
+        f"gemm_nn_big requires M%256 and N%256 and K%64; got {M}×{K}×{N}"
+    )
+    assert a.stride(-1) == 1 and b.stride(-1) == 1
     if out is None:
         out = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    else:
+        assert out.shape == (M, N) and out.dtype == a.dtype
+        assert out.stride(-1) == 1
     dtype_str = _DTYPE2STR[a.dtype]
-    cfg, t = _autotune_nn_impl(dtype_str, M, K, N, a, b, out, verbose=verbose)
-    _gemm_tune.set_cached_config(("nn", dtype_str, M, K, N), cfg)
-    if verbose:
-        flops = 2 * M * N * K / 1e12
-        tf = flops / t if t > 0 else 0
-        print(f"autotune_nn {dtype_str} {M}×{N}×{K} → {cfg} at {tf:.1f} TF/s ({t*1e6:.1f} μs)")
-    return cfg
-
-
-# ---------- Public API + torch.library registration ----------
-
-
-def _should_use_big_kernel(dtype: torch.dtype, M: int, K: int, N: int) -> bool:
-    """Route to the 256×256 / 8-warp variant when it's measured to win.
-
-    OGS-matched wins (MI355X, bf16): 4096×4096×4096 +15%, 4096×8192×8192
-    (typical MLP dx shape) +8-15%, 8192×8192×8192 +0-5%.
-
-    Skip when:
-      * dtype != bf16 — f16 shows 5-8% regressions at these shapes,
-        likely MFMA-scheduling artefacts specific to the f16 variant.
-      * M or N < 4096 — 256×256 grid undersaturates CUs below 4k×4k
-        output, hurting more than it helps (measured -34 to -60% on
-        2048×1024 and 4096×2048 shapes).
-      * shape doesn't meet 256/256/64 alignment.
-    """
-    if dtype != torch.bfloat16:
-        return False
-    if M < 4096 or N < 4096:
-        return False
-    if M % 256 or N % 256 or K % 64:
-        return False
-    return True
-
-
-@torch.library.custom_op(
-    "quack_amd::_gemm_nn_out",
-    mutates_args=("out",),
-    schema="(Tensor a, Tensor b, Tensor(a0!) out) -> ()",
-)
-def _gemm_nn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
-    assert a.is_cuda and b.is_cuda and out.is_cuda
-    assert a.dim() == 2 and b.dim() == 2 and out.dim() == 2
-    M, K = a.shape
-    K2, N = b.shape
-    assert K == K2, f"A @ B requires inner dims to match: {a.shape} @ {b.shape}"
-    assert out.shape == (M, N), f"out shape {out.shape} != (M, N) = ({M}, {N})"
-    assert a.dtype == b.dtype == out.dtype
-    assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.stride(-1) == 1
-    if _should_use_big_kernel(a.dtype, M, K, N):
-        from quack.amd.gemm_gfx950_nn_big import _compile_nn_big_kernel
-        _compile_nn_big_kernel(_DTYPE2STR[a.dtype], K, N, _m_hint=M)(
-            out, a, b, M,
-        )
-        return
-    dtype_str = _DTYPE2STR[a.dtype]
-    config = _pick_config(dtype_str, M, K, N, a, b, out)
-    tm, tn, tk, bmw, bnw = config
-    _compile_nn_kernel(
-        dtype_str, K, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
-        BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw, _m_hint=M,
-    )(out, a, b, M)
-
-
-@_gemm_nn_out.register_fake
-def _gemm_nn_out_fake(a, b, out):
-    return None
-
-
-def gemm_nn(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
-    """``C[M, N] = A[M, K] @ B[K, N]`` for f16/bf16 row-major inputs.
-
-    Both operands row-major; A has K stride-1 (inner), B has N stride-1.
-    This is the DX layout: ``dx = dy @ W`` — dy plays A, W plays B.
-
-    Constraints (MVP):
-      - M multiple of 128; N multiple of 256; K multiple of 64.
-      - dtype in {f16, bf16}; output dtype matches input.
-    """
-    M, K = a.shape
-    _, N = b.shape
-    if out is None:
-        out = torch.empty(M, N, device=a.device, dtype=a.dtype)
-    _gemm_nn_out(a, b, out)
+    _compile_nn_big_kernel(dtype_str, K, N, _m_hint=M)(out, a, b, M)
     return out
 
 
-__all__ = ["gemm_nn", "autotune_nn"]
+__all__ = ["gemm_nn_big"]
