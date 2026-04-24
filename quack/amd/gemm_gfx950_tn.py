@@ -83,6 +83,11 @@ def _compile_tn_kernel(
     TILE_K: int = 64,
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
+    # OGS-style grid swizzle; see gemm_gfx950_nn.py for the rationale.
+    # TN's M is compile-time (comes from the dw shape), so both grid dims
+    # are constexpr and swizzle2d / xcd_swizzle can fold to near-static.
+    XCD_SWIZZLE: int = 8,
+    GROUP_M: int = 4,
 ):
     BLOCK_K = TILE_K
     assert BLOCK_K >= 32
@@ -199,8 +204,45 @@ def _compile_tn_kernel(
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x
-        block_n_idx = fx.block_idx.y
+
+        # 1D grid: decode flat tile id into (pid_m, pid_n) via xcd_swizzle +
+        # swizzle2d (see gemm_gfx950_nn.py). Both bm and bn are compile-time
+        # constants on TN (m and n come from the dw-shape closure), so most
+        # of the arithmetic folds.
+        flat_pid = fx.Int32(fx.block_idx.x)
+        bm_c_int = m // BLOCK_M
+        bn_c_int = n // BLOCK_N
+        bn_c = fx.Int32(bn_c_int)
+        bm_c = fx.Int32(bm_c_int)
+        if XCD_SWIZZLE > 1:
+            total_int = bm_c_int * bn_c_int
+            xcd_c = fx.Int32(XCD_SWIZZLE)
+            pids_per_group = fx.Int32(total_int // XCD_SWIZZLE)
+            extra_pids = fx.Int32(total_int % XCD_SWIZZLE)
+            xcd_group = flat_pid % xcd_c
+            xcd_local = flat_pid // xcd_c
+            min_ge = arith.select(
+                arith.cmpi(arith.CmpIPredicate.slt, xcd_group, extra_pids),
+                xcd_group, extra_pids,
+            )
+            pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
+        else:
+            pid = flat_pid
+        if GROUP_M > 1:
+            gm_c = fx.Int32(GROUP_M)
+            width_c = fx.Int32(GROUP_M * bn_c_int)
+            group_id = pid // width_c
+            remain = bm_c - group_id * gm_c
+            group_size = arith.select(
+                arith.cmpi(arith.CmpIPredicate.slt, remain, gm_c),
+                remain, gm_c,
+            )
+            group_size_i = fx.Int32(group_size)
+            block_m_idx = group_id * gm_c + (pid % group_size_i)
+            block_n_idx = (pid % width_c) // group_size_i
+        else:
+            block_m_idx = pid // bn_c
+            block_n_idx = pid % bn_c
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
         m_blocks16 = fx.Int32(BLOCK_M_BYTES // 16)
@@ -525,7 +567,8 @@ def _compile_tn_kernel(
         bn = n // BLOCK_N
         tn_kernel._func.__name__ = KERNEL_NAME
         launcher = tn_kernel(C, A, B)
-        launcher.launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        # 1D grid; in-kernel xcd_swizzle + swizzle2d derive (pid_m, pid_n).
+        launcher.launch(grid=(bm * bn, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_tn_kernel
 

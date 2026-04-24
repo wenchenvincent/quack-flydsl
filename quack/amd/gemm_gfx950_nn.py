@@ -79,6 +79,13 @@ def _compile_nn_kernel(
     TILE_K: int = 64,
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
+    # Grid swizzle (OGS matmul_ogs pattern):
+    #   XCD_SWIZZLE — redistribute adjacent pids across chiplets (MI355X
+    #     has 8 XCDs). ``1`` disables.
+    #   GROUP_M — tile grouping along M for L2 B-matrix reuse across
+    #     4 consecutive M-tiles sharing one N-tile load. ``1`` disables.
+    XCD_SWIZZLE: int = 8,
+    GROUP_M: int = 4,
     _m_hint: int = 0,  # cache-key only; see splitk for grid-bake workaround rationale
 ):
     BLOCK_K = TILE_K
@@ -209,8 +216,49 @@ def _compile_nn_kernel(
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x
-        block_n_idx = fx.block_idx.y
+
+        # 1D grid launch: block_idx.x is a flat tile id in [0, bm*bn).
+        # Decode (block_m_idx, block_n_idx) via two-stage swizzle:
+        #   (1) xcd_swizzle — pulls adjacent pids onto different chiplets
+        #       (domain_size = bm*bn, XCD_SWIZZLE groups). Keeps per-XCD
+        #       tile assignment contiguous to preserve L2 locality there.
+        #   (2) swizzle2d — remaps flat pid to (pid_m, pid_n) grouping
+        #       GROUP_M consecutive M-tiles under the same pid_n block,
+        #       so B-matrix N-tile columns are reused across 4 M-tiles.
+        # Matches the OGS matmul_ogs pattern at cdna4. Constants (XCD=8,
+        # GROUP_M=4) match the AMD default opt-flags.
+        flat_pid = fx.Int32(fx.block_idx.x)
+        bn_c = fx.Int32(n // BLOCK_N)               # compile-time
+        bm_rt = (m + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M)
+        if XCD_SWIZZLE > 1:
+            xcd_c = fx.Int32(XCD_SWIZZLE)
+            total_tiles = bm_rt * bn_c
+            pids_per_group = total_tiles // xcd_c
+            extra_pids = total_tiles % xcd_c
+            xcd_group = flat_pid % xcd_c
+            xcd_local = flat_pid // xcd_c
+            min_ge = arith.select(
+                arith.cmpi(arith.CmpIPredicate.slt, xcd_group, extra_pids),
+                xcd_group, extra_pids,
+            )
+            pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
+        else:
+            pid = flat_pid
+        if GROUP_M > 1:
+            gm_c = fx.Int32(GROUP_M)
+            width = gm_c * bn_c
+            group_id = pid // width
+            remain = bm_rt - group_id * gm_c
+            group_size = arith.select(
+                arith.cmpi(arith.CmpIPredicate.slt, remain, gm_c),
+                remain, gm_c,
+            )
+            group_size_i = fx.Int32(group_size)
+            block_m_idx = group_id * gm_c + (pid % group_size_i)
+            block_n_idx = (pid % width) // group_size_i
+        else:
+            block_m_idx = pid // bn_c
+            block_n_idx = pid % bn_c
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
         k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
@@ -568,6 +616,7 @@ def _compile_nn_kernel(
             allocator.finalize()
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
+        total_tiles = bm * bn
         nn_kernel._func.__name__ = KERNEL_NAME
         launcher = nn_kernel(C, A, B, m)
         # Occupancy hint: 2 waves per EU lets the hardware scheduler keep
@@ -578,7 +627,11 @@ def _compile_nn_kernel(
         for op in ctx.gpu_module_body.operations:
             if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
                 op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)
-        launcher.launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        # 1D grid launch; in-kernel xcd_swizzle + swizzle2d derive 2D (pid_m,
+        # pid_n) from the flat block_idx.x. Gives the scheduler freedom to
+        # redistribute adjacent tiles across XCDs while preserving L2 reuse
+        # via GROUP_M-style M-tile grouping.
+        launcher.launch(grid=(total_tiles, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_nn_kernel
 
