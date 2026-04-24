@@ -1,12 +1,17 @@
 # Copyright (c) 2026, AMD.
 
-"""Bench FlyDSL gemm_nn / gemm_tn vs a Triton GEMM vs torch (hipBLASLt).
+"""Bench FlyDSL gemm_nn / gemm_tn vs TWO Triton references + torch (hipBLASLt).
 
-Apples-to-apples comparison on the same shapes / dtypes. The Triton
-kernel here is a standard textbook GEMM (from the Triton tutorial,
-adapted to ROCm gfx950 / bf16+f16). Autotune across a few BLOCK_M /
-BLOCK_N / BLOCK_K configs so the Triton kernel gets its own best-pick
-per shape too — otherwise the comparison is unfair.
+Triton baselines:
+  1. **Primus-Turbo GEMM** — production Triton kernel from
+     ``/workspace/Primus-Turbo/primus_turbo/triton/gemm/gemm_kernel.py``
+     (AMD-authored, autotuned for HIP / gfx950).
+  2. **Triton tutorial matmul** — faithful reproduction of
+     ``triton-lang/triton/python/tutorials/03-matrix-multiplication.py``
+     (with GROUP_SIZE_M L2 swizzle, standard across nv/amd).
+
+Both Triton kernels have their own autotune sweep, so the comparison
+is "best Triton config vs best FlyDSL config" — apples-to-apples.
 
 Usage:
     PYTHONPATH=/workspace/quack python -m tests.amd.bench_vs_triton
@@ -14,7 +19,9 @@ Usage:
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 
 import torch
 import triton
@@ -24,75 +31,31 @@ from quack.amd.gemm_gfx950_nn import gemm_nn
 from quack.amd.gemm_gfx950_tn import gemm_tn
 
 
-# Triton matmul kernel — A (M, K) @ B (K, N) -> C (M, N), all row-major.
-# Standard tutorial shape; this is the "NN" layout in our terminology.
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
-                      num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8},
-                      num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
-                      num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8},
-                      num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
-                      num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8},
-                      num_stages=2, num_warps=8),
-    ],
-    key=["M", "N", "K"],
-)
-@triton.jit
-def _triton_nn_kernel(
-    A_ptr, B_ptr, C_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    # Group swizzle for better L2 re-use.
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+# ---------------------------------------------------------------------------
+# (1) Primus-Turbo GEMM — direct import (AMD upstream production kernel)
+# ---------------------------------------------------------------------------
 
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = A_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+_PRIMUS_PATH = "/workspace/Primus-Turbo"
+if _PRIMUS_PATH not in sys.path:
+    sys.path.insert(0, _PRIMUS_PATH)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
-        acc = tl.dot(a, b, acc=acc)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    c = acc.to(A_ptr.dtype.element_ty)
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = C_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+try:
+    from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel as _primus_kernel
+    _HAVE_PRIMUS = True
+except ImportError:
+    _HAVE_PRIMUS = False
 
 
-def triton_gemm_nn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def primus_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     M, K = a.shape
     K2, N = b.shape
     assert K == K2
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
-    _triton_nn_kernel[grid](
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    _primus_kernel[grid](
         a, b, c, M, N, K,
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
@@ -101,16 +64,94 @@ def triton_gemm_nn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return c
 
 
-def triton_gemm_tn(a_kn: torch.Tensor, b_kn: torch.Tensor) -> torch.Tensor:
-    """Wrap the NN triton kernel to compute a_kn.T @ b_kn (= dW for training).
+# ---------------------------------------------------------------------------
+# (2) Triton tutorial matmul — faithful reproduction of
+#     https://github.com/triton-lang/triton/blob/main/python/tutorials/
+#     03-matrix-multiplication.py
+# ---------------------------------------------------------------------------
 
-    Uses a.T as a strided view — triton consumes the stride tuple directly.
+
+def _tutorial_autotune_configs():
+    """Matches the tutorial's HIP autotune config block."""
+    return [
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'waves_per_eu': 2},
+                      num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 4, 'waves_per_eu': 2},
+                      num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'waves_per_eu': 2},
+                      num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'waves_per_eu': 3},
+                      num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'waves_per_eu': 8},
+                      num_warps=4, num_stages=2),
+    ]
+
+
+@triton.autotune(configs=_tutorial_autotune_configs(), key=['M', 'N', 'K'])
+@triton.jit
+def _tutorial_matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Faithful Triton tutorial matmul (M, K) @ (K, N) -> (M, N).
+
+    Standard group-swizzle launch + masked loads + f32 accumulator.
     """
-    K, M = a_kn.shape
-    K2, N = b_kn.shape
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    c = accumulator.to(tl.float16)  # will be cast at store below
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def tutorial_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    M, K = a.shape
+    K2, N = b.shape
     assert K == K2
-    a_view = a_kn.transpose(0, 1)  # (M, K) view, strides (1, M)
-    return triton_gemm_nn(a_view, b_kn)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
+    _tutorial_matmul_kernel[grid](
+        a, b, c, M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Bench harness
+# ---------------------------------------------------------------------------
 
 
 def _bench(fn, warmup: int = 15, iters: int = 50) -> float:
@@ -131,15 +172,16 @@ def _bench(fn, warmup: int = 15, iters: int = 50) -> float:
 
 
 def main():
-    header = (
-        f"{'kernel':<10} {'shape':<24} {'dtype':<6}"
-        f" {'flydsl TF/s':>12} {'triton TF/s':>13} {'torch TF/s':>12}"
-        f" {'fly/triton':>11} {'fly/torch':>11}"
-    )
-    print(header); print("-" * len(header))
+    print(f"Primus-Turbo available: {_HAVE_PRIMUS}")
+    header_cells = ["kernel", "shape", "dtype", "flydsl TF/s"]
+    if _HAVE_PRIMUS:
+        header_cells.append("primus TF/s")
+    header_cells += ["tutorial TF/s", "torch TF/s",
+                     "fly/primus" if _HAVE_PRIMUS else "",
+                     "fly/tutorial", "fly/torch"]
+    print("  ".join(c.rjust(13) for c in header_cells))
 
     for dtype, dt_str in [(torch.bfloat16, "bf16"), (torch.float16, "f16")]:
-        # NN: y = x @ W  (both row-major, A K-inner, B N-inner)
         for M, K, N in [(2048, 4096, 1024), (4096, 8192, 2048), (8192, 16384, 4096)]:
             torch.manual_seed(0)
             a = torch.randn(M, K, device="cuda", dtype=dtype) * 0.1
@@ -147,38 +189,29 @@ def main():
             out = torch.empty(M, N, device="cuda", dtype=dtype)
             flops = 2 * M * N * K / 1e12
 
-            # Warm compiles separately so the first bench doesn't capture JIT time.
+            # Warm compiles.
             gemm_nn(a, b, out); torch.cuda.synchronize()
-            triton_gemm_nn(a, b); torch.cuda.synchronize()
+            if _HAVE_PRIMUS:
+                primus_gemm(a, b); torch.cuda.synchronize()
+            tutorial_gemm(a, b); torch.cuda.synchronize()
 
             t_fly = _bench(lambda: gemm_nn(a, b, out))
-            t_tri = _bench(lambda: triton_gemm_nn(a, b))
+            t_prm = _bench(lambda: primus_gemm(a, b)) if _HAVE_PRIMUS else None
+            t_tut = _bench(lambda: tutorial_gemm(a, b))
             t_trc = _bench(lambda: torch.matmul(a, b, out=out))
-            print(
-                f"{'NN':<10} {M}×{N}×{K:<10} {dt_str:<6}"
-                f" {flops/t_fly:>12.1f} {flops/t_tri:>13.1f} {flops/t_trc:>12.1f}"
-                f" {t_tri/t_fly:>10.3f}x {t_trc/t_fly:>10.3f}x"
-            )
 
-        # TN: dW = dy.T @ x
-        for K, M, N in [(2048, 4096, 1024), (4096, 8192, 2048), (8192, 16384, 4096)]:
-            torch.manual_seed(0)
-            a = torch.randn(K, M, device="cuda", dtype=dtype) * 0.1
-            b = torch.randn(K, N, device="cuda", dtype=dtype) * 0.1
-            out = torch.empty(M, N, device="cuda", dtype=dtype)
-            flops = 2 * M * N * K / 1e12
-
-            gemm_tn(a, b, out); torch.cuda.synchronize()
-            triton_gemm_tn(a, b); torch.cuda.synchronize()
-
-            t_fly = _bench(lambda: gemm_tn(a, b, out))
-            t_tri = _bench(lambda: triton_gemm_tn(a, b))
-            t_trc = _bench(lambda: torch.matmul(a.T, b, out=out))
-            print(
-                f"{'TN K=' + str(K):<10} {M}×{N:<18} {dt_str:<6}"
-                f" {flops/t_fly:>12.1f} {flops/t_tri:>13.1f} {flops/t_trc:>12.1f}"
-                f" {t_tri/t_fly:>10.3f}x {t_trc/t_fly:>10.3f}x"
-            )
+            row = [
+                f"NN", f"{M}×{N}×{K}", dt_str,
+                f"{flops/t_fly:.1f}",
+            ]
+            if _HAVE_PRIMUS:
+                row.append(f"{flops/t_prm:.1f}")
+            row += [
+                f"{flops/t_tut:.1f}", f"{flops/t_trc:.1f}",
+                f"{t_prm/t_fly:.2f}x" if _HAVE_PRIMUS else "",
+                f"{t_tut/t_fly:.2f}x", f"{t_trc/t_fly:.2f}x",
+            ]
+            print("  ".join(c.rjust(13) for c in row))
 
 
 if __name__ == "__main__":
