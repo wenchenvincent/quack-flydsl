@@ -750,24 +750,28 @@ def autotune_nn(
 def _should_use_big_kernel(dtype: torch.dtype, M: int, K: int, N: int) -> bool:
     """Route to the 256×256 / 8-warp variant when it's measured to win.
 
-    OGS-matched wins (MI355X, bf16): 4096×4096×4096 +15%, 4096×8192×8192
-    (typical MLP dx shape) +8-15%, 8192×8192×8192 +0-5%.
+    Wins on MI355X:
+      * bf16: M >= 4096 and N >= 4096 (up to +15%)
+      * f16:  only M == N == 4096 (+10%); other large shapes regress
+        because CDNA4 f16 MFMA has extra MFMA→VALU latency not fully
+        hidden even with packed ``v_cvt_pkrtz_f16_f32`` (OGS shows a
+        similar bf16>f16 gap on the same hardware, ~4%).
 
-    Skip when:
-      * dtype != bf16 — f16 shows 5-8% regressions at these shapes,
-        likely MFMA-scheduling artefacts specific to the f16 variant.
-      * M or N < 4096 — 256×256 grid undersaturates CUs below 4k×4k
-        output, hurting more than it helps (measured -34 to -60% on
-        2048×1024 and 4096×2048 shapes).
-      * shape doesn't meet 256/256/64 alignment.
+    Small shapes (M or N < 4096) are blocked unconditionally — the
+    256×256 grid undersaturates CUs below 4k×4k output, hurting
+    -34 to -60% measured on 2048×1024 and 4096×2048 shapes.
+
+    Alignment: M%256, N%256, K%64 required by the kernel body.
     """
-    if dtype != torch.bfloat16:
+    if M % 256 or N % 256 or K % 64:
         return False
     if M < 4096 or N < 4096:
         return False
-    if M % 256 or N % 256 or K % 64:
-        return False
-    return True
+    if dtype == torch.bfloat16:
+        return True
+    if dtype == torch.float16 and M == 4096 and N == 4096:
+        return True
+    return False
 
 
 @torch.library.custom_op(

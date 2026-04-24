@@ -615,6 +615,16 @@ def _compile_nn_big_kernel(
             )
             wrote_if = scf.IfOp(in_pass, results_=[], has_else=False)
             with ir.InsertionPoint(wrote_if.then_block):
+                # Pair-packed truncf for f16 via rocdl.cvt.pkrtz. Each MFMA
+                # C-fragment stores 4 f32 values at 4 consecutive M rows at
+                # one N column; pairing adjacent (kk, kk+1) lets the backend
+                # emit ``v_cvt_pkrtz_f16_f32`` which doesn't have the
+                # MFMA→VALU hazard stall that scalar ``v_cvt_f16_f32_e32``
+                # hits — saves ~34 × 5-cycle s_nops per wave. bf16 already
+                # gets packed ``v_cvt_pk_bf16_f32`` out of the default
+                # ``truncf`` lowering, no intrinsic needed there.
+                _use_pkrtz = dtype == "f16"
+                _pk_res_ty = T.vec(2, T.f16) if _use_pkrtz else None
                 for ii in range_constexpr(WARP_M_STEPS):
                     warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                     for jj in range_constexpr(WARP_N_STEPS):
@@ -624,18 +634,55 @@ def _compile_nn_big_kernel(
                         warp_atom_n_lds = (
                             warp_atom_n_idx - fx.Int32(PASS_N_START)
                         )
-                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                            lds_m_idx = fx.Index(
-                                warp_atom_m_idx + stmatrix_c_m_vec_idx + kk,
-                            )
-                            lds_n_idx = fx.Index(
-                                warp_atom_n_lds + stmatrix_c_n_idx,
-                            )
-                            val = vector.extract(
-                                c_frags[ii * WARP_N_STEPS + jj],
-                                static_position=[kk], dynamic_position=[],
-                            )
-                            cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+                        c_frag = c_frags[ii * WARP_N_STEPS + jj]
+                        if _use_pkrtz:
+                            assert WMMA_C_FRAG_VALUES % 2 == 0
+                            for kk2 in range_constexpr(WMMA_C_FRAG_VALUES // 2):
+                                kk = kk2 * 2
+                                v0 = vector.extract(
+                                    c_frag, static_position=[kk],
+                                    dynamic_position=[],
+                                )
+                                v1 = vector.extract(
+                                    c_frag, static_position=[kk + 1],
+                                    dynamic_position=[],
+                                )
+                                pk = rocdl.CvtPkRtz(_pk_res_ty, v0, v1).result
+                                e0 = vector.extract(
+                                    pk, static_position=[0],
+                                    dynamic_position=[],
+                                )
+                                e1 = vector.extract(
+                                    pk, static_position=[1],
+                                    dynamic_position=[],
+                                )
+                                lds_n_idx = fx.Index(
+                                    warp_atom_n_lds + stmatrix_c_n_idx,
+                                )
+                                cs_[
+                                    fx.Index(warp_atom_m_idx
+                                             + stmatrix_c_m_vec_idx + kk),
+                                    lds_n_idx,
+                                ] = e0
+                                cs_[
+                                    fx.Index(warp_atom_m_idx
+                                             + stmatrix_c_m_vec_idx + kk + 1),
+                                    lds_n_idx,
+                                ] = e1
+                        else:
+                            for kk in range_constexpr(WMMA_C_FRAG_VALUES):
+                                lds_m_idx = fx.Index(
+                                    warp_atom_m_idx
+                                    + stmatrix_c_m_vec_idx + kk,
+                                )
+                                lds_n_idx = fx.Index(
+                                    warp_atom_n_lds + stmatrix_c_n_idx,
+                                )
+                                val = vector.extract(
+                                    c_frag, static_position=[kk],
+                                    dynamic_position=[],
+                                )
+                                cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
                 scf.YieldOp([])
 
             gpu.barrier()
