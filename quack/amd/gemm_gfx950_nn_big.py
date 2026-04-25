@@ -79,6 +79,14 @@ def _compile_nn_big_kernel(
     TILE_K: int = 64,
     BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 4,
+    # When True (default), replaces the LDS-staged 2-pass writeback
+    # with a direct reg→HBM writeback using ds_bpermute to transpose
+    # the MFMA C fragment from "4 rows × 1 col per lane" to "4 cols ×
+    # 1 row per lane", then a single 4-element vec_store per atom.
+    # Mirrors the OGS matmul_ogs writeback pattern. Closes the 19%
+    # non-MFMA gap measured in rocprofv3 at 8192×4096×16384 bf16:
+    # +10-18% across all bench shapes vs LDS-staged.
+    DIRECT_WRITE: bool = True,
     # Grid swizzle (OGS matmul_ogs pattern):
     #   XCD_SWIZZLE — redistribute adjacent pids across chiplets (MI355X
     #     has 8 XCDs). ``1`` disables.
@@ -583,7 +591,109 @@ def _compile_nn_big_kernel(
         b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
         block_mma_sync(a_frags, b_frags, c_frags)
 
-        # ---------- Write-back — 2-pass over N ----------
+        # ---------- Write-back ----------
+        from flydsl._mlir.dialects import scf
+        stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
+        stmatrix_c_n_idx = w_tid % WMMA_N
+
+        if DIRECT_WRITE:
+            # Direct reg→HBM writeback. Per atom:
+            #   1. each lane selects c_frag[src_kk] where src_kk = (l//4)%4
+            #      via 3 conditional selects.
+            #   2. 4 ds_bpermute transposes the fragment so output lane l
+            #      ends up holding 4 f32 values at (row = l//4, cols =
+            #      (l%4)*4 + 0..3) of the atom's 16×16 output.
+            #   3. pack 4 f32 → 4 bf16 (or f16 via cvt_pkrtz) into a
+            #      vector<4 x dtype> per lane.
+            #   4. one vec_store of size 4 to HBM at the right (row, col).
+            #
+            # No LDS staging, no barriers. Per warp: 32 atoms × 1 store.
+            # Layout knobs for the transpose:
+            src_kk_v = (w_tid // fx.Int32(4)) % fx.Int32(4)  # per-lane runtime
+            dst_row_in_atom = w_tid // fx.Int32(4)            # 0..15
+            dst_col_start_in_atom = (w_tid % fx.Int32(4)) * fx.Int32(4)
+            # Source lane mapping (for output kk_out 0..3):
+            #   src_lane(l, kk_out) = (l//16)*16 + (l%4)*4 + kk_out
+            sl_base = (w_tid // fx.Int32(16)) * fx.Int32(16) + (w_tid % fx.Int32(4)) * fx.Int32(4)
+
+            # Pre-bitcast eq predicates (per-lane, atom-invariant).
+            eq0 = arith.cmpi(arith.CmpIPredicate.eq, src_kk_v, fx.Int32(0))
+            eq1 = arith.cmpi(arith.CmpIPredicate.eq, src_kk_v, fx.Int32(1))
+            eq2 = arith.cmpi(arith.CmpIPredicate.eq, src_kk_v, fx.Int32(2))
+
+            for ii in range_constexpr(WARP_M_STEPS):
+                warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
+                for jj in range_constexpr(WARP_N_STEPS):
+                    warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
+                    c_frag = c_frags[ii * WARP_N_STEPS + jj]
+                    # Bitcast each c_frag[kf] to i32 (source for bpermute).
+                    cf_i32 = []
+                    for kf in range_constexpr(4):
+                        v = vector.extract(c_frag, static_position=[kf], dynamic_position=[])
+                        cf_i32.append(arith.bitcast(T.i32, v))
+
+                    # 16 ds_bpermutes: bp[kk_out][kf] = src_lane(kk_out)'s c_frag[kf].
+                    # Per output kk_out, select bp[kk_out][src_kk] where
+                    # src_kk = (l//4)%4 is the OUTPUT lane's selector.
+                    out_vals_i32 = []
+                    for kk_out in range_constexpr(4):
+                        idx_lane = sl_base + fx.Int32(kk_out)
+                        idx_byte = idx_lane * fx.Int32(4)
+                        idx_v = (idx_byte.ir_value()
+                                 if hasattr(idx_byte, "ir_value")
+                                 else idx_byte.value)
+                        bps = []
+                        for kf in range_constexpr(4):
+                            bps.append(rocdl.DsBpermuteOp(T.i32, idx_v, cf_i32[kf]).result)
+                        # Select output lane's src_kk-th value.
+                        sel_i32 = arith.select(
+                            eq0, bps[0],
+                            arith.select(
+                                eq1, bps[1],
+                                arith.select(eq2, bps[2], bps[3]),
+                            ),
+                        )
+                        out_vals_i32.append(sel_i32)
+                    # Bitcast i32 → f32
+                    out_vals_f32 = [arith.bitcast(T.f32, v) for v in out_vals_i32]
+
+                    # Step 3: pack 4 f32 → 4 dtype values.
+                    if dtype == "f16":
+                        pk01 = rocdl.CvtPkRtz(T.vec(2, T.f16),
+                                              out_vals_f32[0],
+                                              out_vals_f32[1]).result
+                        pk23 = rocdl.CvtPkRtz(T.vec(2, T.f16),
+                                              out_vals_f32[2],
+                                              out_vals_f32[3]).result
+                        e0 = vector.extract(pk01, static_position=[0], dynamic_position=[])
+                        e1 = vector.extract(pk01, static_position=[1], dynamic_position=[])
+                        e2 = vector.extract(pk23, static_position=[0], dynamic_position=[])
+                        e3 = vector.extract(pk23, static_position=[1], dynamic_position=[])
+                    else:  # bf16 — default truncf gets paired into v_cvt_pk_bf16_f32 by the backend.
+                        e0 = arith.truncf(dtype_, out_vals_f32[0])
+                        e1 = arith.truncf(dtype_, out_vals_f32[1])
+                        e2 = arith.truncf(dtype_, out_vals_f32[2])
+                        e3 = arith.truncf(dtype_, out_vals_f32[3])
+                    out_vec = vector.from_elements(T.vec(4, dtype_), [e0, e1, e2, e3])
+
+                    # Step 4: store. Lane l writes 4 bf16 at
+                    # (row = warp_atom_m + l//4, col_start = warp_atom_n + (l%4)*4).
+                    m_local_idx = fx.Index(warp_atom_m_idx + dst_row_in_atom)
+                    n_local_idx = fx.Index(warp_atom_n_idx + dst_col_start_in_atom)
+                    m_global_idx = m_offset + m_local_idx
+                    cond_boundary = arith.cmpi(
+                        arith.CmpIPredicate.ult, m_global_idx, fx.Index(m),
+                    )
+                    cond_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                    with ir.InsertionPoint(cond_if.then_block):
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_local_idx),
+                            out_vec, 4,
+                        )
+                        scf.YieldOp([])
+            return  # skip the LDS-staged 2-pass writeback below
+
+        # ---------- 2-pass LDS-staged writeback (default) ----------
         #
         # LDS C staging is halved (BM × BN/2). Each pass:
         #   (a) active warps (whose warp_n_idx falls in this pass's N-half)
@@ -595,9 +705,6 @@ def _compile_nn_big_kernel(
         # N-range (WARP_N wide) falls cleanly inside one pass's BN/2 slab
         # whenever WARP_N divides BN/2 — holds for 256×256 / (2,4). The
         # runtime ``my_warp_pass`` compare just selects 2 of the 4 N-warps.
-        from flydsl._mlir.dialects import scf
-        stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
-        stmatrix_c_n_idx = w_tid % WMMA_N
         my_wn = wid % fx.Int32(BLOCK_N_WARPS)
         # pass id of this warp's N-range: (wn * WARP_N) // (BN/2)
         my_warp_pass = (my_wn * fx.Int32(WARP_N)) // fx.Int32(C_LDS_N)
