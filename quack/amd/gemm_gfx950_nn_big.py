@@ -87,6 +87,46 @@ def _compile_nn_big_kernel(
     # non-MFMA gap measured in rocprofv3 at 8192×4096×16384 bf16:
     # +10-18% across all bench shapes vs LDS-staged.
     DIRECT_WRITE: bool = True,
+    # Pipeline depth (compute pipeline stages). 2 = default flow:
+    # HBM→LDS for next iter overlaps with MFMA, but LDS→regs is
+    # serialised after the iter's barrier.
+    #
+    # 3 = adds a third compute stage by ds_read'ing one extra iter
+    # ahead concurrently with MFMA; the prologue prefetches 2 iters
+    # into LDS so iter-k's ds_read targets a stage written 1 iter ago,
+    # not this iter — no internal barrier needed. STAGES (LDS double-
+    # buffering) stays at 2; the 3rd stage is register-prefetch.
+    #
+    # Status: implemented, opt-in only. Mirrors gluon-tutorials a16w16
+    # v5 (local_prefetch). On our 256×256 tile it currently regresses:
+    # at TILE_K=64 the doubled live-fragment set spills (the AMDGPU
+    # compiler doesn't move prefetch frags into AGPRs, so we hit the
+    # 256 VGPR cap and the hot loop scratch-loads 57 spills/iter); at
+    # TILE_K=32 there's no spill but the loop overhead from doubling
+    # the K-iter count costs more than the ds_read overlap saves.
+    # The gluon-tutorials path forward (v7-v8) requires N-slicing or
+    # MN-slicing the operand loads + a custom assembly post-processor
+    # to make the RA actually use all 512 unified VGPR+AGPR — out of
+    # scope without that tooling.
+    PIPELINE_DEPTH: int = 2,
+    # When True, splits the B-fragment LDS read into two N-halves and
+    # runs MFMA in two passes (cols 0..BN/2-1, then cols BN/2..BN-1).
+    # The first half's b_frags dies before the second half is loaded,
+    # so the register allocator only needs to keep half-B live at any
+    # given time. Mirrors gluon-tutorials a16w16 v7 (sliceN).
+    #
+    # Status: opt-in (default False). Saves only ~1 VGPR at the
+    # peak measured on our 8-warp 256×256 config and shows mixed
+    # bench results (-3% to +2%) — register pressure on this kernel
+    # is dominated by A-side fragments (16 frags vs 8 for B), which
+    # SLICE_N alone doesn't reduce. Combining with SLICE_M (the
+    # tutorial v8 path) plus an assembly post-processor (their
+    # ``amdgcnas``) is what brought their kernel to 98% MFMA
+    # efficiency — out of scope without that tooling.
+    #
+    # Implementation: only wired into the PIPELINE_DEPTH=2 path
+    # currently. PIPELINE_DEPTH=3 ignores this flag.
+    SLICE_N: bool = False,
     # Grid swizzle (OGS matmul_ogs pattern):
     #   XCD_SWIZZLE — redistribute adjacent pids across chiplets (MI355X
     #     has 8 XCDs). ``1`` disables.
@@ -511,6 +551,88 @@ def _compile_nn_big_kernel(
                             c_idx = ii * WARP_N_STEPS + jj
                             c_frags[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags[c_idx])
 
+        # ---------- N-slicing variants (SLICE_N=True) ----------
+        if SLICE_N:
+            assert WARP_N_STEPS % 2 == 0, "SLICE_N requires even WARP_N_STEPS"
+            HALF_N_STEPS = WARP_N_STEPS // 2
+
+        def lds_matrix_b_half(lds_stage, n_half):
+            """Like ``lds_matrix_b`` but loads only one N-half.
+
+            Returns ``WARP_K_STEPS * HALF_N_STEPS`` fragments. b_frags_half[
+            kk * HALF_N_STEPS + jj_local] = full lds_matrix_b's
+            [kk * WARP_N_STEPS + (n_half * HALF_N_STEPS + jj_local)].
+            """
+            s = fx.Index(lds_stage)
+            HALF = WARP_N_STEPS // 2
+            j_offset = n_half * HALF
+            b_frags_h = [0] * (WARP_K_STEPS * HALF)
+            FRAG = WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
+            v4_type = T.vec(4, dtype_)
+            v8_type = T.vec(FRAG, dtype_)
+            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            lb = w_tid % WMMA_N
+            sg = lb // 4
+            pr = lb % 4
+            block_offset = w_tid // WMMA_N
+            for kk in range_constexpr(WARP_K_STEPS):
+                for jj_local in range_constexpr(HALF):
+                    jj = j_offset + jj_local
+                    warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
+                    warp_atom_k_idx = kk * WARP_ATOM_K
+                    halves = []
+                    for r in range_constexpr(2):
+                        row = warp_atom_k_idx + block_offset * 8 + r * 4 + sg
+                        col = warp_atom_n_idx + pr * 4
+                        lds_byte_offset = bs_.linear_offset(
+                            (s, fx.Index(row), fx.Index(col))
+                        ) * DTYPE_BYTES
+                        lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr)
+                        lds_addr_idx = lds_base + lds_byte_offset
+                        lds_addr_i64 = arith.index_cast(T.i64, lds_addr_idx)
+                        lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_i64)
+                        v4 = rocdl.ds_read_tr16_b64(v4_type, lds_ptr).result
+                        halves.append(v4)
+                    elems = []
+                    for h in range_constexpr(2):
+                        for e in range_constexpr(4):
+                            elems.append(vector.extract(
+                                halves[h], static_position=[e], dynamic_position=[],
+                            ))
+                    vec = vector.from_elements(v8_type, elems)
+                    b_frags_h[kk * HALF + jj_local] = vec
+            return b_frags_h
+
+        def block_mma_sync_half(a_frags, b_frags_h, c_frags, n_half):
+            """Run MFMAs for one N-half. b_frags_h has WARP_K_STEPS * HALF
+            fragments; c_frags is the full output (we only update the half
+            corresponding to ``n_half``)."""
+            HALF = WARP_N_STEPS // 2
+            j_offset = n_half * HALF
+            for kk in range_constexpr(WARP_K_STEPS):
+                for ii in range_constexpr(WARP_M_STEPS):
+                    a_frag = a_frags[kk * WARP_M_STEPS + ii]
+                    for jj_local in range_constexpr(HALF):
+                        jj = j_offset + jj_local
+                        b_frag = b_frags_h[kk * HALF + jj_local]
+                        if MFMA_PER_WARP_K == 2:
+                            a_i64x2 = vector.bitcast(T.i64x2, a_frag)
+                            a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
+                            a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
+                            a_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a0_i64]))
+                            a_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a1_i64]))
+                            b_i64x2 = vector.bitcast(T.i64x2, b_frag)
+                            b0_i64 = vector.extract(b_i64x2, static_position=[0], dynamic_position=[])
+                            b1_i64 = vector.extract(b_i64x2, static_position=[1], dynamic_position=[])
+                            b_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b0_i64]))
+                            b_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64]))
+                            c_idx = ii * WARP_N_STEPS + jj
+                            acc_mid = WMMA_IMPL(a_v0, b_v0, c_frags[c_idx])
+                            c_frags[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
+                        else:
+                            c_idx = ii * WARP_N_STEPS + jj
+                            c_frags[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags[c_idx])
+
         def hot_loop_scheduler():
             MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
             LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
@@ -543,53 +665,215 @@ def _compile_nn_big_kernel(
                     rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
             rocdl.sched_barrier(0)
 
-        # ---------- Hot loop (prelude + scf.for over K) ----------
-
-        # Prelude: stage-0 loads for A and B.
+        # ---------- Hot loop ----------
         k_begin = arith.constant(0, type=T.i32)
-        if ASYNC_COPY:
-            ldg_sts_a_async(k_begin, 0)
-        else:
-            sts_a(ldg_a(k_begin), 0)
-        b_regs0 = ldg_b(k_begin)
-        sts_b(b_regs0, 0)
-        gpu.barrier()
-        a_frags = lds_matrix_a(0)
-        b_frags = lds_matrix_b(0)
-        rocdl.sched_barrier(0)
 
-        init_state = (
-            [k_begin, arith.constant(0, index=True)]
-            + c_frags + a_frags + b_frags
-        )
-        for _bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
-            k_offset = state[0]
-            current_stage = fx.Index(state[1])
-            next_stage = 1 - current_stage
-            c_frags = state[2 : 2 + C_FRAGS_LEN]
-            a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
-            b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
-            # Next K-tile loads (overlap with current MFMA).
+        if PIPELINE_DEPTH == 3:
+            # 3-stage compute pipeline. Each loop iter overlaps
+            # HBM→LDS (for iter k+2) + ds_read (for iter k+1) + MFMA
+            # (on iter k regs). STAGES=2 LDS suffices because iter k
+            # writes slot k%2 and reads slot (k+1)%2 — different
+            # slots — and the data being read was written 1 iter ago
+            # (the gpu.barrier at end of prev iter is the fence).
+            # Prologue must prefetch 2 iters before entering the
+            # steady loop; epilogue drains the last 2 MFMAs.
+
+            # Prologue: HBM→LDS iters 0 and 1, then ds_read iter 0.
             if ASYNC_COPY:
-                ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                ldg_sts_a_async(k_begin, 0)
             else:
-                a_regs_next = ldg_a(k_offset + BLOCK_K)
-            b_regs_next = ldg_b(k_offset + BLOCK_K)
-            block_mma_sync(a_frags, b_frags, c_frags)
-            if not ASYNC_COPY:
-                sts_a(a_regs_next, next_stage)
-            sts_b(b_regs_next, next_stage)
-            hot_loop_scheduler()
+                sts_a(ldg_a(k_begin), 0)
+            b_regs0 = ldg_b(k_begin)
+            sts_b(b_regs0, 0)
+
+            k_one = k_begin + fx.Int32(BLOCK_K)
+            if ASYNC_COPY:
+                ldg_sts_a_async(k_one, 1)
+            else:
+                sts_a(ldg_a(k_one), 1)
+            b_regs1 = ldg_b(k_one)
+            sts_b(b_regs1, 1)
+
             gpu.barrier()
-            a_frags_next = lds_matrix_a(next_stage)
-            b_frags_next = lds_matrix_b(next_stage)
-            k_offset = k_offset + fx.Int32(BLOCK_K)
+            a_frags = lds_matrix_a(0)
+            b_frags = lds_matrix_b(0)
             rocdl.sched_barrier(0)
-            results = yield [k_offset, next_stage] + c_frags + a_frags_next + b_frags_next
-        c_frags = results[2 : 2 + C_FRAGS_LEN]
-        a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
-        b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
-        block_mma_sync(a_frags, b_frags, c_frags)
+
+            # Steady loop: c_iter goes from 0 to BLOCK_K_LOOPS-3
+            # (BLOCK_K_LOOPS-2 iters total). Each iter:
+            #   * HBM→LDS iter (c_iter+2) → slot c_iter%2
+            #   * ds_read iter (c_iter+1) from slot (c_iter+1)%2 → next regs
+            #   * MFMA on iter c_iter regs
+            # state = [k_offset (= c_iter*BLOCK_K), c_iter%2,
+            #          c_frags, a_frags, b_frags]
+            init_state = (
+                [k_begin, arith.constant(0, index=True)]
+                + c_frags + a_frags + b_frags
+            )
+            STEADY_ITERS = BLOCK_K_LOOPS - 2
+            for _bki, state in range(0, STEADY_ITERS, init=init_state):
+                k_offset = state[0]
+                w_slot = fx.Index(state[1])         # c_iter % 2 — overwriting now-stale data
+                r_slot = 1 - w_slot                  # (c_iter+1) % 2 — has iter c_iter+1's data
+                c_frags = state[2 : 2 + C_FRAGS_LEN]
+                a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+                b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
+
+                # HBM→LDS iter c_iter+2 → w_slot.
+                k_load = k_offset + fx.Int32(2 * BLOCK_K)
+                if ASYNC_COPY:
+                    ldg_sts_a_async(k_load, w_slot)
+                else:
+                    a_regs_next = ldg_a(k_load)
+                b_regs_next = ldg_b(k_load)
+                # ds_read iter c_iter+1 from r_slot — overlaps with MFMA
+                # since the slots differ (no internal barrier).
+                a_frags_next = lds_matrix_a(r_slot)
+                b_frags_next = lds_matrix_b(r_slot)
+                # MFMA on iter c_iter regs.
+                block_mma_sync(a_frags, b_frags, c_frags)
+                if not ASYNC_COPY:
+                    sts_a(a_regs_next, w_slot)
+                sts_b(b_regs_next, w_slot)
+                hot_loop_scheduler()
+                gpu.barrier()
+                k_offset = k_offset + fx.Int32(BLOCK_K)
+                rocdl.sched_barrier(0)
+                # Toggle stage parity for next iter.
+                next_w_slot = 1 - w_slot
+                results = yield (
+                    [k_offset, next_w_slot] + c_frags + a_frags_next + b_frags_next
+                )
+            # Epilogue: drain last 2 MFMAs.
+            # After loop, regs hold iter (BLOCK_K_LOOPS - 2)'s data.
+            # Slot ((BLOCK_K_LOOPS - 1) % 2) holds iter BLOCK_K_LOOPS-1's data.
+            c_frags = results[2 : 2 + C_FRAGS_LEN]
+            a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+            b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
+            # MFMA on iter (BLOCK_K_LOOPS - 2)
+            block_mma_sync(a_frags, b_frags, c_frags)
+            # ds_read iter (BLOCK_K_LOOPS - 1) — prologue/loop already wrote it.
+            last_slot = (BLOCK_K_LOOPS - 1) % 2
+            a_frags_last = lds_matrix_a(last_slot)
+            b_frags_last = lds_matrix_b(last_slot)
+            block_mma_sync(a_frags_last, b_frags_last, c_frags)
+        elif SLICE_N:
+            # PIPELINE_DEPTH == 2 with N-slicing. Carry only half-B
+            # across iter boundary; load the other half mid-iter
+            # (after mma_h0 retires h0's regs). Halves peak B-frag
+            # register pressure.
+            HALF = WARP_N_STEPS // 2
+            B_FRAGS_H_LEN = WARP_K_STEPS * HALF
+
+            # Prologue: HBM→LDS iter 0; ds_read full A, only B-h0.
+            if ASYNC_COPY:
+                ldg_sts_a_async(k_begin, 0)
+            else:
+                sts_a(ldg_a(k_begin), 0)
+            b_regs0 = ldg_b(k_begin)
+            sts_b(b_regs0, 0)
+            gpu.barrier()
+            a_frags = lds_matrix_a(0)
+            b_frags_h0 = lds_matrix_b_half(0, 0)
+            rocdl.sched_barrier(0)
+
+            init_state = (
+                [k_begin, arith.constant(0, index=True)]
+                + c_frags + a_frags + b_frags_h0
+            )
+            for _bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
+                k_offset = state[0]
+                current_stage = fx.Index(state[1])
+                next_stage = 1 - current_stage
+                c_frags = state[2 : 2 + C_FRAGS_LEN]
+                a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+                b_frags_h0 = state[
+                    2 + C_FRAGS_LEN + A_FRAGS_LEN
+                    : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_H_LEN
+                ]
+                # HBM→LDS iter k → next_stage (overlaps with mma_h0).
+                if ASYNC_COPY:
+                    ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                else:
+                    a_regs_next = ldg_a(k_offset + BLOCK_K)
+                b_regs_next = ldg_b(k_offset + BLOCK_K)
+                # mma_h0 of iter k-1's data.
+                block_mma_sync_half(a_frags, b_frags_h0, c_frags, 0)
+                # b_frags_h0 dies here.
+                if not ASYNC_COPY:
+                    sts_a(a_regs_next, next_stage)
+                sts_b(b_regs_next, next_stage)
+                hot_loop_scheduler()
+                gpu.barrier()
+                # Load h1 of iter k-1 from current_stage (different from
+                # next_stage just written, no extra barrier needed).
+                b_frags_h1 = lds_matrix_b_half(current_stage, 1)
+                block_mma_sync_half(a_frags, b_frags_h1, c_frags, 1)
+                # b_frags_h1 dies.
+                # Load iter k's full A and h0-only B for next iter.
+                a_frags_next = lds_matrix_a(next_stage)
+                b_frags_next_h0 = lds_matrix_b_half(next_stage, 0)
+                k_offset = k_offset + fx.Int32(BLOCK_K)
+                rocdl.sched_barrier(0)
+                results = yield (
+                    [k_offset, next_stage] + c_frags + a_frags_next + b_frags_next_h0
+                )
+            # Drain: mma_h0 + load h1 + mma_h1 for the last iter.
+            c_frags = results[2 : 2 + C_FRAGS_LEN]
+            a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+            b_frags_h0 = results[
+                2 + C_FRAGS_LEN + A_FRAGS_LEN
+                : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_H_LEN
+            ]
+            block_mma_sync_half(a_frags, b_frags_h0, c_frags, 0)
+            last_stage = (BLOCK_K_LOOPS - 1) % 2
+            b_frags_h1_last = lds_matrix_b_half(last_stage, 1)
+            block_mma_sync_half(a_frags, b_frags_h1_last, c_frags, 1)
+        else:
+            # PIPELINE_DEPTH == 2 (default): single-iter lookahead, ds_read
+            # serialised after gpu.barrier. Original flow.
+            if ASYNC_COPY:
+                ldg_sts_a_async(k_begin, 0)
+            else:
+                sts_a(ldg_a(k_begin), 0)
+            b_regs0 = ldg_b(k_begin)
+            sts_b(b_regs0, 0)
+            gpu.barrier()
+            a_frags = lds_matrix_a(0)
+            b_frags = lds_matrix_b(0)
+            rocdl.sched_barrier(0)
+
+            init_state = (
+                [k_begin, arith.constant(0, index=True)]
+                + c_frags + a_frags + b_frags
+            )
+            for _bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
+                k_offset = state[0]
+                current_stage = fx.Index(state[1])
+                next_stage = 1 - current_stage
+                c_frags = state[2 : 2 + C_FRAGS_LEN]
+                a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+                b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
+                if ASYNC_COPY:
+                    ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                else:
+                    a_regs_next = ldg_a(k_offset + BLOCK_K)
+                b_regs_next = ldg_b(k_offset + BLOCK_K)
+                block_mma_sync(a_frags, b_frags, c_frags)
+                if not ASYNC_COPY:
+                    sts_a(a_regs_next, next_stage)
+                sts_b(b_regs_next, next_stage)
+                hot_loop_scheduler()
+                gpu.barrier()
+                a_frags_next = lds_matrix_a(next_stage)
+                b_frags_next = lds_matrix_b(next_stage)
+                k_offset = k_offset + fx.Int32(BLOCK_K)
+                rocdl.sched_barrier(0)
+                results = yield [k_offset, next_stage] + c_frags + a_frags_next + b_frags_next
+            c_frags = results[2 : 2 + C_FRAGS_LEN]
+            a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+            b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
+            block_mma_sync(a_frags, b_frags, c_frags)
 
         # ---------- Write-back ----------
         from flydsl._mlir.dialects import scf
