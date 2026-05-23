@@ -84,8 +84,8 @@ def _compile_nn_kernel(
     #     has 8 XCDs). ``1`` disables.
     #   GROUP_M — tile grouping along M for L2 B-matrix reuse across
     #     4 consecutive M-tiles sharing one N-tile load. ``1`` disables.
-    XCD_SWIZZLE: int = 8,
-    GROUP_M: int = 4,
+    XCD_SWIZZLE: int = 4,
+    GROUP_M: int = 1,
     _m_hint: int = 0,  # cache-key only; see splitk for grid-bake workaround rationale
 ):
     BLOCK_K = TILE_K
