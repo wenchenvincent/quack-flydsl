@@ -127,13 +127,23 @@ def _compile_nn_big_kernel(
     # Implementation: only wired into the PIPELINE_DEPTH=2 path
     # currently. PIPELINE_DEPTH=3 ignores this flag.
     SLICE_N: bool = False,
-    # Grid swizzle (OGS matmul_ogs pattern):
-    #   XCD_SWIZZLE — redistribute adjacent pids across chiplets (MI355X
-    #     has 8 XCDs). ``1`` disables.
+    # Grid swizzle:
+    #   XCD_SWIZZLE — number of XCDs (chiplets) to distribute work across.
+    #     MI355X has 8 XCDs. ``1`` disables.
+    #   XCD_CHUNK_SIZE — chunk granularity for XCD assignment, per
+    #     HipKittens Algorithm 1 (arxiv:2511.08083). Each XCD receives
+    #     consecutive chunks of this many tiles before cycling to the
+    #     next XCD. ``0`` falls back to the OGS-style scheme (= large
+    #     implicit chunk = total_tiles / XCD_SWIZZLE), giving each XCD
+    #     one big contiguous tile range. Small values (HK paper uses
+    #     4) keep concurrently-executing XCDs working on nearby tiles
+    #     so shared LLC (per-chiplet-pair on MI355X) hits more.
     #   GROUP_M — tile grouping along M for L2 B-matrix reuse across
-    #     4 consecutive M-tiles sharing one N-tile load. ``1`` disables.
-    XCD_SWIZZLE: int = 8,
-    GROUP_M: int = 4,
+    #     GROUP_M consecutive M-tiles sharing one N-tile load. Equivalent
+    #     to HipKittens' ``window_h``. ``1`` disables.
+    XCD_SWIZZLE: int = 4,
+    XCD_CHUNK_SIZE: int = 0,
+    GROUP_M: int = 1,
     _m_hint: int = 0,  # cache-key only; see splitk for grid-bake workaround rationale
 ):
     BLOCK_K = TILE_K
@@ -284,29 +294,63 @@ def _compile_nn_big_kernel(
 
         # 1D grid launch: block_idx.x is a flat tile id in [0, bm*bn).
         # Decode (block_m_idx, block_n_idx) via two-stage swizzle:
-        #   (1) xcd_swizzle — pulls adjacent pids onto different chiplets
-        #       (domain_size = bm*bn, XCD_SWIZZLE groups). Keeps per-XCD
-        #       tile assignment contiguous to preserve L2 locality there.
-        #   (2) swizzle2d — remaps flat pid to (pid_m, pid_n) grouping
-        #       GROUP_M consecutive M-tiles under the same pid_n block,
-        #       so B-matrix N-tile columns are reused across 4 M-tiles.
-        # Matches the OGS matmul_ogs pattern at cdna4. Constants (XCD=8,
-        # GROUP_M=4) match the AMD default opt-flags.
+        #   (1) xcd_swizzle — remap flat pid so adjacent hardware-pid
+        #       tiles end up on the right XCDs for cache locality.
+        #       Two modes:
+        #         XCD_CHUNK_SIZE == 0: OGS-style — each XCD gets one big
+        #           contiguous chunk (=total_tiles/XCD_SWIZZLE). Max
+        #           per-XCD L2 locality, minimal LLC cross-XCD sharing.
+        #         XCD_CHUNK_SIZE > 0: HipKittens Algorithm 1 — each XCD
+        #           gets multiple small chunks of CHUNK_SIZE tiles,
+        #           interleaved across cycles. Adjacent XCDs process
+        #           nearby tiles concurrently → LLC reuse for shared
+        #           operand rows.
+        #   (2) swizzle2d (GROUP_M) — remap flat pid to (pid_m, pid_n)
+        #       grouping GROUP_M consecutive M-tiles under each pid_n
+        #       block (= HK ``window_h``).
         flat_pid = fx.Int32(fx.block_idx.x)
         bn_c = fx.Int32(n // BLOCK_N)               # compile-time
         bm_rt = (m + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M)
         if XCD_SWIZZLE > 1:
             xcd_c = fx.Int32(XCD_SWIZZLE)
             total_tiles = bm_rt * bn_c
-            pids_per_group = total_tiles // xcd_c
-            extra_pids = total_tiles % xcd_c
-            xcd_group = flat_pid % xcd_c
-            xcd_local = flat_pid // xcd_c
-            min_ge = arith.select(
-                arith.cmpi(arith.CmpIPredicate.slt, xcd_group, extra_pids),
-                xcd_group, extra_pids,
-            )
-            pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
+            if XCD_CHUNK_SIZE > 0:
+                # HipKittens Algorithm 1 — chunk-based remap.
+                #   target_xcd = pid % XCD
+                #   local_index = pid // XCD
+                #   chunk_idx = local_index // CHUNK
+                #   position = local_index % CHUNK
+                #   remapped = chunk_idx*(XCD*CHUNK) + target_xcd*CHUNK + position
+                # Tail (linear_xy >= aligned_limit) passes through
+                # unchanged so we don't lose tiles.
+                chunk_c = fx.Int32(XCD_CHUNK_SIZE)
+                blocks_per_cycle = fx.Int32(XCD_SWIZZLE * XCD_CHUNK_SIZE)
+                aligned_limit = (total_tiles // blocks_per_cycle) * blocks_per_cycle
+                is_aligned = arith.cmpi(
+                    arith.CmpIPredicate.slt, flat_pid, aligned_limit,
+                )
+                target_xcd = flat_pid % xcd_c
+                local_index = flat_pid // xcd_c
+                chunk_idx = local_index // chunk_c
+                position = local_index % chunk_c
+                pid_aligned = (
+                    chunk_idx * blocks_per_cycle
+                    + target_xcd * chunk_c
+                    + position
+                )
+                pid = arith.select(is_aligned, pid_aligned, flat_pid)
+                pid = fx.Int32(pid)
+            else:
+                # OGS-style contiguous-chunk swizzle.
+                pids_per_group = total_tiles // xcd_c
+                extra_pids = total_tiles % xcd_c
+                xcd_group = flat_pid % xcd_c
+                xcd_local = flat_pid // xcd_c
+                min_ge = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.slt, xcd_group, extra_pids),
+                    xcd_group, extra_pids,
+                )
+                pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
         else:
             pid = flat_pid
         if GROUP_M > 1:
