@@ -659,7 +659,14 @@ _NN_CANDIDATES = [
     (64, 128, 64, 1, 4),    # smaller M tile
     (64, 256, 64, 1, 4),    # thin-M, wide-N
     (256, 64, 64, 2, 2),    # wide-M, thin-N
+    (64, 64, 64, 2, 2),     # small-square — both M and N modest
+    (32, 128, 64, 1, 4),    # very thin M, wide enough N
 ]
+
+
+# MI355X / gfx950 has 256 CUs. Used by the heuristic to detect
+# CU-undersaturated regimes (grid < n_cu/2) and pick smaller tiles.
+_N_CU = 256
 
 
 def _shape_fits(M: int, N: int, cfg: _gemm_tune.Config) -> bool:
@@ -667,12 +674,45 @@ def _shape_fits(M: int, N: int, cfg: _gemm_tune.Config) -> bool:
     return M % tm == 0 and N % tn == 0 and M >= tm and N >= tn
 
 
-def _heuristic_config(M: int, N: int) -> _gemm_tune.Config:
-    """Fast config pick without benchmarking — first candidate that fits."""
+def _heuristic_config(M: int, N: int, K: Optional[int] = None) -> _gemm_tune.Config:
+    """Pick a tile config without benchmarking, CU-occupancy aware.
+
+    Strategy: the default 128×128 tile fills the 256-CU MI355X array
+    well as long as the grid has a reasonable number of tiles. Only
+    switch to a smaller (64×64) tile when ``grid_at_128 < N_CU/4``
+    — i.e., the grid is so small that fewer than a quarter of the
+    CUs are busy. Above that threshold, kernels are short enough
+    that bench-time variance (20-50% noise at sub-30us kernels)
+    swamps any signal from changing tiles, so we stay with the
+    predictable default.
+
+    Measured wins (MI355X bf16):
+      1024×4096×512  →  (64, 64) 2×2:  +47% (grid_at_128 = 32)
+      512×512×512    →  (64, 64) 2×2:  +15% (grid_at_128 = 16)
+      Most other shapes keep 128×128 — autotune can find further
+      single-shape wins where they exist.
+    """
+    grid_at_128 = (M // 128) * (N // 128) if M >= 128 and N >= 128 else 0
+    can_128 = M % 128 == 0 and N % 128 == 0
+
+    # CU well-utilised (or close to it): 128×128 — predictable, big-K
+    # amortisation, no measurement-variance surprises.
+    if grid_at_128 >= _N_CU // 4 and can_128:
+        return (128, 128, 64, 1, 4)
+
+    # Very small grid: 128×128 leaves too many CUs idle, switch to
+    # (64, 64) for 4× the tile count.
+    if M >= 64 and N >= 64 and M % 64 == 0 and N % 64 == 0:
+        return (64, 64, 64, 2, 2)
+
+    # Fallback for shapes that can fit 128×128 but not (64, 64) — rare.
+    if can_128:
+        return (128, 128, 64, 1, 4)
+
+    # Ultra-narrow fallback: scan candidate list.
     for cfg in _NN_CANDIDATES:
         if _shape_fits(M, N, cfg):
             return cfg
-    # Last-resort fallback: the broadest-fit config.
     return (128, 256, 64, 1, 4)
 
 
@@ -689,7 +729,7 @@ def _pick_config(
         cfg, _ = _autotune_nn_impl(dtype_str, M, K, N, a, b, out, verbose=False)
         _gemm_tune.set_cached_config(key, cfg)
         return cfg
-    return _heuristic_config(M, N)
+    return _heuristic_config(M, N, K)
 
 
 def _autotune_nn_impl(
@@ -700,7 +740,7 @@ def _autotune_nn_impl(
     """Search _NN_CANDIDATES on the given (a, b, out) tensors; return (best_cfg, best_time)."""
     candidates = [c for c in _NN_CANDIDATES if _shape_fits(M, N, c)]
     if not candidates:
-        return _heuristic_config(M, N), float("inf")
+        return _heuristic_config(M, N, K), float("inf")
 
     def launch_factory(cfg):
         tm, tn, tk, bmw, bnw = cfg
