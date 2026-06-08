@@ -589,3 +589,95 @@ cycles, as the ATT analysis predicts?). If perf landslides at ~1050 TF/s,
 either upstream the `fly.lds_ptr_cast` op to FlyDSL or extend
 `raw_ptr_buffer_load_lds`'s Python wrapper to accept a fly.ptr and bridge
 internally.
+
+---
+
+## 2026-06-08 second implementation attempt — findings
+
+Spent another session on the LDS provenance fix. Got further than the
+2026-06-07 attempt but **still didn't deliver** the projected
+~1265 TF/s. New findings refine the design space.
+
+### What was tried
+
+1. **Replaced `memref.global` (via SmemAllocator) with `llvm.mlir.global`**
+   emitted at gpu.module scope. Inside the kernel, replaced `STensor`
+   with a custom shim that uses `llvm.mlir.addressof + llvm.getelementptr`
+   for both `ds_read` (via `llvm.load`) and `buffer_load_lds` destination
+   construction. Compile + correctness OK. **Perf dropped 1158 → 970 TF/s.**
+
+2. **Split into TWO `llvm.mlir.global`s** (one per LDS sub-region, AS and BS)
+   to satisfy `AMDGPULowerModuleLDSPass.cpp:1268` `if (NumberVars > 1)`
+   gate. Still got `alias.scope = 0` in the LLVM IR dump, and
+   `vmcnt(0)` drains in the ISA WENT UP from 10 → 13. **Perf dropped
+   further to 870 TF/s.**
+
+### What we learned about the AMDGPU lowering pipeline
+
+- **`AMDGPULowerModuleLDSPass` runs AFTER the MLIR-to-LLVM-IR dump
+  point**. The IR we dump at FlyDSL stage 20 (before
+  `gpu-module-to-binary`) does NOT yet have `alias.scope` metadata even
+  if the pass would eventually attach it.
+- **The pass attaches scopes via `refineUsesAlignmentAndAA`** (lines
+  1316-1319) but only on uses of the merged-struct GEP, not on arbitrary
+  loads/stores. Even with two globals, the merging behaviour for
+  `external` linkage globals appears to skip our access patterns.
+- **HipCC's C++ frontend emits IR with TBAA / `__restrict__`-derived
+  noalias metadata FROM THE START**. That carries through SIInsertWaitcnts
+  unchanged. Our FlyDSL-generated IR has no alias metadata, so even if
+  LowerModuleLDS attaches per-LDS-global scopes, SIInsertWaitcnts still
+  sees pending writes as potentially aliasing all ds_reads.
+- The `LDSDMAStores` tracking in SIInsertWaitcnts (`SIInsertWaitcnts.cpp:1216-1248`)
+  uses `MachineMemOperand` AAInfo. To populate that, the LLVM IR ds_read
+  load must already carry `!alias.scope` / `!noalias` metadata at IR
+  selection time.
+
+### The real fix path (revised)
+
+**The simple "swap memref.global to llvm.mlir.global" is NOT sufficient.**
+The full fix requires emitting `!alias.scope` and `!noalias` metadata
+explicitly on every LDS load/store and on the `buffer_load_lds` intrinsic
+call — mirroring what HipCC produces for C++ with `__restrict__`-tagged
+LDS pointers.
+
+In MLIR, this means using the **llvm dialect's
+`AliasAnalysisOpInterface`** — attributes like `alias_scopes`,
+`noalias_scopes`, and `tbaa` on `llvm.load`, `llvm.store`, and
+intrinsic call ops. The metadata pipeline:
+
+1. Emit a `#llvm.alias_scope_domain<id = ..., description = "kernel">`
+   at gpu.module level.
+2. Emit per-region `#llvm.alias_scope<id = ..., domain = ...,
+   description = "as_region">` and `"bs_region"`.
+3. On every `llvm.load` from `as_base`: attach
+   `alias_scopes = [#<as_scope>], noalias_scopes = [#<bs_scope>]`.
+4. On every `llvm.load` from `bs_base`: mirror.
+5. On every `rocdl.raw_ptr_buffer_load_lds` to `as_base`:
+   `alias_scopes = [#<as_scope>], noalias_scopes = [#<bs_scope>]`.
+6. Mirror for bs.
+
+### Effort estimate (revised)
+
+- **~6-10h** for the metadata-attaching helper + 16x32 kernel migration.
+- The helper would likely be reusable for other kernels (and could even
+  be upstreamed into FlyDSL).
+- Risk: metadata-driven aliasing analysis may still not provide partial
+  drains if SIInsertWaitcnts's `LDSDMAStores` slot-tracking can't
+  distinguish writes within a region.
+
+### Recommended next iteration
+
+Two options:
+
+1. **Try the metadata-attaching helper** (above). High confidence this
+   matches HK's mechanism but moderate uncertainty whether SIInsertWaitcnts
+   will use the metadata effectively for partial drains.
+2. **Just accept the 10% gap on 16x32**. The 32x16 kernel already beats
+   HK (1148 vs 1130 TF/s). The 16x32 is 9% behind HK (1158 vs 1272).
+   Diminishing returns on chasing this.
+
+If picking (1), the prototyping order should be:
+- Reproduce HK's IR shape for a tiny kernel (one buffer_load_lds + one
+  ds_read with explicit alias metadata) and verify `!alias.scope`
+  survives all the way to the ISA → `vmcnt(N)` partial drain.
+- If yes, apply to 16x32 kernel.
