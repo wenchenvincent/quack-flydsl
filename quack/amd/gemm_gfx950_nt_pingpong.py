@@ -348,32 +348,31 @@ def _compile_nt_pingpong_kernel(
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
-        # ----- Initial s_sleep is vestigial in this 1-barrier-per-iter design -----
-        # With only 1 gpu.barrier() per K-step, the compiler-driven ILP within
-        # one wave's instruction stream (aggressive reordering of async LDS
-        # loads and MFMAs) is what hides latency. A per-warp_row stagger
-        # is not load-bearing here.
-        #
-        # The fine-grained 4-barriers-per-iter HK design is in
-        # ``gemm_gfx950_nt_pingpong_16x32.py``. That kernel DOES use real
-        # stagger via ``if warp_row==1: gpu.barrier()`` (HK's conditional
-        # s_barrier — ATT-confirmed working at 1 WG/CU on gfx950) and runs
-        # at ~520 TF/s vs this kernel's ~1063. The gap is NOT staggering —
-        # the 16x32 stagger is healthy. It's the 16 barriers per K-step
-        # compounding with FlyDSL's inttoptr-based LDS pointer construction:
-        # LLVM auto-inserts a conservative ``s_waitcnt vmcnt(0)`` at every
-        # barrier (because alias-scope is lost), totaling ~6600 cyc/iter
-        # waitcnt vs ~1800 here. See
-        # ``docs/superpowers/specs/2026-06-04-flydsl-lds-provenance-todo.md``
-        # for the fix path.
+        # s_waitcnt bitfield (gfx9): bits[3:0]=vmcnt_lo, bits[6:4]=expcnt,
+        # bits[11:8]=lgkmcnt, bits[15:14]=vmcnt_hi. "No wait" on a field
+        # means encoding all-ones for that field.
+        VMCNT_0 = 0x0F70  # vmcnt=0, expcnt=7 (no wait), lgkmcnt=15 (no wait)
+
+        # ----- Initial s_sleep desync (vestigial in 1-barrier-per-iter) -----
+        # NOT HK's conditional s_barrier — that creates a stagger of one
+        # *barrier interval*, which here is a full K-step. Two warp groups
+        # would end up on different K-iterations and read mismatched LDS
+        # stages. The conditional s_barrier pattern only gives correct
+        # stagger when there are ≥2 barriers per K-step (1-cluster lag);
+        # this kernel has 1 barrier per K-step, so we keep s_sleep instead.
         if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
             rocdl.s_sleep(16)
 
         # ----- Prologue: HBM→LDS iter 0 → stage 0 -----
+        # Use bare ``rocdl.s_barrier()`` instead of ``gpu.barrier()`` to
+        # skip the release/acquire fence pair MLIR auto-inserts. The
+        # vmcnt(0) drain we DO need (so cross-wave LDS reads see the
+        # prefetched data) is explicit.
         k_begin = arith.constant(0, type=T.i32)
         ldg_sts_a_async(k_begin, 0)
         ldg_sts_b_async(k_begin, 0)
-        gpu.barrier()
+        rocdl.s_waitcnt(VMCNT_0)
+        rocdl.s_barrier()
 
         # ----- Main loop: 4 clusters per K-step -----
         BLOCK_K_LOOPS = k // BLOCK_K
@@ -401,8 +400,10 @@ def _compile_nt_pingpong_kernel(
             mma_kk(a_frags_kk1, b_frags_kk1, c_frags)
 
             # End-of-iter barrier: drains the async prefetches' vmcnt
-            # so the next iter's LDS reads see committed data.
-            gpu.barrier()
+            # so the next iter's LDS reads see committed data. Bare
+            # rocdl.s_barrier (no fence pair); explicit vmcnt(0) preserved.
+            rocdl.s_waitcnt(VMCNT_0)
+            rocdl.s_barrier()
 
             k_offset = k_offset + fx.Int32(BLOCK_K)
             rocdl.sched_barrier(0)

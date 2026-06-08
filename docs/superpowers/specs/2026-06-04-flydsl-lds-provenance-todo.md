@@ -21,7 +21,9 @@ drain take longer.
 ~5 min per kernel call site, but only safe if explicit
 `rocdl.s_waitcnt(vmcnt(N))` drains are in place for correctness.
 
-### Source 2: `SIInsertWaitcnts` unconditional drain at `s_barrier`
+### Source 2: ~~`SIInsertWaitcnts` unconditional drain at `s_barrier`~~ **WRONG — gfx950 has BackOffBarrier**
+
+**This section was originally wrong.** Corrected 2026-06-08:
 
 `SIInsertWaitcnts.cpp:2633-2636`:
 ```cpp
@@ -31,13 +33,32 @@ if (Opc == AMDGPU::S_BARRIER && !ST.hasAutoWaitcntBeforeBarrier() &&
 }
 ```
 
-gfx950 has neither `AutoWaitcntBeforeBarrier` nor `BackOffBarrier` HW
-features, so the compiler **unconditionally** forces `vmcnt(0)` before
-every `S_BARRIER`. Architectural; no software fix on gfx9.
+`FeatureISAVersion9_4_Common` (which `gfx950` → `ISAVersion9_5_0` →
+`ISAVersion9_5_Common` inherits from) **includes `FeatureBackOffBarrier`**
+(`llvm/lib/Target/AMDGPU/AMDGPU.td:1686`). So `hasBackOffBarrier()`
+returns true → the unconditional drain is **skipped**. `s_barrier` on
+gfx950 does NOT auto-drain `vmcnt(0)`.
 
-**Mitigation:** Reduce barrier count per iter. HK FP8 4-wave uses 2 barriers
-per iter, our original port had 4. Reducing to 2 in the HK 4-wave kernel
-(landed 2026-06-07) saved ~60 cyc/iter.
+The HK kernel pattern confirms this: HK uses `__builtin_amdgcn_s_barrier()`
+without an automatic drain, and only adds explicit `__builtin_amdgcn_s_waitcnt(0)`
+at the specific barriers that need it (see
+`HipKittens/kernels/gemm/bf16fp32/256_256_64_32_with32x16.cpp:88,118`).
+
+**Real Source 2 (the actual mechanism):** `gpu.barrier()` MLIR op lowers
+to `fence release(workgroup) + s_barrier + fence acquire(workgroup)`.
+The release fence forces ordering of prior memory ops to workgroup-visible
+memory before the barrier; for pending `buffer_load_lds` writes (which
+target LDS = workgroup-visible), SIInsertWaitcnts inserts `vmcnt(0)`
+before the fence to satisfy that ordering. This is per-`gpu.barrier()`,
+not per-`s_barrier`.
+
+**Mitigation = Fix A (= the real fix, not a workaround):** Replace
+`gpu.barrier()` with `rocdl.s_barrier()` and add explicit `rocdl.s_waitcnt(VMCNT_N)`
+drains ONLY where the data flow actually needs them. Landed 2026-06-08
+on `gemm_gfx950_nt_pingpong.py` (neutral perf, kernel has only 2 barriers
+per K-step and both need full vmcnt(0)). Bigger win expected on
+`gemm_gfx950_nt_pingpong_16x32.py` (16 barriers per K-step → ~6600 cyc/iter
+in waitcnt today).
 
 ### Source 3: `SIInsertWaitcnts` conservative drain before `ds_read` (LDS aliasing)
 

@@ -464,10 +464,10 @@ def _compile_nt_pingpong_16x32_kernel(
         # Closed at the END of the kernel with `if warp_row==0: barrier`
         # to re-sync.
         if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
-            gpu.barrier()
+            rocdl.s_barrier()
 
         rocdl.s_waitcnt(VMCNT_4)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         # ----- Prologue stage 2: load K-step 1 PARTIALLY into stage 1 -----
         # (Mirror HK lines 130-135: Bs[1][0], As[1][0], Bs[1][1]; As[1][1] is
@@ -477,7 +477,7 @@ def _compile_nt_pingpong_16x32_kernel(
         ldg_sts_b_half_async(BLOCK_K, 1, 1)
 
         rocdl.s_waitcnt(VMCNT_6)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         # ----- Main loop: 2 K-steps unrolled per iter, 8 LD/MMA clusters -----
         # Faithfully mirrors HK's k_16x32.cpp lines 139-251. Each iter processes
@@ -504,79 +504,79 @@ def _compile_nt_pingpong_16x32_kernel(
             a_h0_s0 = lds_matrix_a_half(0, 0)
             ldg_sts_a_half_async(k_now_b, 1, 1)
             rocdl.s_waitcnt(LGKMCNT_8)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA0: C[0][0]
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a_h0_s0, b_h0_s0, c_frags, 0)
-            gpu.barrier()
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
             # LD1: read B_h1 (stage 0); prefetch B_h0 of K-step 2k+2 into stage 0
             b_h1_s0 = lds_matrix_b_half(0, 1)
             ldg_sts_b_half_async(k_next_a, 0, 0)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA1: C[0][1]
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a_h0_s0, b_h1_s0, c_frags, 1)
-            gpu.barrier()
+            rocdl.s_barrier()
 
             # LD2: read A_h1 (stage 0); prefetch A_h0 of K-step 2k+2 into stage 0
             a_h1_s0 = lds_matrix_a_half(0, 1)
             ldg_sts_a_half_async(k_next_a, 0, 0)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA2: C[1][0]
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a_h1_s0, b_h0_s0, c_frags, 2)
-            gpu.barrier()
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
             # LD3: read B_h0 (stage 1) for K-step 2k+1; prefetch B_h1 of K-step 2k+2 into stage 0
             b_h0_s1 = lds_matrix_b_half(1, 0)
             ldg_sts_b_half_async(k_next_a, 0, 1)
             rocdl.s_waitcnt(VMCNT_6)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA3: C[1][1] — no lgkmcnt drain (regs already loaded)
             mma_quadrant(a_h1_s0, b_h1_s0, c_frags, 3)
-            gpu.barrier()
+            rocdl.s_barrier()
 
             # === K-step 2k+1 from stage 1 ===
             # LD0: read A_h0 (stage 1); prefetch A_h1 of K-step 2k+2 into stage 0
             a_h0_s1 = lds_matrix_a_half(1, 0)
             ldg_sts_a_half_async(k_next_a, 0, 1)
             rocdl.s_waitcnt(LGKMCNT_8)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA0
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a_h0_s1, b_h0_s1, c_frags, 0)
-            gpu.barrier()
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
             # LD1: read B_h1 (stage 1); prefetch B_h0 of K-step 2k+3 into stage 1
             b_h1_s1 = lds_matrix_b_half(1, 1)
             ldg_sts_b_half_async(k_next_b, 1, 0)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA1
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a_h0_s1, b_h1_s1, c_frags, 1)
-            gpu.barrier()
+            rocdl.s_barrier()
 
             # LD2: read A_h1 (stage 1); prefetch A_h0 of K-step 2k+3 into stage 1
             a_h1_s1 = lds_matrix_a_half(1, 1)
             ldg_sts_a_half_async(k_next_b, 1, 0)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA2
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a_h1_s1, b_h0_s1, c_frags, 2)
-            gpu.barrier()
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
             # LD3: NO ds_read; prefetch B_h1 of K-step 2k+3 into stage 1
             ldg_sts_b_half_async(k_next_b, 1, 1)
             rocdl.s_waitcnt(VMCNT_6)
-            gpu.barrier()
+            rocdl.s_barrier()
             # MMA3
             mma_quadrant(a_h1_s1, b_h1_s1, c_frags, 3)
-            gpu.barrier()
+            rocdl.s_barrier()
 
             results = yield [k_next_a] + c_frags
 
@@ -593,48 +593,48 @@ def _compile_nt_pingpong_16x32_kernel(
         b_h0_s0 = lds_matrix_b_half(0, 0)
         a_h0_s0 = lds_matrix_a_half(0, 0)
         ldg_sts_a_half_async(k_last_b, 1, 1)
-        gpu.barrier()
+        rocdl.s_barrier()
         # MMA0
         rocdl.s_waitcnt(LGKMCNT_0)
         mma_quadrant(a_h0_s0, b_h0_s0, c_frags, 0)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         # LD1
         b_h1_s0 = lds_matrix_b_half(0, 1)
-        gpu.barrier()
+        rocdl.s_barrier()
         # MMA1
         rocdl.s_waitcnt(LGKMCNT_0)
         mma_quadrant(a_h0_s0, b_h1_s0, c_frags, 1)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         # LD2: also need vmcnt drain so the A_h1 load from LD0 has committed.
         a_h1_s0 = lds_matrix_a_half(0, 1)
         rocdl.s_waitcnt(VMCNT_0)
-        gpu.barrier()
+        rocdl.s_barrier()
         # MMA2 + MMA3 fused (per HK epilogue 1)
         rocdl.s_waitcnt(LGKMCNT_0)
         mma_quadrant(a_h1_s0, b_h0_s0, c_frags, 2)
         mma_quadrant(a_h1_s0, b_h1_s0, c_frags, 3)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         # ----- Epilogue 2: K-step TOTAL_K_STEPS-1 from stage 1 -----
         # Mirror HK lines 295-330. Stage 1 fully loaded now (A_h1 was loaded
         # in epilogue 1).
         b_h0_s1 = lds_matrix_b_half(1, 0)
         a_h0_s1 = lds_matrix_a_half(1, 0)
-        gpu.barrier()
+        rocdl.s_barrier()
         rocdl.s_waitcnt(LGKMCNT_0)
         mma_quadrant(a_h0_s1, b_h0_s1, c_frags, 0)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         b_h1_s1 = lds_matrix_b_half(1, 1)
-        gpu.barrier()
+        rocdl.s_barrier()
         rocdl.s_waitcnt(LGKMCNT_0)
         mma_quadrant(a_h0_s1, b_h1_s1, c_frags, 1)
-        gpu.barrier()
+        rocdl.s_barrier()
 
         a_h1_s1 = lds_matrix_a_half(1, 1)
-        gpu.barrier()
+        rocdl.s_barrier()
         rocdl.s_waitcnt(LGKMCNT_0)
         mma_quadrant(a_h1_s1, b_h0_s1, c_frags, 2)
         mma_quadrant(a_h1_s1, b_h1_s1, c_frags, 3)
@@ -643,7 +643,7 @@ def _compile_nt_pingpong_16x32_kernel(
         # to re-sync with warp_row==1 before the writeback. Pairs with
         # the initial `if warp_row==1: barrier` in the prologue.
         if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(0)):
-            gpu.barrier()
+            rocdl.s_barrier()
 
         # =========================================================
         # Writeback: each c_frag is vec<4 x f32>. MFMA 16x16x32 output
