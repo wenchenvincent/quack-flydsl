@@ -29,7 +29,10 @@ Architecture (mirrors HipKittens ``256_256_64_32_with32x16.cpp``):
   - Async HBM → LDS via ``raw_ptr_buffer_load_lds`` for both A and B
     (both K-inner → symmetric load paths, no ``ds_read_tr16_b64`` needed
     for B's transpose unlike the NN kernel)
-  - AGPR passthrough (``amdgpu-agpr-alloc=128,128``) for accumulators
+  - No AGPR forcing — at 8 waves/WG and waves_per_eu=2, each wave has
+    256 VGPRs; the compiler fits everything in ~210-240 VGPRs with 0
+    AGPRs (HK's profile). Forcing AGPR=128,128 splits the unified pool
+    and costs ~6% perf via extra VGPR↔AGPR copies.
 
 Public API:
 
@@ -486,14 +489,18 @@ def _compile_nt_pingpong_kernel(
         total_tiles = bm * bn
         nt_kernel._func.__name__ = KERNEL_NAME
         launcher = nt_kernel(C, A, B, m)
-        # AGPR passthrough — let MFMA accumulators live in AGPRs, freeing
-        # VGPRs for operands. Mirrors the NN big kernel's mechanism.
-        passthrough_attr = ir.ArrayAttr.get([
-            ir.ArrayAttr.get([
-                ir.StringAttr.get("amdgpu-agpr-alloc"),
-                ir.StringAttr.get("128,128"),
-            ]),
-        ])
+        # With 8 waves/WG and waves_per_eu=2 we have 256 VGPRs/wave —
+
+        # the compiler can fit everything in VGPRs (~210-240). Forcing
+
+        # ``amdgpu-agpr-alloc=128,128`` (older NN-big pattern) splits the
+
+        # unified pool into 128 VGPR + 128 AGPR and adds VGPR↔AGPR copies
+
+        # per MFMA, costing ~6% perf. HK kernels run with VGPRs=210,
+
+        # AGPRs=0 — same profile we get when we let the compiler decide.
+        passthrough_attr = ir.ArrayAttr.get([])
         for op in ctx.gpu_module_body.operations:
             if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
                 op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)

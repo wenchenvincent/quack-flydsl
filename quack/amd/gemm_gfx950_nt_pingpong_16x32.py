@@ -707,12 +707,13 @@ def _compile_nt_pingpong_16x32_kernel(
         total_tiles = bm * bn
         nt_kernel_16x32._func.__name__ = KERNEL_NAME
         launcher = nt_kernel_16x32(C, A, B, m)
-        passthrough_attr = ir.ArrayAttr.get([
-            ir.ArrayAttr.get([
-                ir.StringAttr.get("amdgpu-agpr-alloc"),
-                ir.StringAttr.get("128,128"),
-            ]),
-        ])
+        # With 8 waves/WG and waves_per_eu=2 we have 256 VGPRs/wave —
+        # the compiler can fit everything in VGPRs (~210-240). Forcing
+        # ``amdgpu-agpr-alloc=128,128`` (older NN-big pattern) splits the
+        # unified pool into 128 VGPR + 128 AGPR and adds VGPR↔AGPR copies
+        # per MFMA, costing ~6% perf. HK kernels run with VGPRs=210,
+        # AGPRs=0 — same profile we get when we let the compiler decide.
+        passthrough_attr = ir.ArrayAttr.get([])
         for op in ctx.gpu_module_body.operations:
             if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
                 op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)
