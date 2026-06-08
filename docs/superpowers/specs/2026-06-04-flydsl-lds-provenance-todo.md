@@ -451,3 +451,120 @@ clearly identifies the pre-`ds_read` drains Fix B should eliminate.
      should drop from ~300-400 cyc each to ≤60 cyc each (becoming partial
      `vmcnt(N)` drains)
    - Total waitcnt cyc/iter should drop from 973 to ~285
+
+---
+
+## 2026-06-07 implementation attempt — findings
+
+Spent a session on Fix B (provenance for Source 3 / pre-`ds_read` drains).
+Did NOT land the fix; below are the concrete results so the next iteration
+can pick up cleanly.
+
+### What was done
+
+1. **Bumped `/workspace/FlyDSL` 150 commits** from `23f59ab2` to upstream
+   main `48170e30`. Local escape-hatch (`FLYDSL_EXTRA_LLC_OPTS` in
+   `python/flydsl/compiler/backends/rocm.py`) preserved through the merge.
+   Rebuilt incrementally via `scripts/build.sh` (~3 min on a warm cache).
+2. **Fixed AST-rewriter regression in HK kernel.** Upstream FlyDSL's
+   `_is_constexpr` is strict — only recognises `const_expr(...)` calls.
+   Plain `if PY_CONST:` patterns now dispatch through `scf_if_dispatch`,
+   and variables first-defined-inside-a-branch don't escape. Wrapped two
+   sites in `fx.const_expr(...)`:
+   - `gemm_gfx950_nt_4wave_hk.py:192` (`XCD_SWIZZLE > 1`)
+   - `gemm_gfx950_nt_4wave_hk.py:206` (`GROUP_M > 1`)
+3. **Confirmed upstream `fly.get_dyn_shared` already has the right
+   lowering**: `llvm.mlir.global + addressof + getelementptr`
+   (`tests/mlir/Conversion/dyn_shared.mlir:6`).
+4. **Tried `llvm.mlir.addressof @<sym>` of the `memref.global`** that
+   `SmemAllocator` emits → MLIR verifier rejects (`addressof` requires
+   `llvm.mlir.global`).
+5. **Tried `fx.get_dyn_shared` + `builtin.unrealized_conversion_cast`** to
+   bridge `fly.ptr<i8, shared>` → `!llvm.ptr<3>` for `buffer_load_lds`. The
+   conversion framework inserts an inverse cast on the same value (because
+   `fly.get_dyn_shared`'s lowering does `replaceOp(op, llvm_ptr_val)` which
+   updates user types) and **both casts remain live** post-conversion:
+   ```
+   failed to legalize unresolved materialization from
+   '!llvm.ptr<3>' to '!fly.ptr<i8, shared, align<1024>>'
+   ```
+6. **Reverted to the pre-migration kernel** + kept only the const_expr
+   fixes. Bench at 8192³ bf16: **845 TF/s** (vs 856 pre-bump, ~1.3%
+   regression purely from the FlyDSL bump).
+
+### Why the upstream FlyDSL infrastructure isn't a drop-in
+
+Upstream FlyDSL kernels that use `fly.get_dyn_shared` (e.g. `kernels/preshuffle_gemm_v2.py`)
+go through the high-level `fx.copy`/`fx.gemm` ops, not the low-level
+`rocdl.raw_ptr_buffer_load_lds` intrinsic. The high-level ops are fly
+dialect ops that get lowered to `buffer_load_lds` at fly-to-rocdl
+conversion time, so the LDS pointer **stays in fly-land until lowering**
+and the conversion handles the type bridge cleanly.
+
+QuACK's HK kernel calls `rocdl.raw_ptr_buffer_load_lds` directly with an
+`!llvm.ptr<3>` operand for fine-grained control over scheduling and
+warp-uniformity. This direct intrinsic call **doesn't go through fly-to-rocdl
+conversion** — the rocdl op is already in the legal target dialect — so
+there's no clean way to bridge a fly.ptr to its llvm.ptr<3> operand at
+MLIR-build time.
+
+`kernels/splitk_hgemm.py:491-492` confirms upstream also doesn't have a
+clean answer here — it uses the same legacy
+`memref.extract_aligned_pointer_as_index + create_llvm_ptr` (= inttoptr)
+pattern as QuACK, with the same provenance loss.
+
+### Three real paths forward (none are <1h)
+
+**Path P1 — High-level `fx.copy` migration (idiomatic, biggest refactor).**
+Replace direct `rocdl.raw_ptr_buffer_load_lds` calls with `fx.copy` +
+`fx.rocdl.BufferCopy128b` atoms; replace direct `ds_read` (via
+`vector.load_op` on STensor) with `fx.copy` from LDS-typed pointers; replace
+explicit MFMA driver with `fx.gemm`. ~6-12h, large surface, but matches
+upstream patterns and unlocks future FlyDSL improvements automatically.
+
+**Path P2 — Custom fly op for LDS-ptr-to-llvm-ptr bridge.**
+Add a `fly.lds_ptr_cast` op (Fly_Pointer → AnyType:llvm.ptr) with a trivial
+FlyToROCDL lowering pattern (`replaceOp(op, adaptor.getSrc())` — the type
+converter already maps fly.ptr<i8,shared> to llvm.ptr<3>). Use it in QuACK
+HK kernel:
+```python
+shared_base_fly = fx.get_dyn_shared()
+shared_base_llvm = fx.lds_ptr_cast(llvm_ptr_3_ty, shared_base_fly)
+# GEP from shared_base_llvm with byte offsets; feed to raw_ptr_buffer_load_lds
+```
+FlyOps.td + FlyToROCDL.cpp work (~150 LOC) + Python wrapper (~20 LOC) +
+QuACK rewrite of LDS access in HK kernel (~50 LOC). ~3-5h. Smallest viable
+change to FlyDSL; isolated to one new op.
+
+**Path P3 — Replace `SmemAllocator` with direct `llvm.GlobalOp` emit.**
+Emit `llvm.mlir.global @<sym> external addr_space(3)` at gpu.module level
+(navigating to ctx.gpu_module_body from inside the kernel function).
+Replace STensor's `vector.load_op` on memref with direct `llvm.load`
+from GEPed `!llvm.ptr<3>`. Self-contained to QuACK (no FlyDSL changes).
+~2-3h, but STensor is shared with many other AMD kernels so the change has
+to be opt-in.
+
+### Other breakage uncovered by the bump
+
+Filed for follow-up audits — the bumped FlyDSL is stricter and surfaces
+real bugs that the older version silently accepted:
+
+- `tests/amd/test_rmsnorm.py` — fails on `w_div` (defined-in-branch-only;
+  needs either `const_expr(...)` wraps on `if per_head:` / `else:` or
+  outer-scope pre-initialisation of `w_div`).
+- `tests/amd/test_gemm_4wave_lds_pp.py[bf16]` — fails because
+  `rocdl.mfma.f32.16x16x16f16` now strictly rejects bf16 operands. The
+  kernel was using the f16 intrinsic for bf16; either switch to
+  `mfma_f32_16x16x16bf16` or use the K=32 atom (`mfma.f32.16x16x32bf16`).
+- ~50 other `if PY_CONST:` sites across AMD kernels (`gemm_gfx950_nn_big.py`
+  has 12, `gemm.py` has 8, etc.) — same const_expr fix as the HK kernel
+  needed wherever a var is first-defined-in-branch.
+
+### Recommended next iteration
+
+Path P2 is the smallest path to validate the perf hypothesis (does
+addressof+GEP for `buffer_load_lds` actually drop the pre-`ds_read` drain
+cycles, as the ATT analysis predicts?). If perf landslides at ~1050 TF/s,
+either upstream the `fly.lds_ptr_cast` op to FlyDSL or extend
+`raw_ptr_buffer_load_lds`'s Python wrapper to accept a fly.ptr and bridge
+internally.

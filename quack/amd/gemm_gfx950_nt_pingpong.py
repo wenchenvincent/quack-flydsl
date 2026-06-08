@@ -16,8 +16,16 @@ Architecture (mirrors HipKittens ``256_256_64_32_with32x16.cpp``):
   - K-step: 64, split into 2 sub-K iters of DOT_SLICE = 32 each
   - 8 warps in 2×4 grid (warp_row, warp_col) — each owns 128 × 64
   - 4 clusters per K-step: (load-kk0, MFMA-kk0, load-kk1, MFMA-kk1)
-  - Initial desync via ``s_sleep`` on warp_row==1 (HK uses conditional
-    s_barrier which requires 2-WG/CU residency; s_sleep works at 1 WG/CU)
+  - Initial desync via vestigial ``s_sleep`` on warp_row==1; with only
+    1 barrier per K-step the compiler-driven ILP within a single wave's
+    instruction stream is what does most of the work, so the desync is
+    not load-bearing for THIS kernel. (HK's conditional ``s_barrier``
+    pattern — ``if warp_row==1: s_barrier()`` — actually DOES work at
+    1 WG/CU on gfx950: warp_row==1 waves take the extra barrier and
+    pair with warp_row==0's next barrier through the shared WG counter.
+    ATT-verified in ``gemm_gfx950_nt_pingpong_16x32.py``. Earlier
+    speculation that the conditional pattern required 2 WG/CU was
+    wrong; both mechanisms work at 1 WG/CU.)
   - ``s_setprio(1)/(0)`` wrapping each MFMA
   - MFMA atom: ``mfma_f32_16x16x32_bf16`` (K=32 per atom, matches DOT_SLICE)
   - Async HBM → LDS via ``raw_ptr_buffer_load_lds`` for both A and B
@@ -165,7 +173,7 @@ def _compile_nt_pingpong_kernel(
         flat_pid = fx.Int32(fx.block_idx.x)
         bn_c = fx.Int32(n // BLOCK_N)
         bm_rt = (m + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M)
-        if XCD_SWIZZLE > 1:
+        if fx.const_expr(XCD_SWIZZLE > 1):
             xcd_c = fx.Int32(XCD_SWIZZLE)
             total_tiles = bm_rt * bn_c
             pids_per_group = total_tiles // xcd_c
@@ -179,7 +187,7 @@ def _compile_nt_pingpong_kernel(
             pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
         else:
             pid = flat_pid
-        if GROUP_M > 1:
+        if fx.const_expr(GROUP_M > 1):
             gm_c = fx.Int32(GROUP_M)
             width = gm_c * bn_c
             group_id = pid // width
@@ -340,15 +348,24 @@ def _compile_nt_pingpong_kernel(
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
-        # ----- Initial s_sleep is vestigial — kernel runs lockstep -----
-        # The 1-K-step kernel uses async HBM→LDS + ILP within one wave's
-        # instruction stream (compiler reorders aggressively). It is NOT
-        # a real pingpong kernel — see docstring. We tried real HK-style
-        # 4-barrier-per-iter staggering and got 833 TF/s vs current 1066;
-        # LLVM auto-inserts conservative vmcnt drains around every barrier
-        # because FlyDSL's inttoptr-based LDS pointer construction breaks
-        # alias-scope tracking. This kernel's compiler-friendly schedule
-        # (1 barrier per iter) is what makes it fast.
+        # ----- Initial s_sleep is vestigial in this 1-barrier-per-iter design -----
+        # With only 1 gpu.barrier() per K-step, the compiler-driven ILP within
+        # one wave's instruction stream (aggressive reordering of async LDS
+        # loads and MFMAs) is what hides latency. A per-warp_row stagger
+        # is not load-bearing here.
+        #
+        # The fine-grained 4-barriers-per-iter HK design is in
+        # ``gemm_gfx950_nt_pingpong_16x32.py``. That kernel DOES use real
+        # stagger via ``if warp_row==1: gpu.barrier()`` (HK's conditional
+        # s_barrier — ATT-confirmed working at 1 WG/CU on gfx950) and runs
+        # at ~520 TF/s vs this kernel's ~1063. The gap is NOT staggering —
+        # the 16x32 stagger is healthy. It's the 16 barriers per K-step
+        # compounding with FlyDSL's inttoptr-based LDS pointer construction:
+        # LLVM auto-inserts a conservative ``s_waitcnt vmcnt(0)`` at every
+        # barrier (because alias-scope is lost), totaling ~6600 cyc/iter
+        # waitcnt vs ~1800 here. See
+        # ``docs/superpowers/specs/2026-06-04-flydsl-lds-provenance-todo.md``
+        # for the fix path.
         if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
             rocdl.s_sleep(16)
 

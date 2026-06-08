@@ -184,7 +184,7 @@ def _compile_nt_pingpong_16x32_kernel(
         flat_pid = fx.Int32(fx.block_idx.x)
         bn_c = fx.Int32(n // BLOCK_N)
         bm_rt = (m + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M)
-        if XCD_SWIZZLE > 1:
+        if fx.const_expr(XCD_SWIZZLE > 1):
             xcd_c = fx.Int32(XCD_SWIZZLE)
             total_tiles = bm_rt * bn_c
             pids_per_group = total_tiles // xcd_c
@@ -198,7 +198,7 @@ def _compile_nt_pingpong_16x32_kernel(
             pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
         else:
             pid = flat_pid
-        if GROUP_M > 1:
+        if fx.const_expr(GROUP_M > 1):
             gm_c = fx.Int32(GROUP_M)
             width = gm_c * bn_c
             group_id = pid // width
