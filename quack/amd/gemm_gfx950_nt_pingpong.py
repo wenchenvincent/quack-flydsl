@@ -16,16 +16,14 @@ Architecture (mirrors HipKittens ``256_256_64_32_with32x16.cpp``):
   - K-step: 64, split into 2 sub-K iters of DOT_SLICE = 32 each
   - 8 warps in 2×4 grid (warp_row, warp_col) — each owns 128 × 64
   - 4 clusters per K-step: (load-kk0, MFMA-kk0, load-kk1, MFMA-kk1)
-  - Initial desync via vestigial ``s_sleep`` on warp_row==1; with only
-    1 barrier per K-step the compiler-driven ILP within a single wave's
-    instruction stream is what does most of the work, so the desync is
-    not load-bearing for THIS kernel. (HK's conditional ``s_barrier``
-    pattern — ``if warp_row==1: s_barrier()`` — actually DOES work at
-    1 WG/CU on gfx950: warp_row==1 waves take the extra barrier and
-    pair with warp_row==0's next barrier through the shared WG counter.
-    ATT-verified in ``gemm_gfx950_nt_pingpong_16x32.py``. Earlier
-    speculation that the conditional pattern required 2 WG/CU was
-    wrong; both mechanisms work at 1 WG/CU.)
+  - Initial desync via HK's conditional ``s_barrier`` on warp_row==1.
+    The 4 barriers per K-step structure gives a per-cluster rhythm; the
+    extra warp_row==1 barrier in the prologue pairs with warp_row==0's
+    next barrier through the shared WG counter, locking the two groups
+    one cluster out-of-phase forever after. Result: when warp_row==0 is
+    MFMA-busy, warp_row==1 is LDS-busy, and vice versa — true pingpong.
+    Works at 1 WG/CU on gfx950 (ATT-verified, both here and in the
+    sibling 16x32 kernel).
   - ``s_setprio(1)/(0)`` wrapping each MFMA
   - MFMA atom: ``mfma_f32_16x16x32_bf16`` (K=32 per atom, matches DOT_SLICE)
   - Async HBM → LDS via ``raw_ptr_buffer_load_lds`` for both A and B
@@ -332,7 +330,7 @@ def _compile_nt_pingpong_kernel(
         # =========================================================
         # Helper: MFMA for one sub-K. Wraps with s_setprio(1)/(0)
         # for the HK ping-pong (asymmetric wave population biased
-        # by the warp_row==1 initial s_sleep).
+        # by the warp_row==1 prologue conditional s_barrier).
         # =========================================================
         def mma_kk(a_frags, b_frags, c_frags):
             rocdl.s_setprio(1)
@@ -351,17 +349,8 @@ def _compile_nt_pingpong_kernel(
         # s_waitcnt bitfield (gfx9): bits[3:0]=vmcnt_lo, bits[6:4]=expcnt,
         # bits[11:8]=lgkmcnt, bits[15:14]=vmcnt_hi. "No wait" on a field
         # means encoding all-ones for that field.
-        VMCNT_0 = 0x0F70  # vmcnt=0, expcnt=7 (no wait), lgkmcnt=15 (no wait)
-
-        # ----- Initial s_sleep desync (vestigial in 1-barrier-per-iter) -----
-        # NOT HK's conditional s_barrier — that creates a stagger of one
-        # *barrier interval*, which here is a full K-step. Two warp groups
-        # would end up on different K-iterations and read mismatched LDS
-        # stages. The conditional s_barrier pattern only gives correct
-        # stagger when there are ≥2 barriers per K-step (1-cluster lag);
-        # this kernel has 1 barrier per K-step, so we keep s_sleep instead.
-        if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
-            rocdl.s_sleep(16)
+        VMCNT_0 = 0x0F70   # vmcnt=0, expcnt=7 (no wait), lgkmcnt=15 (no wait)
+        LGKMCNT_0 = 0xC07F  # vmcnt=63 (no wait), lgkmcnt=0
 
         # ----- Prologue: HBM→LDS iter 0 → stage 0 -----
         # Use bare ``rocdl.s_barrier()`` instead of ``gpu.barrier()`` to
@@ -374,7 +363,33 @@ def _compile_nt_pingpong_kernel(
         rocdl.s_waitcnt(VMCNT_0)
         rocdl.s_barrier()
 
-        # ----- Main loop: 4 clusters per K-step -----
+        # ----- HK-style conditional s_barrier desync -----
+        # Mirrors HipKittens 256_256_64_32_with32x16.cpp:91-93. The 4
+        # barriers per K-step below (B1..B4) create a cluster-by-cluster
+        # rhythm; the extra barrier on warp_row==1 here pairs with
+        # warp_row==0's next barrier through the WG arrival counter, so
+        # the two groups run exactly one cluster out-of-phase forever
+        # after — true pingpong shape. When warp_row==0 is MFMA-busy
+        # (cluster 1 or 3), warp_row==1 is LDS-busy (cluster 0 or 2),
+        # and vice versa. ATT-verified to work at 1 WG/CU on gfx950
+        # (see ``gemm_gfx950_nt_pingpong_16x32.py`` for the prior
+        # verification). DEPENDS on the 4-barriers-per-iter structure
+        # below — with the previous 1-barrier-per-iter design this
+        # mechanism produces a full-K-step stagger and breaks
+        # correctness (NaN output from mismatched LDS stages).
+        if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
+            rocdl.s_barrier()
+
+        # ----- Main loop: 4 barriers per K-step (HK pingpong shape) -----
+        # Mirrors HK's ``256_256_64_32_with32x16.cpp:95-124``:
+        #   Cluster 0: ds_read kk=0 + buffer_load_lds prefetch -> B1
+        #   Cluster 1: lgkmcnt(0) + MFMA kk=0                  -> B2
+        #   Cluster 2: ds_read kk=1                            -> vmcnt(0) -> B3
+        #   Cluster 3: lgkmcnt(0) + MFMA kk=1                  -> B4
+        # The vmcnt(0) sits before B3 (not B4) so cluster 0's DMA writes
+        # are drained one cluster early — by the time r1 (one cluster
+        # behind r0) starts NEXT iter's cluster 0 LDS reads, both warp
+        # groups' DMA writes have committed.
         BLOCK_K_LOOPS = k // BLOCK_K
         init_state = [k_begin, arith.constant(0, index=True)] + c_frags
         for _bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
@@ -383,26 +398,29 @@ def _compile_nt_pingpong_kernel(
             next_stage = 1 - current_stage
             c_frags = state[2 : 2 + C_FRAGS_LEN]
 
-            # Cluster 0: load kk=0 operands + prefetch HBM for next iter.
+            # Cluster 0: ds_read kk=0 + HBM→LDS prefetch for next iter.
             a_frags_kk0 = lds_matrix_a_kk(current_stage, 0)
             b_frags_kk0 = lds_matrix_b_kk(current_stage, 0)
             ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
             ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
+            rocdl.s_barrier()
 
-            # Cluster 1: MFMA on kk=0 (setprio inside mma_kk).
+            # Cluster 1: MFMA on kk=0. Drain lgkmcnt so ds_reads land first.
+            rocdl.s_waitcnt(LGKMCNT_0)
             mma_kk(a_frags_kk0, b_frags_kk0, c_frags)
+            rocdl.s_barrier()
 
-            # Cluster 2: load kk=1 operands from current_stage.
+            # Cluster 2: ds_read kk=1 from current_stage. vmcnt(0) drains
+            # cluster 0's DMA writes (committed before next iter's cluster
+            # 0 reads them).
             a_frags_kk1 = lds_matrix_a_kk(current_stage, 1)
             b_frags_kk1 = lds_matrix_b_kk(current_stage, 1)
+            rocdl.s_waitcnt(VMCNT_0)
+            rocdl.s_barrier()
 
             # Cluster 3: MFMA on kk=1.
+            rocdl.s_waitcnt(LGKMCNT_0)
             mma_kk(a_frags_kk1, b_frags_kk1, c_frags)
-
-            # End-of-iter barrier: drains the async prefetches' vmcnt
-            # so the next iter's LDS reads see committed data. Bare
-            # rocdl.s_barrier (no fence pair); explicit vmcnt(0) preserved.
-            rocdl.s_waitcnt(VMCNT_0)
             rocdl.s_barrier()
 
             k_offset = k_offset + fx.Int32(BLOCK_K)
