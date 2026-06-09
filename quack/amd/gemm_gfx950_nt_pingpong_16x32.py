@@ -41,9 +41,7 @@ from flydsl._mlir.dialects import llvm, memref
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-from quack.amd.flydsl_tensor_shim import GTensor, STensor, get_dtype_in_kernel
+from quack.amd.flydsl_tensor_shim import GTensor, get_dtype_in_kernel
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.gemm_gfx950_mfma_core import _WmmaHalfK32, swizzle_xor16
 
@@ -130,30 +128,28 @@ def _compile_nt_pingpong_16x32_kernel(
 
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
-    # ----- LDS allocation -----
-    # Attempted: 8 separate ``memref.global`` (one per subregion) to get
-    # ``AMDGPULowerModuleLDSPass`` to attach distinct alias scopes per
-    # subregion. Didn't work — FlyDSL's ``raw_ptr_buffer_load_lds``
-    # constructs the LDS pointer via ``inttoptr(extract_aligned_pointer_as_index
-    # + offset)`` (see flydsl/expr/rocdl/__init__.py:386-393), which destroys
-    # provenance. The buffer_load_lds intrinsic call ends up with no
-    # ``!alias.scope`` metadata, so ``SIInsertWaitcnts`` falls back to
-    # the conservative all-LDS-aliasing path either way. To unlock this
-    # optimization upstream, FlyDSL would need to expose a memref→llvm.ptr<3>
-    # path that doesn't go through int.
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=GPU_ARCH,
-        global_sym_name=f"nt_pp16x32_smem_{dtype}_{k}_{n}",
+    # ----- LDS allocation — per-stage globals + alias scopes -----
+    # Four LDS globals: A staging × 2 stages, B staging × 2 stages. Each
+    # stage gets its own ``llvm.mlir.global`` + its own alias scope.
+    # ds_reads of stage N never alias pending buffer_load_lds writes to
+    # stage N^1, so SIInsertWaitcnts can emit partial vmcnt(N) drains
+    # instead of conservative vmcnt(0) before every cluster boundary.
+    # Per-region (only 2 scopes) was tried first and didn't reduce drains
+    # because pingpong reads stage N from AS while writing stage N^1 to AS
+    # — same scope. The compile-time-known stage at each call site lets
+    # us specialise to 4 distinct scopes.
+    AS_STAGE_BYTES = BLOCK_M * BLOCK_K * DTYPE_BYTES
+    BS_STAGE_BYTES = BLOCK_N * BLOCK_K * DTYPE_BYTES
+    LDS_SYMS_A = (
+        f"nt_pp16x32_smem_as0_{dtype}_{k}_{n}",
+        f"nt_pp16x32_smem_as1_{dtype}_{k}_{n}",
     )
-
-    smem_a_offset = allocator._align(allocator.ptr, 16)
-    AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_a_offset + AS_BYTES
-
-    smem_b_offset = allocator._align(allocator.ptr, 16)
-    BS_BYTES = STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_b_offset + BS_BYTES
+    LDS_SYMS_B = (
+        f"nt_pp16x32_smem_bs0_{dtype}_{k}_{n}",
+        f"nt_pp16x32_smem_bs1_{dtype}_{k}_{n}",
+    )
+    LDS_ALIAS_DOMAIN = f'#llvm.alias_scope_domain<id = "nt_pp16x32_{dtype}_{k}_{n}.lds">'
+    SCOPE_IDS = ("as0", "as1", "bs0", "bs1")
 
     BLOCK_K_LOOPS_HINT = max(1, k // BLOCK_K)
 
@@ -169,12 +165,89 @@ def _compile_nt_pingpong_16x32_kernel(
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))     # (N, K) K-inner — NT
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))    # (M, N) N-inner
 
-        # ----- LDS descriptors -----
-        base_ptr = allocator.get_base()
-        smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
-        as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
-        bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
+        # ----- LDS descriptors (provenance + per-stage alias scopes) -----
+        _LDS_PTR_TY = ir.Type.parse("!llvm.ptr<3>")
+        _I8_TY = T.i8
+        _GEP_DYN = -(2 ** 31)
+
+        def _gep_lds(base_ptr, byte_offset_i32):
+            return llvm.getelementptr(
+                _LDS_PTR_TY, base_ptr, [byte_offset_i32], [_GEP_DYN], _I8_TY, None,
+            )
+
+        def _scope_attr(ids):
+            # Build a `[#llvm.alias_scope<id="x", domain=...>, ...]` ArrayAttr.
+            inner = ", ".join(
+                f'#llvm.alias_scope<id = "{i}", domain = {LDS_ALIAS_DOMAIN}>'
+                for i in ids
+            )
+            return ir.Attribute.parse(f"[{inner}]")
+
+        _SCOPE = {sid: _scope_attr((sid,)) for sid in SCOPE_IDS}
+        _NOALIAS = {sid: _scope_attr(tuple(o for o in SCOPE_IDS if o != sid))
+                    for sid in SCOPE_IDS}
+
+        _as_bases = (
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[0]),
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[1]),
+        )
+        _bs_bases = (
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_B[0]),
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_B[1]),
+        )
+
+        # Per-region per-stage scope tuples — keyed by stage int.
+        _as_scopes = (_SCOPE["as0"], _SCOPE["as1"])
+        _as_noalias = (_NOALIAS["as0"], _NOALIAS["as1"])
+        _bs_scopes = (_SCOPE["bs0"], _SCOPE["bs1"])
+        _bs_noalias = (_NOALIAS["bs0"], _NOALIAS["bs1"])
+
+        def _make_lds_view_2d(base_ptr, shape, my_scope, other_scopes):
+            # shape = (BLOCK_M_or_N, BLOCK_K) — single stage
+            stride = []
+            s = 1
+            for sh in reversed(shape):
+                stride.insert(0, s)
+                s *= sh
+            stride = tuple(stride)
+
+            def linear_offset(idxs):
+                if not isinstance(idxs, tuple):
+                    idxs = (idxs,)
+                offset = idxs[0] * stride[0]
+                for i in range_constexpr(1, len(idxs)):
+                    offset = offset + idxs[i] * stride[i]
+                return offset
+
+            def vec_load(idxs, vec_size):
+                elem_off = linear_offset(idxs)
+                byte_off_idx = elem_off * DTYPE_BYTES
+                byte_off_i32 = arith.index_cast(T.i32, byte_off_idx)
+                gep = _gep_lds(base_ptr, byte_off_i32)
+                vec_t = T.vec(vec_size, dtype_)
+                return llvm.LoadOp(
+                    vec_t, gep, alignment=2,
+                    alias_scopes=my_scope, noalias_scopes=other_scopes,
+                ).result
+
+            ns = type("LDSView", (), {})()
+            ns.base_ptr = base_ptr
+            ns.shape = shape
+            ns.stride = stride
+            ns.linear_offset = linear_offset
+            ns.vec_load = vec_load
+            return ns
+
+        as_views = tuple(
+            _make_lds_view_2d(_as_bases[s], (BLOCK_M, BLOCK_K),
+                              _as_scopes[s], _as_noalias[s])
+            for s in range(STAGES)
+        )
+        bs_views = tuple(
+            _make_lds_view_2d(_bs_bases[s], (BLOCK_N, BLOCK_K),
+                              _bs_scopes[s], _bs_noalias[s])
+            for s in range(STAGES)
+        )
 
         # ----- Tile coords (1D grid → 2D via 2-stage swizzle) -----
         # (1) XCD swizzle (OGS-style): remap flat pid so each XCD owns one
@@ -255,13 +328,16 @@ def _compile_nt_pingpong_16x32_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = as_.linear_offset(
-                    (fx.Index(lds_stage), m_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = as_views[lds_stage]
+
+                lds_offset = view.linear_offset((m_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_as_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     A_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -269,6 +345,11 @@ def _compile_nt_pingpong_16x32_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_as_scopes[lds_stage],
+
+                    noalias_scopes=_as_noalias[lds_stage],
+
                 )
 
         def ldg_sts_b_half_async(k_offset, lds_stage, n_half):
@@ -283,13 +364,16 @@ def _compile_nt_pingpong_16x32_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = B_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = bs_.linear_offset(
-                    (fx.Index(lds_stage), n_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = bs_views[lds_stage]
+
+                lds_offset = view.linear_offset((n_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_bs_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     B_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -297,6 +381,11 @@ def _compile_nt_pingpong_16x32_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_bs_scopes[lds_stage],
+
+                    noalias_scopes=_bs_noalias[lds_stage],
+
                 )
 
         # Full-tile loaders (used only by the prologue).
@@ -315,13 +404,16 @@ def _compile_nt_pingpong_16x32_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = as_.linear_offset(
-                    (fx.Index(lds_stage), m_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = as_views[lds_stage]
+
+                lds_offset = view.linear_offset((m_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_as_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     A_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -329,6 +421,11 @@ def _compile_nt_pingpong_16x32_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_as_scopes[lds_stage],
+
+                    noalias_scopes=_as_noalias[lds_stage],
+
                 )
 
         # =========================================================
@@ -348,13 +445,16 @@ def _compile_nt_pingpong_16x32_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = B_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = bs_.linear_offset(
-                    (fx.Index(lds_stage), n_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = bs_views[lds_stage]
+
+                lds_offset = view.linear_offset((n_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_bs_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     B_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -362,6 +462,11 @@ def _compile_nt_pingpong_16x32_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_bs_scopes[lds_stage],
+
+                    noalias_scopes=_bs_noalias[lds_stage],
+
                 )
 
         # =========================================================
@@ -370,7 +475,7 @@ def _compile_nt_pingpong_16x32_kernel(
         # indexed [ai * K_SUBITERS + kk] for ai ∈ 0..3, kk ∈ 0..1.
         # =========================================================
         def lds_matrix_a_half(lds_stage, m_half):
-            s = fx.Index(lds_stage)
+            view = as_views[lds_stage]  # compile-time stage dispatch
             n_frags = M_ATOMS_PER_QUAD * K_SUBITERS
             a_frags = [0] * n_frags
             for ai in range_constexpr(M_ATOMS_PER_QUAD):
@@ -382,8 +487,8 @@ def _compile_nt_pingpong_16x32_kernel(
                     warp_atom_k_idx = kk * WMMA_K
                     col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = as_.vec_load(
-                        (s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
+                    vec = view.vec_load(
+                        (row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
                     )
                     a_frags[ai * K_SUBITERS + kk] = vec
             return a_frags
@@ -395,7 +500,7 @@ def _compile_nt_pingpong_16x32_kernel(
         # =========================================================
         def lds_matrix_b_half(lds_stage, n_half):
             warp_col = wid % BLOCK_N_WARPS
-            s = fx.Index(lds_stage)
+            view = bs_views[lds_stage]  # compile-time stage dispatch
             n_frags = N_ATOMS_PER_QUAD * K_SUBITERS
             b_frags = [0] * n_frags
             for aj in range_constexpr(N_ATOMS_PER_QUAD):
@@ -407,8 +512,8 @@ def _compile_nt_pingpong_16x32_kernel(
                     warp_atom_k_idx = kk * WMMA_K
                     col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = bs_.vec_load(
-                        (s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
+                    vec = view.vec_load(
+                        (row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
                     )
                     b_frags[aj * K_SUBITERS + kk] = vec
             return b_frags
@@ -701,7 +806,20 @@ def _compile_nt_pingpong_16x32_kernel(
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
+            linkage = ir.Attribute.parse('#llvm.linkage<external>')
+            for sym, size in (
+                (LDS_SYMS_A[0], AS_STAGE_BYTES),
+                (LDS_SYMS_A[1], AS_STAGE_BYTES),
+                (LDS_SYMS_B[0], BS_STAGE_BYTES),
+                (LDS_SYMS_B[1], BS_STAGE_BYTES),
+            ):
+                llvm.GlobalOp(
+                    global_type=ir.Type.parse(f"!llvm.array<{size} x i8>"),
+                    sym_name=sym,
+                    linkage=linkage,
+                    addr_space=3,
+                    alignment=1024,
+                )
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         total_tiles = bm * bn
