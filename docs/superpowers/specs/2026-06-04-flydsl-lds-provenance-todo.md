@@ -681,3 +681,62 @@ If picking (1), the prototyping order should be:
   ds_read with explicit alias metadata) and verify `!alias.scope`
   survives all the way to the ISA → `vmcnt(N)` partial drain.
 - If yes, apply to 16x32 kernel.
+
+---
+
+## 2026-06-09 third attempt — explicit alias scopes (flash_attn pattern)
+
+Applied the exact `flash_attn_gfx950.py` pattern:
+- TWO `llvm.mlir.global`s (LDS_SYM_A, LDS_SYM_B).
+- `llvm.alias_scope_domain` + per-region `llvm.alias_scope`.
+- Explicit `alias_scopes=` / `noalias_scopes=` on every `llvm.LoadOp` (ds_read)
+  AND on every `rocdl.raw_ptr_buffer_load_lds` call.
+
+### What worked
+
+- **Metadata IS propagating** to LLVM IR: 128 alias.scope sites, 128 noalias
+  sites in the dumped IR. Verified scopes are attached to all 96 ds_reads
+  and 32 of 33 buffer_load_lds calls (the prologue's single full-drain
+  retains no scope, as expected).
+- IR structurally clean — buffer_load_lds destinations are `getelementptr
+  @<global>, i32 %offset`, no inttoptr.
+
+### What didn't work
+
+- **vmcnt(0) drain count UNCHANGED** at 10 (same as baseline with inttoptr).
+- **Perf REGRESSED** 1158 → 1055 TF/s. The shim's per-load arithmetic +
+  the addressof+GEP pattern pushed VGPR usage from 242 → 256 with 13 spills
+  + 28 scratch ops. The scratch I/O is the new perf killer.
+
+### Why scopes don't reduce drains here
+
+Per-region scopes (AS vs BS) are insufficient for our pingpong design.
+At each barrier:
+- Pending writes: `buffer_load_lds → AS@next_stage` (the prefetch)
+- Upcoming reads: `ds_read ← AS@current_stage` (the actual compute)
+
+Both writes and reads are in the AS region — same scope. The compiler
+treats them as potentially aliasing and drains conservatively.
+
+**To get partial drains, we'd need per-stage scopes**: AS@0, AS@1, BS@0,
+BS@1 — four scopes. Within each iter, the unrolled K-step body knows at
+COMPILE TIME which stage it's reading from and which it's writing to
+(stage 0 vs stage 1 are hardcoded in the unrolled body). So per-stage
+scopes are statically determinable.
+
+### Effort estimate (revised, again)
+
+- ~4-6h to plumb per-stage scope IDs through `lds_matrix_*_half` and
+  `ldg_sts_*_half_async`.
+- ~2h to recover the 14-VGPR regression from a cleaner shim (avoid the
+  per-load arithmetic, share the GEP base across loads in a cluster).
+- Total: ~6-8h. Estimated impact: drains 10 → ~2, perf 1158 → ~1230 TF/s
+  (still ~3% below HK 1272 due to remaining per-cluster scheduling
+  differences).
+
+### Diminishing returns warning
+
+QuACK 32x16 already beats HK (1148 vs 1130, +2%). QuACK 16x32 is 9%
+behind HK and likely won't fully close even with per-stage scopes. The
+6-8h investment yields ~6-8% on a non-default kernel. Strongly suggest
+deferring unless there's a specific perf target that requires it.
