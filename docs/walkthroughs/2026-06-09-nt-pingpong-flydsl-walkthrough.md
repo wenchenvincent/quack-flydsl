@@ -406,14 +406,30 @@ LDS_SYMS_A = (f"nt_pp_smem_as0_{dtype}_{k}_{n}",
               f"nt_pp_smem_as1_{dtype}_{k}_{n}")
 LDS_SYMS_B = (f"nt_pp_smem_bs0_{dtype}_{k}_{n}",
               f"nt_pp_smem_bs1_{dtype}_{k}_{n}")
+LDS_ALIAS_DOMAIN = f'#llvm.alias_scope_domain<id = "nt_pp_{dtype}_{k}_{n}.lds">'
 SCOPE_IDS = ("as0", "as1", "bs0", "bs1")
 
 # Inside @flyc.kernel body:
+def _scope_attr(ids):
+    inner = ", ".join(
+        f'#llvm.alias_scope<id = "{i}", domain = {LDS_ALIAS_DOMAIN}>'
+        for i in ids
+    )
+    return ir.Attribute.parse(f"[{inner}]")
+
+# Each scope tags ONE region; its noalias list is the OTHER three.
+_SCOPE   = {sid: _scope_attr((sid,)) for sid in SCOPE_IDS}
+_NOALIAS = {sid: _scope_attr(tuple(o for o in SCOPE_IDS if o != sid))
+            for sid in SCOPE_IDS}
+
 _as_bases = (llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[0]),
              llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[1]))
 # ... bs_bases similar ...
-_as_scopes  = (_SCOPE["as0"],  _SCOPE["as1"])
-_as_noalias = (_NOALIAS["as0"], _NOALIAS["as1"])
+
+# Per-stage tuples so the DMA helper can do `_as_scopes[lds_stage]`
+# at compile time (lds_stage is a Python int):
+_as_scopes  = (_SCOPE["as0"],   _SCOPE["as1"])    # what the op IS
+_as_noalias = (_NOALIAS["as0"], _NOALIAS["as1"])  # what it CANNOT alias
 
 # DMA helper — lds_stage MUST be a Python int (no runtime indexing on tuples):
 def ldg_sts_a_async(k_offset, lds_stage):  # lds_stage is Python int (0 or 1)
