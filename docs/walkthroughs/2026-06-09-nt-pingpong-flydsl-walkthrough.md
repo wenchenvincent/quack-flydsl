@@ -479,6 +479,79 @@ Now `as0` ∈ reader's noalias-set of the writer (and vice versa). The pass conc
 
 The 2× unroll is a real cost — the IR for the K-loop body doubles, instruction-cache pressure goes up, and the scheduler has fewer freedoms than a tight loop. On the NT pingpong shapes it's a net win because the `vmcnt`-elision savings dominate. On NN-family / TN / splitk it's not even available — those kernels have a structural blocker (LDS-aliased C write-back; [Caveat 11](../../.claude/skills/port-hipkittens-to-flydsl/SKILL.md)) and stay on Configuration A.
 
+### D. How HipKittens does the same thing — a different strategy
+
+The HipKittens reference for this kernel (`kernels/gemm/bf16fp32/256_256_64_32_with32x16.cpp`) reaches comparable `vmcnt(0)` counts (~1 per K-step) **without** the per-stage globals and **without** the alias-scope metadata. It does this by managing drains manually.
+
+**LDS allocation in HK** — single `extern __shared__` block + a bump allocator (`with32x16.cpp:36-39`):
+
+```cpp
+extern __shared__ alignment_dummy __shm[];
+shared_allocator al((int*)&__shm[0]);
+st_bf<BLOCK_SIZE, K_STEP, st_32x32_s> (&As)[2] = al.allocate<...>();  // 2 stages
+st_bf<BLOCK_SIZE, K_STEP, st_32x32_s> (&Bs)[2] = al.allocate<...>();
+```
+
+`shared_allocator::allocate<T, N>` (`include/common/util.cuh:309-317`) just bumps the pointer and `reinterpret_cast`s it to a typed reference. Structurally this is **Configuration A** from the FlyDSL side: one LDS global (the dynamic-shared region), carved up by GEPs from a single base. `AMDGPULowerModuleLDSPass` sees `NumberVars = 1` and produces no scope metadata.
+
+**Pointer construction for the DMA** (`include/ops/warp/memory/tile/global_to_shared.cuh:201-208`):
+
+```cpp
+const T* lds_base = &dst.data[0] + (warpid * elements_per_warp);   // typed ptr addrspace(3)
+const T* lds_elem_ptr = lds_base + (i * num_warps * elements_per_warp);
+uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_elem_ptr);    // → i64 (provenance dies)
+as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);               // → ptr addrspace(3)
+llvm_amdgcn_raw_buffer_load_lds(srsrc, lds_ptr, ...);
+```
+
+That `reinterpret_cast<uintptr_t>` → cast-back-to-pointer round-trip lowers to exactly the same `ptrtoint`/`inttoptr` pair we deliberately avoid in Configuration C. So even within HK, the buffer_load_lds destination loses pointer provenance at the intrinsic call site.
+
+**Why does HK still get a clean schedule?** Because the K-loop body has its drains placed by hand (`with32x16.cpp:95-117`):
+
+```cpp
+// Cluster 0 — ds_read kk=0 + HBM→LDS prefetch
+load(A_tile, subtile_inplace<...>(As[tic], {warp_row, 0}));
+G::load(As[toc], g.a, {0, 0, row, tile+1}, swizzled_offsets_A);  // prefetch into "toc" stage
+load(B_tile, subtile_inplace<...>(Bs[tic], {warp_col, 0}));
+G::load(Bs[toc], g.b, {0, 0, col, tile+1}, swizzled_offsets_B);
+__builtin_amdgcn_s_barrier();                                     // no auto-drain (BackOffBarrier)
+
+// Cluster 1 — MFMA on kk=0
+asm volatile("s_waitcnt lgkmcnt(0)");                             // explicit ds_read drain
+__builtin_amdgcn_s_setprio(1);
+mma_ABt(C_accum, A_tile, B_tile, C_accum);
+__builtin_amdgcn_s_setprio(0);
+__builtin_amdgcn_s_barrier();
+
+// Cluster 2 — ds_read kk=1; the one explicit vmcnt drain per K-step
+load(A_tile, subtile_inplace<...>(As[tic], {warp_row, 1}));
+load(B_tile, subtile_inplace<...>(Bs[tic], {warp_col, 1}));
+__builtin_amdgcn_s_waitcnt(0);                                    // explicit vmcnt(0)
+__builtin_amdgcn_s_barrier();
+```
+
+Three things make this work without metadata-driven elision:
+
+1. **`BackOffBarrier` subtarget feature on gfx950** (Caveat 4 in the porting skill) — `s_barrier` does *not* auto-insert a `vmcnt(0)` before it. So bare `__builtin_amdgcn_s_barrier()` adds no waits.
+2. **Explicit `__builtin_amdgcn_s_waitcnt(0)` in cluster 2** — the programmer asserts "all HBM→LDS DMAs must be visible by here." `SIInsertWaitcnts` sees this and doesn't need to add anything redundant.
+3. **`asm volatile("s_waitcnt lgkmcnt(0)")`** before MFMA — explicit drain of the `ds_read` results so the MFMA operands are valid.
+
+The compiler's `SIInsertWaitcnts` pass still runs and is still conservative, but its conservative additions are no-ops: each "I'd add a `vmcnt(0)` here" point already has a programmer-supplied drain a few instructions back. The redundant ones get folded away in MachineLICM-like passes.
+
+### The two strategies side-by-side
+
+| | HipKittens | QuACK (per-stage scopes) |
+|---|---|---|
+| LDS globals | 1 (dynamic shared) | 4 (one per stage × side) |
+| Pointer to DMA dest | `inttoptr` from typed GEP | `addressof + GEP` (provenance kept) |
+| `AMDGPULowerModuleLDSPass` adds scopes | ✗ (`NumberVars = 1`) | ✓ + merged with explicit per-stage scopes |
+| `s_waitcnt(0)` placement | **Hand-placed**, exactly where needed | **Auto-placed** by SIInsertWaitcnts under scope guidance |
+| Programmer effort per K-step | Read the schedule, pick drain locations | Tag scopes once; trust the pass |
+| Robust to schedule edits | Less — moving instructions may invalidate drain placement | More — re-running the pass replaces drains automatically |
+| Total `vmcnt(0)` per K-step | ~1 (explicit) | ~1 (auto-elided down to one) |
+
+Both reach roughly the same endpoint. HK trusts the programmer to *place* drains; QuACK trusts the compiler to *infer* them from declared aliasing relations. Neither is strictly better — HK is more direct and minimal-IR; QuACK is more declarative and survives schedule changes without re-tuning. The per-stage-scope approach is also what lets QuACK's DSL-level schedules stay free of explicit `s_waitcnt(0)` calls, which keeps the kernel code at the same abstraction level as MFMA atoms, LDS views, and DMA helpers — explicit waitcnts would be a level lower than the rest of the kernel.
+
 ---
 
 ## 11. The closure-namespace pattern
