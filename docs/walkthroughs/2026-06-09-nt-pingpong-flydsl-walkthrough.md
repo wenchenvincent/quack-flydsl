@@ -23,7 +23,7 @@ What this doc does NOT cover:
 - The full lowering pipeline from `@flyc.kernel` body to AMDGPU ISA
 - Why specific tile sizes / barrier patterns were chosen — see the kernel docstring and the HK reference
 
-Where I'm uncertain I say so explicitly in §13.
+Where I'm uncertain I say so explicitly in §17.
 
 ---
 
@@ -54,7 +54,7 @@ Defines a **host-side launcher**. Inside `launch_nt_kernel` you can:
 - Compute grid dimensions from runtime arguments (`bm = (m + BLOCK_M - 1) // BLOCK_M`).
 - Mutate the GPU module's IR directly via `CompilationContext.get_current()` — this is the escape hatch the kernel uses to emit `llvm.mlir.global` ops at module scope (§7).
 - Call the `@flyc.kernel` with the host-side arguments to produce a `launcher` object.
-- Set LLVM function attributes on the kernel before launching (§12).
+- Set LLVM function attributes on the kernel before launching (§14).
 - `launcher.launch(grid=..., block=..., stream=...)`.
 
 You always need both: the kernel for "what runs on the device," the launcher for "everything the host side has to set up." In QuACK the `@functools.lru_cache(maxsize=1024)` on `_compile_nt_pingpong_kernel` keeps the launcher cached per `(dtype, K, N)` — recompiling is expensive.
@@ -73,7 +73,7 @@ This is the concept that unlocks everything else. A value in the kernel body is 
 
 The kernel uses this distinction load-bearing in three places:
 
-1. **`as_views[lds_stage]`** in `lds_matrix_a_kk` and friends. `lds_stage` is a **Python int** at every call site — that's why the loop is 2× unrolled (§10). `as_views` is a Python tuple; you can't index it with an MLIR `Value`.
+1. **`as_views[lds_stage]`** in `lds_matrix_a_kk` and friends. `lds_stage` is a **Python int** at every call site — that's why the loop is 2× unrolled (§4.2 for the scf.for form; §15 for the call-site rationale). `as_views` is a Python tuple; you can't index it with an MLIR `Value`.
 2. **`fx.const_expr(XCD_SWIZZLE > 1)`** in the tile-swizzle block. The condition is a Python bool. Without the `fx.const_expr(...)` wrap the upstream FlyDSL AST rewriter will try to lower the `if` into `scf.if`, fail because the predicate isn't `arith.cmpi`-shaped, and (the dangerous failure mode) variables first-defined inside the branch don't escape.
 3. **`range_constexpr(N)`** in the helpers — fully unrolls the loop at compile time so the IR has `WARP_M_STEPS * WARP_N_STEPS = 32` MFMA ops inlined.
 
@@ -139,7 +139,7 @@ if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
 
 `arith.cmpi` returns an `i1` SSA value (an MLIR `Value`). The AST rewriter recognizes `if <cmpi-result>:` and emits `scf.if` with no results. Inside the then-block, IR is emitted normally — but again, anything assigned only inside the branch won't be visible after.
 
-Critical caveat: the rewriter dispatches every non-`const_expr` `if` through `scf_if_dispatch` (see L713 / L588 of `ast_rewriter.py`). That function constructs `scf.IfOp(cond_i1, ...)` from the unwrapped value, and **`scf.IfOp` requires `i1`**. `arith.cmpi(...)` always returns `i1` and is the safe shape. `arith.andi(x, y)` returns whatever width its operands have — if you happen to feed it two `i1`s it works, but if either operand drifts to a wider integer the construction fails or (in older toolchains) silently miscompiles. **Nest `arith.cmpi`s** instead of reaching for `andi`/`ori` as compound predicates. See §16 for the full source-derived story.
+Critical caveat: the rewriter dispatches every non-`const_expr` `if` through `scf_if_dispatch` (see L713 / L588 of `ast_rewriter.py`). That function constructs `scf.IfOp(cond_i1, ...)` from the unwrapped value, and **`scf.IfOp` requires `i1`**. `arith.cmpi(...)` always returns `i1` and is the safe shape. `arith.andi(x, y)` returns whatever width its operands have — if you happen to feed it two `i1`s it works, but if either operand drifts to a wider integer the construction fails or (in older toolchains) silently miscompiles. **Nest `arith.cmpi`s** instead of reaching for `andi`/`ori` as compound predicates. See §17 for the full source-derived story.
 
 ### 5.3 Manual `scf.IfOp` + InsertionPoint
 
@@ -294,7 +294,178 @@ Once attached, the metadata flows through `AMDGPULowerModuleLDSPass` and reaches
 
 ---
 
-## 10. The closure-namespace pattern
+## 10. Counterfactual: what if we used coarser scopes?
+
+The porting skill ([Caveat 7](../../.claude/skills/port-hipkittens-to-flydsl/SKILL.md)) says "per-region scopes don't help pingpong." That claim deserves a side-by-side, because the *code* differences between three configurations are tightly localized — most of the kernel doesn't change.
+
+The three configurations:
+
+- **A.** Single global, no scopes (the legacy `SmemAllocator` + `inttoptr` path).
+- **B.** Per-region scopes — 2 globals (AS, BS), 2 scopes ("a", "b").
+- **C.** Per-stage scopes — 4 globals (AS@0, AS@1, BS@0, BS@1), 4 scopes ("as0", "as1", "bs0", "bs1"). What the kernel uses.
+
+### A. Single global, no scopes
+
+```python
+# At kernel-compile-time:
+LDS_SYM = f"nt_pp_smem_{dtype}_{k}_{n}"  # one global
+
+# Inside @flyc.kernel body:
+allocator = SmemAllocator()
+as_ptr = allocator.alloc(STAGES * BLOCK_M * BLOCK_K, dtype)
+bs_ptr = allocator.alloc(STAGES * BLOCK_N * BLOCK_K, dtype)
+as_ = STensor(as_ptr, dtype, shape=(STAGES, BLOCK_M, BLOCK_K))
+bs_ = STensor(bs_ptr, dtype, shape=(STAGES, BLOCK_K, BLOCK_N))
+
+# DMA helper — runtime stage is fine, no scope plumbing:
+def ldg_sts_a_async(k_offset, lds_stage):  # lds_stage is RUNTIME ir.Value
+    for i in range_constexpr(LDG_A_REG_COUNT):
+        ...
+        # SmemAllocator → extract index → i32 → inttoptr:
+        lds_base = memref.extract_aligned_pointer_as_index(as_.raw_ptr)
+        lds_off  = lds_base + lds_stage * AS_STAGE_BYTES + computed_offset
+        addr_i32 = arith.index_cast(T.i32, lds_off)
+        lds_ptr  = llvm.inttoptr(_LDS_PTR_TY, addr_i32)   # ← provenance dies
+        rocdl.raw_ptr_buffer_load_lds(
+            A_.rsrc, lds_ptr, ...,
+            # no alias_scopes / noalias_scopes — pass has nothing to attach
+        )
+```
+
+LLVM IR for the LDS pointer + DMA:
+
+```llvm
+%addr   = ...                                          ; i64 byte address
+%lds_p  = inttoptr i64 %addr to ptr addrspace(3)       ; provenance lost
+call void @llvm.amdgcn.raw.ptr.buffer.load.lds(..., ptr addrspace(3) %lds_p, ...)
+```
+
+`AMDGPULowerModuleLDSPass` sees `NumberVars = 1` — even without `inttoptr`, the `NumberVars > 1` gate (§9) would short-circuit scope generation. With `inttoptr` on top, the pass also can't trace provenance back to the global. `SIInsertWaitcnts` falls back to "all LDS aliases everything," and every barrier in the K-loop ends up with an explicit or implicit `s_waitcnt vmcnt(0)`.
+
+### B. Per-region scopes (2 globals)
+
+```python
+# At kernel-compile-time:
+AS_TOTAL_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
+BS_TOTAL_BYTES = STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
+LDS_SYMS = (f"nt_pp_smem_a_{dtype}_{k}_{n}",
+            f"nt_pp_smem_b_{dtype}_{k}_{n}")
+LDS_ALIAS_DOMAIN = f'#llvm.alias_scope_domain<id = "nt_pp_{dtype}_{k}_{n}.lds">'
+SCOPE_IDS = ("a", "b")
+
+# Inside @flyc.kernel body:
+_a_base = llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS[0])
+_b_base = llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS[1])
+_SCOPE_A = _scope_attr(("a",)); _SCOPE_B = _scope_attr(("b",))
+_NOALIAS_A = _scope_attr(("b",)); _NOALIAS_B = _scope_attr(("a",))
+
+# DMA helper — runtime stage is STILL fine; offset just gets a stage multiplier:
+def ldg_sts_a_async(k_offset, lds_stage):  # lds_stage is RUNTIME ir.Value
+    for i in range_constexpr(LDG_A_REG_COUNT):
+        ...
+        stage_off  = lds_stage * AS_STAGE_BYTES         # arith.muli at runtime
+        total_off  = stage_off + computed_offset
+        off_i32    = arith.index_cast(T.i32, total_off)
+        lds_ptr    = _gep_lds(_a_base, off_i32)
+        rocdl.raw_ptr_buffer_load_lds(
+            A_.rsrc, lds_ptr, ...,
+            alias_scopes=_SCOPE_A,
+            noalias_scopes=_NOALIAS_A,   # only "B-side accesses don't alias A-side"
+        )
+```
+
+LLVM IR for a write to stage 1:
+
+```llvm
+%off    = ...                                          ; runtime: muli + add
+%lds_p  = getelementptr i8, ptr addrspace(3) @nt_pp_smem_a_..., i32 %off
+call void @llvm.amdgcn.raw.ptr.buffer.load.lds(...,
+            ptr addrspace(3) %lds_p, ...,
+            !alias.scope !{!"a"},
+            !noalias     !{!"b"})
+```
+
+What this buys: a B-side `ds_read` no longer waits on pending A-side `buffer_load_lds`. Cross-region drains can be partial.
+
+What it doesn't buy — the pingpong steady state:
+
+```python
+# K-loop body, schematically:
+ldg_sts_a_async(k_next, lds_stage=1)   # write to A region, stage 1 — scope "a"
+...
+lds_matrix_a_kk(lds_stage=0, kk=0)     # read from A region, stage 0 — scope "a"
+```
+
+**Both ops are in scope `"a"`**. The alias analysis pass uses the rule "same scope ⇒ may alias" (it has no information distinguishing stage 0 from stage 1 within the region). The reader's `noalias = {"b"}` doesn't exclude the writer. Result: at the barrier between them, `SIInsertWaitcnts` still emits `s_waitcnt vmcnt(0)` for the A writes — same outcome as Configuration A for the pingpong pattern.
+
+### C. Per-stage scopes (4 globals) — what the kernel uses
+
+```python
+# At kernel-compile-time:
+LDS_SYMS_A = (f"nt_pp_smem_as0_{dtype}_{k}_{n}",
+              f"nt_pp_smem_as1_{dtype}_{k}_{n}")
+LDS_SYMS_B = (f"nt_pp_smem_bs0_{dtype}_{k}_{n}",
+              f"nt_pp_smem_bs1_{dtype}_{k}_{n}")
+SCOPE_IDS = ("as0", "as1", "bs0", "bs1")
+
+# Inside @flyc.kernel body:
+_as_bases = (llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[0]),
+             llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[1]))
+# ... bs_bases similar ...
+_as_scopes  = (_SCOPE["as0"],  _SCOPE["as1"])
+_as_noalias = (_NOALIAS["as0"], _NOALIAS["as1"])
+
+# DMA helper — lds_stage MUST be a Python int (no runtime indexing on tuples):
+def ldg_sts_a_async(k_offset, lds_stage):  # lds_stage is Python int (0 or 1)
+    for i in range_constexpr(LDG_A_REG_COUNT):
+        ...
+        # No stage multiplication — each stage has its OWN base:
+        off_i32 = arith.index_cast(T.i32, computed_offset)
+        lds_ptr = _gep_lds(_as_bases[lds_stage], off_i32)   # COMPILE-TIME pick
+        rocdl.raw_ptr_buffer_load_lds(
+            A_.rsrc, lds_ptr, ...,
+            alias_scopes  = _as_scopes[lds_stage],          # COMPILE-TIME pick
+            noalias_scopes= _as_noalias[lds_stage],         # the OTHER three scopes
+        )
+```
+
+LLVM IR for a prefetch into stage 1, with a stage-0 read still in flight:
+
+```llvm
+%off    = ...                                          ; runtime
+%lds_p  = getelementptr i8, ptr addrspace(3) @nt_pp_smem_as1_..., i32 %off
+call void @llvm.amdgcn.raw.ptr.buffer.load.lds(...,
+            ptr addrspace(3) %lds_p, ...,
+            !alias.scope !{!"as1"},
+            !noalias     !{!"as0", !"bs0", !"bs1"})
+
+; ... a parallel ds_read of stage 0 ...
+%rd_p   = getelementptr i8, ptr addrspace(3) @nt_pp_smem_as0_..., i32 %off2
+%val    = load <8 x bf16>, ptr addrspace(3) %rd_p,
+            !alias.scope !{!"as0"},
+            !noalias     !{!"as1", !"bs0", !"bs1"}
+```
+
+Now `as0` ∈ reader's noalias-set of the writer (and vice versa). The pass concludes "guaranteed not to alias." `SIInsertWaitcnts` skips the `vmcnt(0)` drain at the intervening barrier.
+
+### Side-by-side
+
+| | A. single global | B. per-region (2) | C. per-stage (4) |
+|---|---|---|---|
+| LDS globals | 1 | 2 | 4 |
+| LDS pointer construction | `inttoptr` | `addressof + GEP` | `addressof + GEP` |
+| `lds_stage` is | Runtime `ir.Value` | Runtime `ir.Value` | **Python int** |
+| Helper accepts runtime stage | ✓ | ✓ | ✗ — needs 2× unroll |
+| `AMDGPULowerModuleLDSPass` adds scopes | ✗ (`NumberVars = 1`) | ✓ | ✓ |
+| Cross-region wait elision | ✗ | ✓ | ✓ |
+| **Pingpong (same region, different stage) elision** | ✗ | ✗ | ✓ |
+| `s_waitcnt vmcnt(0)` per K-step (gfx950) | ~4 | ~2-3 | ~0 (only explicit) |
+
+The 2× unroll is a real cost — the IR for the K-loop body doubles, instruction-cache pressure goes up, and the scheduler has fewer freedoms than a tight loop. On the NT pingpong shapes it's a net win because the `vmcnt`-elision savings dominate. On NN-family / TN / splitk it's not even available — those kernels have a structural blocker (LDS-aliased C write-back; [Caveat 11](../../.claude/skills/port-hipkittens-to-flydsl/SKILL.md)) and stay on Configuration A.
+
+---
+
+## 11. The closure-namespace pattern
 
 `_make_lds_view_2d` returns an object built like this:
 
@@ -314,7 +485,7 @@ You'll see this pattern wherever helper objects need closures and the closure re
 
 ---
 
-## 11. ROCDL intrinsics
+## 12. ROCDL intrinsics
 
 `rocdl.*` ops are direct MLIR wrappers around AMDGPU LLVM IR intrinsics. They're the lowest-level primitives you can hit from FlyDSL without writing inline assembly. The kernel uses:
 
@@ -323,8 +494,8 @@ You'll see this pattern wherever helper objects need closures and the closure re
 | `rocdl.s_barrier()` | `llvm.amdgcn.s.barrier` | The bare `s_barrier` instruction. No fence pairs. |
 | `rocdl.s_waitcnt(imm)` | `llvm.amdgcn.s.waitcnt` | Emits `s_waitcnt` with a literal 16-bit encoding. `VMCNT_0 = 0x0F70` and `LGKMCNT_0 = 0xC07F` are the encodings; see the comment above their definition for the bit layout. |
 | `rocdl.s_setprio(N)` | `llvm.amdgcn.s.setprio` | Sets the wave's instruction-issue priority. Used to bias the scheduler toward MFMA-busy waves during their cluster. |
-| `rocdl.sched_barrier(0)` | `llvm.amdgcn.sched.barrier` | Compile-time scheduling fence. The mask says which instruction types are *allowed* to cross; `0 = NONE` allowed = nothing crosses. (See §16 for the inversion in `invertSchedBarrierMask`.) Used between unrolled iterations to keep the cluster schedule honest. |
-| `rocdl.raw_ptr_buffer_load_lds(...)` | `llvm.amdgcn.raw.ptr.buffer.load.lds` | Asynchronous HBM → LDS DMA. Uses a buffer resource descriptor (the SRD; §12) and a destination LDS pointer. |
+| `rocdl.sched_barrier(0)` | `llvm.amdgcn.sched.barrier` | Compile-time scheduling fence. The mask says which instruction types are *allowed* to cross; `0 = NONE` allowed = nothing crosses. (See §17 for the inversion in `invertSchedBarrierMask`.) Used between unrolled iterations to keep the cluster schedule honest. |
+| `rocdl.raw_ptr_buffer_load_lds(...)` | `llvm.amdgcn.raw.ptr.buffer.load.lds` | Asynchronous HBM → LDS DMA. Uses a buffer resource descriptor (the SRD; §13) and a destination LDS pointer. |
 | `rocdl.readfirstlane(T.i32, x)` | `llvm.amdgcn.readfirstlane` | Reads lane 0's value into a scalar register. Promotes a value the compiler doesn't realize is uniform into the SGPR file. |
 | `rocdl.mfma_f32_16x16x32_bf16(...)` | `llvm.amdgcn.mfma.f32.16x16x32.bf16` | The MFMA atom. Returns `vec<4 x f32>` C-fragment per lane. |
 
@@ -334,7 +505,7 @@ The MLIR-level "intrinsic op" pattern is uniform: you import from `flydsl.expr.r
 
 ---
 
-## 12. Buffer resource descriptors
+## 13. Buffer resource descriptors
 
 `A_.rsrc` and `B_.rsrc` are the AMDGPU **buffer resource descriptors** — 128-bit SGPR quads that encode `{base_addr, num_records, stride, flags}`. `raw_ptr_buffer_load_lds` needs an SRD as its first operand. `GTensor` builds one up-front from the input tensor's data pointer and size; it's reused for every DMA call.
 
@@ -344,7 +515,7 @@ The kernel uses the SRD form everywhere it touches HBM: `ldg_sts_a_async`, `ldg_
 
 ---
 
-## 13. Occupancy + register allocation knobs
+## 14. Occupancy + register allocation knobs
 
 Right before `launcher.launch(...)`, the kernel sets:
 
@@ -361,7 +532,7 @@ Why 2 specifically for this kernel: the kernel runs at **8 waves / WG, 1 WG / CU
 
 ---
 
-## 14. Walkthrough: how the pieces fit, in source order
+## 15. Walkthrough: how the pieces fit, in source order
 
 A short tour now that the features are explained. I'll quote section headers from the source comments where I can.
 
@@ -467,13 +638,13 @@ Three jobs:
 
 1. Emit the four `llvm.GlobalOp`s at module scope (§7).
 2. Compute grid dims from the runtime `m`.
-3. Set the `waves_per_eu` attribute on the kernel function before launch (§13).
+3. Set the `waves_per_eu` attribute on the kernel function before launch (§14).
 
 The pattern `for op in ctx.gpu_module_body.operations: if ... op.OPERATION_NAME == "gpu.func":` is how you find the GPU function inside the module after the kernel has been traced. You can attach LLVM IR attributes to it directly.
 
 ---
 
-## 15. Compile-time vs runtime cheat sheet
+## 16. Compile-time vs runtime cheat sheet
 
 | You want to … | Use |
 |---|---|
@@ -497,7 +668,7 @@ The pattern `for op in ctx.gpu_module_body.operations: if ... op.OPERATION_NAME 
 
 ---
 
-## 16. Verified findings (and what's still unverified)
+## 17. Verified findings (and what's still unverified)
 
 I dove into the LLVM / MLIR / FlyDSL sources to pin down the items I'd flagged uncertain in earlier drafts. Verified against current source:
 
@@ -596,7 +767,7 @@ The porting skill's caveat — *"`if arith.andi(...):` silently lets all lanes t
 
 ---
 
-## 17. Further reading
+## 18. Further reading
 
 - `quack/amd/gemm_gfx950_nt_pingpong_16x32.py` — the sibling kernel; same patterns, 16x32 quadrant.
 - `quack/amd/gemm_gfx950_nt_4wave_hk.py` — 4-wave pingpong, an instructive contrast (different barrier density).
