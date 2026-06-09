@@ -740,3 +740,257 @@ QuACK 32x16 already beats HK (1148 vs 1130, +2%). QuACK 16x32 is 9%
 behind HK and likely won't fully close even with per-stage scopes. The
 6-8h investment yields ~6-8% on a non-default kernel. Strongly suggest
 deferring unless there's a specific perf target that requires it.
+
+---
+
+## 2026-06-09 implementation LANDED — how it works
+
+Three commits land per-stage alias scopes on the 8-wave and 4-wave NT
+GEMM family:
+- `64a7462` — 16x32 (8-wave) +8% (1158 → 1247 TF/s)
+- `8bacb87` — 32x16 (8-wave) +5% (1148 → 1198 TF/s)
+- `483197c` — 4-wave HK +17% (845 → 1009 TF/s)
+
+This section documents the technique so future agents don't re-discover
+it. **No IR post-processing is involved** — the alias scope metadata is
+attached at MLIR-build time via op kwargs and survives unchanged through
+MLIR→LLVM-IR translation into the backend.
+
+### Pipeline overview
+
+```
+Python (FlyDSL kernel-build time)
+   │  emit `llvm.LoadOp(..., alias_scopes=..., noalias_scopes=...)`
+   │  emit `rocdl.raw_ptr_buffer_load_lds(..., alias_scopes=..., noalias_scopes=...)`
+   ▼
+MLIR (llvm + rocdl dialects)
+   │  ops carry MLIR `ArrayAttr` of `#llvm.alias_scope<...>` attributes
+   │  these implement `AliasAnalysisOpInterface`
+   ▼
+MLIR-to-LLVM-IR translation
+   │  AliasAnalysisOpInterface emits `!alias.scope`, `!noalias` metadata
+   │  attached to the LLVM IR load and call instructions
+   ▼
+LLVM IR (with `!alias.scope` / `!noalias` metadata)
+   │  scope domain `!4` and per-region-per-stage scopes `!3` `!6` etc.
+   ▼
+AMDGPU backend
+   ├─ `AMDGPULowerModuleLDSPass` — packs LDS globals into __amdgpu_module_lds
+   │  (we already have multiple globals so packing is trivial)
+   ▼
+   `SIInsertWaitcnts`
+      │  walks pending LDS DMA writes per pending-ds_read
+      │  reads `MachineMemOperand.AAInfo` (scope + noalias from IR metadata)
+      │  for each pending write, asks ScopedNoAliasAA: does it alias?
+      │     - if write's scope ∈ ds_read's noalias_scopes → no alias → skip
+      │     - else → must wait
+      │  emits partial `vmcnt(N)` instead of full `vmcnt(0)`
+```
+
+### The three building blocks
+
+#### 1. Alias scope attribute construction (Python)
+
+```python
+LDS_ALIAS_DOMAIN = f'#llvm.alias_scope_domain<id = "nt_pp_<dtype>_<k>_<n>.lds">'
+SCOPE_IDS = ("as0", "as1", "bs0", "bs1")  # one per (region × stage)
+
+def _scope_attr(ids):
+    """Build a `[#llvm.alias_scope<id="x", domain=...>, ...]` ArrayAttr."""
+    inner = ", ".join(
+        f'#llvm.alias_scope<id = "{i}", domain = {LDS_ALIAS_DOMAIN}>'
+        for i in ids
+    )
+    return ir.Attribute.parse(f"[{inner}]")
+
+# Per-region-per-stage: scope = THIS region+stage; noalias = ALL OTHERS.
+_SCOPE   = {sid: _scope_attr((sid,)) for sid in SCOPE_IDS}
+_NOALIAS = {sid: _scope_attr(tuple(o for o in SCOPE_IDS if o != sid))
+            for sid in SCOPE_IDS}
+```
+
+`ir.Attribute.parse(...)` accepts the MLIR text-form of any attribute,
+including dialect-specific ones like `#llvm.alias_scope<...>`. This is
+robust: the LLVM dialect's parsers validate the syntax at parse time.
+
+#### 2. Two MLIR ops, two attribute slots
+
+**For ds_reads** (`vector.load` → `llvm.LoadOp`):
+
+```python
+def vec_load(idxs, vec_size):
+    elem_off = linear_offset(idxs)
+    byte_off_i32 = arith.index_cast(T.i32, elem_off * DTYPE_BYTES)
+    gep = llvm.getelementptr(_LDS_PTR_TY, base_ptr, [byte_off_i32], ...)
+    vec_t = T.vec(vec_size, dtype_)
+    return llvm.LoadOp(
+        vec_t, gep, alignment=2,
+        alias_scopes=my_scope,        # ArrayAttr of one #llvm.alias_scope
+        noalias_scopes=other_scopes,  # ArrayAttr of three #llvm.alias_scope
+    ).result
+```
+
+**For buffer_load_lds** (FlyDSL's Python wrapper of `rocdl.raw_ptr_buffer_load_lds`):
+
+```python
+rocdl.raw_ptr_buffer_load_lds(
+    A_.rsrc, lds_ptr,
+    arith.constant(DMA_BYTES, type=T.i32),
+    global_offset,
+    arith.constant(0, type=T.i32),
+    arith.constant(0, type=T.i32),
+    arith.constant(1, type=T.i32),
+    alias_scopes=as_scopes[stage],     # ← kwarg forwarded by FlyDSL wrapper
+    noalias_scopes=as_noalias[stage],  # ← into the ODS-generated op ctor
+)
+```
+
+The FlyDSL Python wrapper at `flydsl/expr/rocdl/__init__.py:495` uses
+`**kw` so any kwarg flows to the underlying ODS-generated op constructor
+unchanged. Both `llvm.LoadOp` and `rocdl.raw_ptr_buffer_load_lds` accept
+`alias_scopes` / `noalias_scopes` / `tbaa` as optional `ArrayAttr` kwargs
+because their ODS definitions implement `AliasAnalysisOpInterface`.
+
+#### 3. Per-STAGE granularity via Python int dispatch
+
+Per-region scopes (AS vs BS, two scopes total) **do not** reduce drains.
+In a pingpong pipeline, each iter writes `AS@(stage^1)` while reading
+`AS@stage` — both `AS` scope, so the compiler still treats them as
+potentially aliasing.
+
+The fix is **per-stage** scopes (AS@0, AS@1, BS@0, BS@1, four total).
+Read of AS@0 has `noalias_scopes = [AS@1, BS@0, BS@1]` — so a pending
+write to AS@1 doesn't force a drain at the read of AS@0.
+
+**This requires the stage to be a Python int at every helper call site**,
+because `as_views[stage]` is a Python tuple lookup that resolves at
+MLIR-build time. Where the original kernels used a runtime `current_stage`
+from the loop state, the loop body had to be **2× unrolled** so each
+sub-step has a hardcoded Python int stage (sub-step 0 → stage 0,
+sub-step 1 → stage 1).
+
+```python
+# Before: 1-K-step-per-iter, runtime stage
+for _ki, state in range(0, TOTAL_K_STEPS, init=init_state):
+    stage_curr = fx.Index(state[1])  # ← runtime, can't index a Python tuple
+    a_frags = lds_matrix_a_kk(stage_curr, 0)  # ← inside the helper:
+    # vec = as_.vec_load((fx.Index(lds_stage), row, col), VEC)  ← STensor / memref-based
+
+# After: 2-K-step-per-iter, compile-time stage
+OUTER_ITERS = TOTAL_K_STEPS // 2
+for _oi, state in range(0, OUTER_ITERS - 1, init=init_state):
+    # Sub-step 0: stage 0
+    a_frags = lds_matrix_a_kk(0, 0)  # ← Python int, indexes as_views[0] at build time
+    # Sub-step 1: stage 1
+    a_frags = lds_matrix_a_kk(1, 0)
+```
+
+And the helper itself:
+```python
+def lds_matrix_a_kk(lds_stage, kk_target):
+    view = as_views[lds_stage]   # ← compile-time tuple index → per-stage scope baked in
+    ...
+    vec = view.vec_load((row, col), WMMA_A_FRAG)
+    # vec_load uses view's captured `my_scope` and `other_scopes` → correct per-stage tags
+```
+
+### Four `llvm.mlir.global`s (one per stage × region)
+
+`AMDGPULowerModuleLDSPass.cpp:1268` only creates alias scopes when
+`NumberVars > 1`. We emit four LDS globals (per-stage × per-region), each
+holding ONE stage worth of one region:
+
+```python
+# At launcher time (in gpu.module body):
+with ir.InsertionPoint(ctx.gpu_module_body):
+    linkage = ir.Attribute.parse('#llvm.linkage<external>')
+    for sym, size in (
+        (LDS_SYMS_A[0], AS_STAGE_BYTES),  # AS@0
+        (LDS_SYMS_A[1], AS_STAGE_BYTES),  # AS@1
+        (LDS_SYMS_B[0], BS_STAGE_BYTES),  # BS@0
+        (LDS_SYMS_B[1], BS_STAGE_BYTES),  # BS@1
+    ):
+        llvm.GlobalOp(
+            global_type=ir.Type.parse(f"!llvm.array<{size} x i8>"),
+            sym_name=sym, linkage=linkage,
+            addr_space=3, alignment=1024,
+        )
+```
+
+Each kernel inside builds 4 `llvm.mlir.addressof` results as base pointers:
+```python
+_as_bases = (
+    llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[0]),
+    llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[1]),
+)
+_bs_bases = (...)
+```
+
+### Why no IR post-processing was needed
+
+The flash_attn_gfx950.py pattern (which we modelled on) does the same
+thing — emit metadata at op-construction time. The MLIR llvm dialect's
+`AliasAnalysisOpInterface` translates the attributes verbatim into LLVM
+IR metadata during MLIR-to-LLVM lowering:
+
+- MLIR: `#llvm.alias_scope_domain<id = "...">` → LLVM IR: `!{!"..."}`
+- MLIR: `#llvm.alias_scope<id = "x", domain = ...>` → LLVM IR: `!{!"x", !DOMAIN}`
+- MLIR: op kwarg `alias_scopes=...` → LLVM IR: `!alias.scope !N`
+- MLIR: op kwarg `noalias_scopes=...` → LLVM IR: `!noalias !M`
+
+Verified by inspecting `~/.flydsl/debug/<kernel>/20_llvm_ir.ll`:
+- 128 `!alias.scope` sites on loads + buffer_load_lds calls
+- 128 `!noalias` sites
+- 4 LDS globals `external addrspace(3)` at the module level
+- 0 `inttoptr` to `ptr addrspace(3)` (the access path is `getelementptr @<global>`)
+
+### Why per-region scopes don't work (deeper)
+
+`SIInsertWaitcnts.cpp:2540-2557` walks `LDSDMAStores` per pending ds_read.
+For each pending write, it asks `ScopedNoAliasAA` whether the write
+aliases the read. With per-region scopes:
+- ds_read of `lds_as` has `alias_scopes=[lds_as], noalias_scopes=[lds_bs]`
+- pending buffer_load_lds write to `lds_as` (the next stage) has
+  `alias_scopes=[lds_as], noalias_scopes=[lds_bs]`
+- ScopedNoAliasAA: write's scope (`lds_as`) ∈ read's noalias? NO.
+- → must wait → full vmcnt(0).
+
+With per-stage scopes:
+- ds_read of `lds_as0` has `alias_scopes=[lds_as0], noalias_scopes=[lds_as1, lds_bs0, lds_bs1]`
+- pending buffer_load_lds to `lds_as1` has `alias_scopes=[lds_as1], ...`
+- ScopedNoAliasAA: write's scope (`lds_as1`) ∈ read's noalias? YES.
+- → can skip this write → partial `vmcnt(N)`.
+
+### Empirical proof (16x32 kernel)
+
+| Pattern | Total s_waitcnt in ISA | vmcnt(0) drains | Perf (TF/s) |
+|---|---|---|---|
+| Original (inttoptr, SmemAllocator) | 30 | 10 | 1158 |
+| Per-region scopes (1 LDS global, 2 scopes) | 42 | 15 | 970 |
+| Per-region scopes (2 LDS globals, 2 scopes) | 38 | 13 | 870 |
+| **Per-stage scopes (4 LDS globals, 4 scopes)** | **21** | **1** | **1247** |
+| HK reference (HipCC's IR with TBAA) | 24 | 1 | 1272 |
+
+The per-stage variant matches HK at the drain-count level. The remaining
+2% perf gap is MFMA cluster scheduling, not LDS provenance.
+
+### Apply to a new kernel — checklist
+
+1. Replace `SmemAllocator(...)` + `STensor(SmemPtr(...))` with the 4-global
+   setup + 4 `_make_lds_view_2d(...)` views, tupled as `as_views`/`bs_views`.
+2. Emit the 4 `llvm.GlobalOp`s in the launch function (in `ctx.gpu_module_body`).
+3. Update every helper that takes `lds_stage` to use `as_views[lds_stage]`
+   / `bs_views[lds_stage]` and to attach `_as_scopes[stage]` /
+   `_as_noalias[stage]` to its `raw_ptr_buffer_load_lds` calls.
+4. If any helper call site uses a RUNTIME stage (e.g. from `scf.for`
+   state), **2× unroll the loop** so each sub-step has a Python int stage.
+5. Verify: `vmcnt(0)` count drops, `alias.scope` sites appear in
+   `20_llvm_ir.ll`, bench shows the expected lift.
+
+### Why the AGPR forcing on the 4-wave HK kernel doesn't conflict
+
+`amdgpu-agpr-alloc=192,192` on the 4-wave HK kernel is independent of
+the alias scope work. It controls VGPR↔AGPR register partitioning, not
+memory dependency analysis. The 4-wave kernel has a larger C accumulator
+(192 fp32/lane vs 128) so the AGPR offload is load-bearing for register
+budget; that stays unchanged. The per-stage scopes apply orthogonally.
