@@ -643,7 +643,7 @@ def _compile_nt_pingpong_kernel(
         passthrough_attr = ir.ArrayAttr.get([])
         for op in ctx.gpu_module_body.operations:
             if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)
+                op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 2)
                 op.attributes["passthrough"] = passthrough_attr
         launcher.launch(grid=(total_tiles, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 

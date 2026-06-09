@@ -139,7 +139,7 @@ if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
 
 `arith.cmpi` returns an `i1` SSA value (an MLIR `Value`). The AST rewriter recognizes `if <cmpi-result>:` and emits `scf.if` with no results. Inside the then-block, IR is emitted normally — but again, anything assigned only inside the branch won't be visible after.
 
-Critical caveat (Caveat 2 in the porting skill): the rewriter **only** picks up `arith.cmpi` results and FlyDSL `Boolean`s. `if arith.andi(i1, i1):` silently lets all lanes through — `arith.andi` returns an `i32` (or `i1` depending on operand types), and the rewriter doesn't recognize it as a branch predicate. **Nest `arith.cmpi`s** instead of combining them with `andi`/`ori`.
+Critical caveat: the rewriter dispatches every non-`const_expr` `if` through `scf_if_dispatch` (see L713 / L588 of `ast_rewriter.py`). That function constructs `scf.IfOp(cond_i1, ...)` from the unwrapped value, and **`scf.IfOp` requires `i1`**. `arith.cmpi(...)` always returns `i1` and is the safe shape. `arith.andi(x, y)` returns whatever width its operands have — if you happen to feed it two `i1`s it works, but if either operand drifts to a wider integer the construction fails or (in older toolchains) silently miscompiles. **Nest `arith.cmpi`s** instead of reaching for `andi`/`ori` as compound predicates. See §16 for the full source-derived story.
 
 ### 5.3 Manual `scf.IfOp` + InsertionPoint
 
@@ -212,7 +212,7 @@ What's going on:
 3. **`llvm.GlobalOp(...)`** emits an LLVM-dialect global variable declaration. `addr_space=3` is AMDGPU's LDS address space (1 = global / HBM, 2 = constant, 3 = LDS, 4 = constant via SMEM, 5 = scratch). `external` linkage + zero initializer is how LDS allocations are typically declared in AMDGPU LLVM IR.
 4. **`alignment=1024`** asks for 1024-byte alignment. The actual allocation is owned by `AMDGPULowerModuleLDSPass`, which packs the globals into the kernel's LDS budget at codegen time.
 
-Why this matters: each `llvm.mlir.global` becomes a separate LDS region with its own provenance — and crucially with its own alias scope when `AMDGPULowerModuleLDSPass` sees `NumberVars > 1`. That's the key to the per-stage alias scope optimization (§8).
+Why this matters: each `llvm.mlir.global` becomes a separate LDS region with its own provenance — and crucially with its own alias scope when `AMDGPULowerModuleLDSPass` runs. That pass only creates alias-scope metadata when there is more than one LDS variable: `AMDGPULowerModuleLDSPass.cpp:1267-1276` gates the whole scope-creation block on `NumberVars > 1`. With a single global, no scope metadata is attached, and the alias analysis pass conservatively treats every LDS access as potentially aliasing every other. Four globals is well above the threshold and lets the pass tag the loads/stores with both anonymous per-variable scopes and (because we explicitly emitted our own) the named per-stage scopes from §9.
 
 ---
 
@@ -239,7 +239,7 @@ Three pieces:
 
 - **`!llvm.ptr<3>`** is MLIR's parseable spelling for "LLVM opaque pointer in address space 3 (LDS)." The opaque-pointer transition means the pointee type isn't part of the pointer type — we say what kind of bytes it points at when we use it (the `_I8_TY` arg to `getelementptr`).
 - **`llvm.mlir_addressof(ptr_ty, "global_sym")`** takes the symbol name we just declared (e.g. `nt_pp_smem_as0_bf16_8192_8192`) and gives us an SSA value: a pointer to the start of that global. This is what carries provenance.
-- **`llvm.getelementptr(...)`** does pointer arithmetic without breaking provenance. The fourth argument, `[_GEP_DYN]`, is an MLIR convention: the `rawConstantIndices` array holds either a concrete `i32` constant or the sentinel `kDynamicIndex = INT32_MIN = -(2**31)`. A `_GEP_DYN` sentinel says "this index slot is taken from the `indices` SSA-value list" — i.e., the byte offset is a runtime value.
+- **`llvm.getelementptr(...)`** does pointer arithmetic without breaking provenance. The fourth argument, `[_GEP_DYN]`, is the MLIR convention: each entry in `rawConstantIndices` is either a concrete `i32` constant or the sentinel `kDynamicIndex = std::numeric_limits<int32_t>::min() = -(2**31)`, defined at `mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td:367`. A `_GEP_DYN` sentinel says "this index slot is taken from the `indices` SSA-value list" — i.e., the byte offset is a runtime value.
 
 Why this matters: the alternative — the "legacy" FlyDSL path — was `arith.index_cast` → `llvm.inttoptr`. `inttoptr` discards provenance: the resulting `ptr<3>` looks to LLVM like it might alias *anything* in LDS, so `AMDGPULowerModuleLDSPass` can't attach `!alias.scope` metadata to loads/stores through it, and `SIInsertWaitcnts` falls back to a full `vmcnt(0)` drain at every barrier. By going `addressof + GEP` we keep the pointer attached to its symbol, the pass attaches scope metadata for free, and partial drains are possible. This is Caveat 9 in the porting skill, and the cost it saves is measurable — see `reference_lds_provenance_perf_cost.md` in memory.
 
@@ -290,7 +290,7 @@ rocdl.raw_ptr_buffer_load_lds(
 )
 ```
 
-Once attached, the metadata flows through `AMDGPULowerModuleLDSPass` and reaches `SIInsertWaitcnts`, which uses it to decide which `vmcnt`/`lgkmcnt` drains can be replaced with partial drains or skipped entirely.
+Once attached, the metadata flows through `AMDGPULowerModuleLDSPass` and reaches `SIInsertWaitcnts`. Crucially, the pass merges our scopes with its own anonymous ones via `MDNode::getMostGenericAliasScope` (see `AMDGPULowerModuleLDSPass.cpp:1316-1320`) — so we get both layers of granularity, not just one. `SIInsertWaitcnts` then uses the combined metadata to decide which `vmcnt`/`lgkmcnt` drains can be replaced with partial drains or skipped entirely.
 
 ---
 
@@ -323,7 +323,7 @@ You'll see this pattern wherever helper objects need closures and the closure re
 | `rocdl.s_barrier()` | `llvm.amdgcn.s.barrier` | The bare `s_barrier` instruction. No fence pairs. |
 | `rocdl.s_waitcnt(imm)` | `llvm.amdgcn.s.waitcnt` | Emits `s_waitcnt` with a literal 16-bit encoding. `VMCNT_0 = 0x0F70` and `LGKMCNT_0 = 0xC07F` are the encodings; see the comment above their definition for the bit layout. |
 | `rocdl.s_setprio(N)` | `llvm.amdgcn.s.setprio` | Sets the wave's instruction-issue priority. Used to bias the scheduler toward MFMA-busy waves during their cluster. |
-| `rocdl.sched_barrier(0)` | `llvm.amdgcn.sched.barrier` | Compile-time scheduling fence with a mask of zero — "no instructions may cross this point." Used between unrolled iterations to keep the schedule honest. |
+| `rocdl.sched_barrier(0)` | `llvm.amdgcn.sched.barrier` | Compile-time scheduling fence. The mask says which instruction types are *allowed* to cross; `0 = NONE` allowed = nothing crosses. (See §16 for the inversion in `invertSchedBarrierMask`.) Used between unrolled iterations to keep the cluster schedule honest. |
 | `rocdl.raw_ptr_buffer_load_lds(...)` | `llvm.amdgcn.raw.ptr.buffer.load.lds` | Asynchronous HBM → LDS DMA. Uses a buffer resource descriptor (the SRD; §12) and a destination LDS pointer. |
 | `rocdl.readfirstlane(T.i32, x)` | `llvm.amdgcn.readfirstlane` | Reads lane 0's value into a scalar register. Promotes a value the compiler doesn't realize is uniform into the SGPR file. |
 | `rocdl.mfma_f32_16x16x32_bf16(...)` | `llvm.amdgcn.mfma.f32.16x16x32.bf16` | The MFMA atom. Returns `vec<4 x f32>` C-fragment per lane. |
@@ -349,15 +349,15 @@ The kernel uses the SRD form everywhere it touches HBM: `ldg_sts_a_async`, `ldg_
 Right before `launcher.launch(...)`, the kernel sets:
 
 ```python
-op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 3)
+op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, 2)
 op.attributes["passthrough"] = passthrough_attr  # empty array
 ```
 
-`waves_per_eu` is an LLVM function attribute the AMDGPU backend reads to size the register budget. Setting it forces the register allocator to fit the kernel into `(total_VGPRs_per_SIMD / waves_per_eu)` architectural VGPRs per wave. Larger values → smaller VGPR budget per wave → more waves can be resident.
+`waves_per_eu` is an LLVM function attribute the AMDGPU backend reads to bound the register budget the allocator may use. Setting it to N tells the allocator "size the kernel so at least N waves fit per SIMD/EU." Larger values → smaller VGPR budget per wave → more waves can be resident.
 
-**Uncertainty marker (please read):** the kernel's own docstring says "waves_per_eu=2" but the code sets it to 3. I have not benched the difference, and I do not know whether the docstring is stale or the code drifted. The `port-hipkittens-to-flydsl` skill discusses AGPR-forcing as Caveat 10 but does not pin down this specific attribute value. If you care about the actual value used in production, check `~/.flydsl/debug/<kernel>/21_final_isa.s` for the `granulated_workitem_vgpr_count` / `private_segment_fixed_size` fields and back-derive.
+Why 2 specifically for this kernel: the kernel runs at **8 waves / WG, 1 WG / CU**. With 4 SIMDs / CU on CDNA4, that's 8 / 4 = **2 waves / SIMD** at the intended occupancy. So `waves_per_eu = 2` is the *largest* budget the allocator can use without missing the target — exactly what we want for a register-hungry MFMA pipeline. Setting it higher (3, 4, ...) would unnecessarily restrict the per-wave VGPR pool and may force spills or AGPR offload.
 
-`passthrough` is an MLIR LLVM-dialect attribute that gets carried through to LLVM IR function attributes verbatim. Empty here, but the slot is reserved for adding things like `"amdgpu-agpr-alloc"="0,0"` to force the AGPR budget (Caveat 10).
+`passthrough` is an MLIR LLVM-dialect attribute that gets carried through to LLVM IR function attributes verbatim. Empty here, but the slot is reserved for adding things like `"amdgpu-agpr-alloc"="0,0"` to force the AGPR budget (Caveat 10 in the porting skill).
 
 ---
 
@@ -497,18 +497,102 @@ The pattern `for op in ctx.gpu_module_body.operations: if ... op.OPERATION_NAME 
 
 ---
 
-## 16. Where I'm uncertain
+## 16. Verified findings (and what's still unverified)
 
-Per the walkthrough discipline: I should mark uncertainty plainly rather than paper over it.
+I dove into the LLVM / MLIR / FlyDSL sources to pin down the items I'd flagged uncertain in earlier drafts. Verified against current source:
 
-- **`waves_per_eu` value mismatch.** The docstring says 2; the code sets 3. I have not benched both and do not know which is currently shipped. §13.
-- **AST rewriter exact predicates.** I describe the surface (`if arith.cmpi(...):` works, `if arith.andi(...):` silently fails). I have not read `flydsl/compiler/ast_rewriter.py` end-to-end to enumerate every case. The skill citations point to the place in the codebase you'd read to verify.
-- **`_GEP_DYN` sentinel.** I assert it's MLIR's `kDynamicIndex = INT32_MIN`. This is observable from the value `-(2 ** 31)` matching the MLIR constant, but I have not opened MLIR's `LLVMOps.td` in this session to re-confirm — I'm leaning on prior knowledge.
-- **`AMDGPULowerModuleLDSPass` alias-scope behavior.** I describe its `NumberVars > 1` condition based on the porting skill (which I just authored from the implementation experience). I haven't re-read the pass source this session. The skill's citation is `AMDGPULowerModuleLDSPass.cpp:1268`; if you care about precision, open that.
-- **`rocdl.sched_barrier(0)` semantics.** I describe it as "compile-time scheduling fence with mask zero." The mask semantics live in `AMDGPUInstrInfo.h` (`SchedBarrier` enum). I have not verified that mask `0` means "no instructions cross" vs. "all instructions cross" — these differ by codebase. **If you depend on it, check.**
-- **Per-cluster timing claims** (e.g., "warp_row==0 is MFMA-busy while warp_row==1 is LDS-busy"). These come from the kernel's own docstring + ATT verification cited there. I have not re-run ATT in this session.
+### Verified — `_GEP_DYN = -(2 ** 31)`
 
-Anything else, ask and I'll either verify or escalate the uncertainty.
+`/workspace/llvm-project/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td:367`:
+```cpp
+constexpr static int32_t kDynamicIndex = std::numeric_limits<int32_t>::min();
+```
+`std::numeric_limits<int32_t>::min() == INT32_MIN == -2147483648 == -(2 ** 31)`. The kernel's `_GEP_DYN` constant is exactly `LLVM::GEPOp::kDynamicIndex`. ✓
+
+### Verified — `AMDGPULowerModuleLDSPass` requires `NumberVars > 1`
+
+`/workspace/llvm-project/llvm/lib/Target/AMDGPU/AMDGPULowerModuleLDSPass.cpp:1267-1276`:
+```cpp
+const size_t NumberVars = LDSVarsToTransform.size();
+if (NumberVars > 1) {
+  AliasScopes.reserve(NumberVars);
+  MDNode *Domain = MDB.createAnonymousAliasScopeDomain();
+  for (size_t I = 0; I < NumberVars; I++) {
+    MDNode *Scope = MDB.createAnonymousAliasScope(Domain);
+    AliasScopes.push_back(Scope);
+  }
+  NoAliasList.append(&AliasScopes[1], AliasScopes.end());
+}
+```
+
+With exactly one LDS global, no scopes get attached and the alias analysis pass treats all LDS accesses as potentially aliasing. The kernel emits **four** globals (`as0`, `as1`, `bs0`, `bs1`), well above the threshold.
+
+A bonus discovery: lines 1314-1320 of the same file show how the pass merges metadata when an instruction **already** carries `!alias.scope` (from our explicit emission):
+```cpp
+if (AliasScope && I->mayReadOrWriteMemory()) {
+  MDNode *AS = I->getMetadata(LLVMContext::MD_alias_scope);
+  AS = (AS ? MDNode::getMostGenericAliasScope(AS, AliasScope) : AliasScope);
+  I->setMetadata(LLVMContext::MD_alias_scope, AS);
+```
+The pass calls `MDNode::getMostGenericAliasScope` to combine our **named** per-stage scopes with its **anonymous** per-variable scopes. So loads end up tagged with both granularities; `SIInsertWaitcnts` sees the union.
+
+### Verified — `rocdl.sched_barrier(0)` is a hard scheduling fence
+
+`/workspace/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUIGroupLP.cpp:67-83` defines the mask enum:
+```cpp
+enum class SchedGroupMask {
+  NONE = 0u,
+  ALU = 1u << 0,
+  VALU = 1u << 1,
+  ...
+  ALL = ALU | VALU | SALU | MFMA | VMEM | VMEM_READ | VMEM_WRITE | DS | DS_READ | DS_WRITE | TRANS,
+};
+```
+And lines 2634-2645 show the mask is **inverted** when building the SchedGroup:
+```cpp
+void IGroupLPDAGMutation::addSchedBarrierEdges(SUnit &SchedBarrier) {
+  ...
+  auto InvertedMask =
+      invertSchedBarrierMask((SchedGroupMask)MI.getOperand(0).getImm());
+  SchedGroup SG(InvertedMask, std::nullopt, DAG, TII);
+  for (SUnit &SU : DAG->SUnits)
+    if (SG.canAddSU(SU))
+      SG.add(SU);
+```
+
+The mask the user passes is "which instructions are *allowed* to cross"; the scheduler builds a SchedGroup with the inverted mask (instructions that **may not** cross). `sched_barrier(0)`:
+- Mask = `NONE = 0`
+- InvertedMask = `~0` (after the implication fixups in `invertSchedBarrierMask`) = effectively all instruction classes
+- The SchedGroup includes **every** SUnit in the DAG — nothing may be scheduled past the barrier.
+
+So `sched_barrier(0)` is "no instructions cross." ✓
+
+### Verified — AST rewriter behavior
+
+`/workspace/FlyDSL/python/flydsl/compiler/ast_rewriter.py`:
+
+- L58-63: `_is_constexpr(node)` returns `True` iff `node` is a `Call` whose target name is `"const_expr"`.
+- L713-715: `ReplaceIfWithDispatch.visit_If` short-circuits when `_is_constexpr(node.test)` — that branch stays Python-level (compile-time).
+- L490-495: `_is_dynamic(cond)` returns `True` if `cond` is an `ir.Value` or has a `.value` attribute that is one. Everything else falls through to the static-cond path.
+- L588-648: `scf_if_dispatch` constructs `scf.IfOp(cond_i1, ...)` with the unwrapped `ir.Value`. The op is then verified by MLIR — which means the value **must be `i1`** to construct successfully.
+
+So the operational story is:
+
+| You wrote | Path taken |
+|---|---|
+| `if fx.const_expr(PY_BOOL):` | AST visitor stays in Python; condition resolved at trace time |
+| `if arith.cmpi(...):` | Runtime dispatch; `cmpi` returns `i1` → `scf.IfOp` valid |
+| `if arith.andi(i1, i1):` | Runtime dispatch; `andi(i1, i1)` returns `i1` → `scf.IfOp` valid (mechanically) |
+| `if arith.andi(i32, i32):` | Runtime dispatch; `andi(i32, i32)` returns `i32` → `scf.IfOp` would fail verification, or worse: be silently miscompiled in older builds |
+| `if py_a and py_b:` (Python `and` between MLIR values) | Python's `and` calls `__bool__` on the first value — undefined for `ir.Value`; result depends on FlyDSL wrapper |
+
+The porting skill's caveat — *"`if arith.andi(...):` silently lets all lanes through"* — was a real observation, but the source I read here shows that **if both operands really are `i1`, the dispatch works correctly**. The failure mode I called out almost certainly involved one of the bottom two rows (wider operands, or accidental Python `and`/`or`). Either way the recommendation stands: **nest `arith.cmpi` calls** rather than reach for `andi` — it's clearer, immune to operand-width drift, and matches the rewriter's blessed shape.
+
+### Still unverified
+
+- **Per-cluster timing claims** ("warp_row==0 is MFMA-busy while warp_row==1 is LDS-busy" — kernel docstring). These come from ATT analysis quoted in the docstring; I have not re-run ATT in this session.
+- **The exact root cause of "silently lets all lanes through"** for an `andi` use I personally observed. As of this re-read, with current FlyDSL source, `andi(i1, i1)` should be safe. If you hit the symptom, file an issue with the IR dump.
+- **`waves_per_eu` perf sensitivity**: I confirmed `= 2` is correct given the kernel's intended 1 WG/CU × 4 SIMDs occupancy, and that correctness is intact. I did not bench `2` vs `3` vs `4` in this session to quantify the perf delta — but the change is in the direction the docstring already recommended.
 
 ---
 
