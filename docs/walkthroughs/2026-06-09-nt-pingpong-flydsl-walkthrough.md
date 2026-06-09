@@ -549,13 +549,47 @@ Measured cost on the 16x32 sibling kernel (`reference_lds_provenance_perf_cost.m
 
 Pre-fix QuACK had **9 extra full `vmcnt(0)` drains** the compiler inserted before `ds_read`s — none written by the programmer. Per-stage scopes eliminate all 9 by giving the alias analysis pass enough information to conclude "this `ds_read` is to `as0`; the only pending DMAs are to `as1` (in the noalias set) — no drain needed." The programmer-placed drains stay; the compiler stops piling on.
 
-**What does HK rely on instead?** This is where I'd been overconfident in the previous draft. `SIInsertWaitcnts` should be just as conservative for HK — same `inttoptr` round-trip, same single LDS global. Yet HK comes out clean (1 `vmcnt(0)`). Plausible mechanisms:
+**What does HK rely on instead?** I dumped HK's compiled LLVM IR (`hipcc --offload-arch=gfx950 -O3 -S -emit-llvm`) and the answer became clear:
 
-- HipCC's frontend preserves more aliasing information on the `st_bf` typed references (the `data` field of the typed struct has a TBAA path that may discriminate within the `__shm` block).
-- The AMDGPU backend's same-base/different-constant-offset GEP disambiguation reaches the `MachineMemOperand`s of the typed `ds_read`s, even though the `buffer_load_lds` destination is `inttoptr`-laundered.
-- ROCm-specific BasicAA or compiler-version differences vs the LLVM trunk FlyDSL ships with.
+**HK's ds_reads are inline assembly, not typed loads.** All 52 LDS reads in the hot path look like this (`hk32x16.ll:233-235`):
 
-I have not dumped HK's machine-IR `MachineMemOperand` aliasing slots to confirm which of these is doing the work. Flagging as unverified rather than guessing.
+```llvm
+%194 = tail call i128 asm sideeffect "ds_read_b128 $0, $1 offset:$2\0A",
+                                     "=v,v,i,~{memory}"(i32 %193, i32 0) #7
+%196 = tail call i128 asm sideeffect "ds_read_b128 $0, $1 offset:$2\0A",
+                                     "=v,v,i,~{memory}"(i32 %193, i32 4096) #7
+```
+
+That's `tail call asm sideeffect` with a `~{memory}` clobber — **zero** typed `load <N x T>, ptr addrspace(3)` instructions in the entire kernel. The TK header `include/ops/warp/memory/util/util.cuh` defines the `move<T>::lds` helpers as `__asm__` blocks specifically to avoid emitting a typed addrspace(3) load.
+
+Now look at how `SIInsertWaitcnts` decides whether to add a `vmcnt(0)` before an instruction (`SIInsertWaitcnts.cpp:2530-2558`):
+
+```cpp
+for (const MachineMemOperand *Memop : MI.memoperands()) {
+    ...
+    unsigned AS = Memop->getAddrSpace();
+    if (AS != AMDGPUAS::LOCAL_ADDRESS && AS != AMDGPUAS::FLAT_ADDRESS)
+      continue;
+    ...
+    if (Ptr && Memop->getAAInfo()) {
+      // walk LDSDMAStores; per-slot aliasing check
+    } else {
+      ScoreBrackets.determineWaitForLDSDMA(LOAD_CNT, TID, Wait);  // drain everything
+    }
+}
+```
+
+The pass walks `MI.memoperands()`. Inline asm typically has **no MachineMemOperand with `AMDGPUAS::LOCAL_ADDRESS`** — `~{memory}` marks side-effects but doesn't expose a specific MMO with an LDS addrspace. So the loop body doesn't execute. The pass never tries to insert a `vmcnt(0)` because it never sees the inline-asm `ds_read_b128` as "an LDS read that needs to wait."
+
+Meanwhile, QuACK's `llvm.LoadOp(vec_t, gep, alignment=2, ...)` lowers to a typed `load <8 x bf16>, ptr addrspace(3) ..., !alias.scope ...` which **does** have an MMO with `AMDGPUAS::LOCAL_ADDRESS`. The pass sees it, walks the loop body, and either drains conservatively (no AA info) or uses the per-slot check (with our per-stage scopes).
+
+So the actual mechanism is:
+
+- **HK**: emits LDS reads as opaque inline assembly. `SIInsertWaitcnts` doesn't track them as LDS loads at all. The programmer-placed `__builtin_amdgcn_s_waitcnt(0)` is the *only* drain that ends up in the ISA, because nothing else asks for one.
+- **QuACK (pre-fix)**: emits LDS reads as typed `load` ops. The pass tracks them, sees no AA info on the prior `buffer_load_lds` writes, conservatively assumes aliasing, drains.
+- **QuACK (post-fix)**: emits typed LDS reads with per-stage `!alias.scope`. The pass tracks them, sees per-slot aliasing info on the writes, proves disjointness, skips the drain.
+
+QuACK ends up at the same drain count as HK, but via "be honest with the alias-analysis pass" rather than "hide the operation from the pass."
 
 ### The two paths side-by-side (corrected)
 
@@ -566,10 +600,10 @@ I have not dumped HK's machine-IR `MachineMemOperand` aliasing slots to confirm 
 | `AMDGPULowerModuleLDSPass` adds scopes | ✗ (`NumberVars = 1`) | ✓ (plus our explicit per-stage scopes merged in) |
 | Programmer-placed `s_waitcnt vmcnt(0)` per K-step | 1 (cluster 2) | 1 (cluster 2) |
 | Programmer-placed `s_waitcnt lgkmcnt(0)` per K-step | 2 (before each MFMA) | 2 (before each MFMA) |
-| Compiler-inserted extra `vmcnt(0)` at `ds_read`s | None (mechanism unverified) | None (per-stage scopes prove disjoint) |
+| Compiler-inserted extra `vmcnt(0)` at `ds_read`s | None — `ds_read_b128` is inline asm, opaque to `SIInsertWaitcnts` | None — per-stage scopes prove disjoint to `SIInsertWaitcnts` |
 | `vmcnt(0)` per K-step in final ISA | 1 | ~1 |
 
-The headline correction: it is **not** "HK places, QuACK declares." Both place. The per-stage-scope plumbing in QuACK exists to **suppress the 9 extra `vmcnt(0)` drains per kernel that `SIInsertWaitcnts` would otherwise pile on top** of the programmer-placed ones. HK reaches the same endpoint without scope metadata; the precise mechanism on the HK side is something I did not verify in this session.
+The headline: both kernels *place* the same explicit drains. The per-stage-scope plumbing in QuACK exists to **suppress the 9 extra `vmcnt(0)` drains per kernel that `SIInsertWaitcnts` would otherwise pile on top** of the programmer-placed ones. HK avoids those extras by emitting its `ds_read`s as inline assembly — opaque to the pass's per-MMO LDS tracking. The QuACK approach gives the optimizer more to work with (it can still do alias-aware scheduling, prove disjointness across loop iterations, etc.); the HK approach is simpler but forfeits any analysis the compiler might do on typed LDS loads. Both work. The QuACK direction is the one that scales as you ask the compiler to do more (autotuner-generated schedules, larger pipeline depths, etc.).
 
 ---
 
