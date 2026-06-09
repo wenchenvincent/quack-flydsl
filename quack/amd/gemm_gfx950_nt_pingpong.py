@@ -56,9 +56,7 @@ from flydsl._mlir.dialects import llvm, memref
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-from quack.amd.flydsl_tensor_shim import GTensor, STensor, get_dtype_in_kernel
+from quack.amd.flydsl_tensor_shim import GTensor, get_dtype_in_kernel
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.gemm_gfx950_mfma_core import _WmmaHalfK32, swizzle_xor16
 
@@ -127,23 +125,24 @@ def _compile_nt_pingpong_kernel(
 
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
-    # ----- LDS allocation -----
-    # A: (STAGES, BLOCK_M=256, BLOCK_K=64)        →  64 KB
-    # B: (STAGES, BLOCK_N=256, BLOCK_K=64)        →  64 KB
-    # Total: 128 KB, within 160 KB cap.
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=GPU_ARCH,
-        global_sym_name=f"nt_pp_smem_{dtype}_{k}_{n}",
+    # ----- LDS allocation — per-stage globals + alias scopes -----
+    # Four LDS globals: A staging × 2 stages, B staging × 2 stages. Each
+    # stage gets its own ``llvm.mlir.global`` + its own alias scope so
+    # ds_reads of stage N don't drain pending buffer_load_lds writes to
+    # stage N^1 (the prefetch destination). See the sibling 16x32 kernel
+    # for the equivalent pattern + a longer explanation.
+    AS_STAGE_BYTES = BLOCK_M * BLOCK_K * DTYPE_BYTES      # 32 KB
+    BS_STAGE_BYTES = BLOCK_N * BLOCK_K * DTYPE_BYTES      # 32 KB
+    LDS_SYMS_A = (
+        f"nt_pp_smem_as0_{dtype}_{k}_{n}",
+        f"nt_pp_smem_as1_{dtype}_{k}_{n}",
     )
-
-    smem_a_offset = allocator._align(allocator.ptr, 16)
-    AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_a_offset + AS_BYTES
-
-    smem_b_offset = allocator._align(allocator.ptr, 16)
-    BS_BYTES = STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_b_offset + BS_BYTES
+    LDS_SYMS_B = (
+        f"nt_pp_smem_bs0_{dtype}_{k}_{n}",
+        f"nt_pp_smem_bs1_{dtype}_{k}_{n}",
+    )
+    LDS_ALIAS_DOMAIN = f'#llvm.alias_scope_domain<id = "nt_pp_{dtype}_{k}_{n}.lds">'
+    SCOPE_IDS = ("as0", "as1", "bs0", "bs1")
 
     BLOCK_K_LOOPS_HINT = max(1, k // BLOCK_K)
 
@@ -159,12 +158,86 @@ def _compile_nt_pingpong_kernel(
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))     # (N, K) K-inner — NT
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))    # (M, N) N-inner
 
-        # ----- LDS descriptors -----
-        base_ptr = allocator.get_base()
-        smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
-        as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
-        bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
+        # ----- LDS descriptors (provenance + per-stage alias scopes) -----
+        _LDS_PTR_TY = ir.Type.parse("!llvm.ptr<3>")
+        _I8_TY = T.i8
+        _GEP_DYN = -(2 ** 31)
+
+        def _gep_lds(base_ptr, byte_offset_i32):
+            return llvm.getelementptr(
+                _LDS_PTR_TY, base_ptr, [byte_offset_i32], [_GEP_DYN], _I8_TY, None,
+            )
+
+        def _scope_attr(ids):
+            inner = ", ".join(
+                f'#llvm.alias_scope<id = "{i}", domain = {LDS_ALIAS_DOMAIN}>'
+                for i in ids
+            )
+            return ir.Attribute.parse(f"[{inner}]")
+
+        _SCOPE = {sid: _scope_attr((sid,)) for sid in SCOPE_IDS}
+        _NOALIAS = {sid: _scope_attr(tuple(o for o in SCOPE_IDS if o != sid))
+                    for sid in SCOPE_IDS}
+
+        _as_bases = (
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[0]),
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[1]),
+        )
+        _bs_bases = (
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_B[0]),
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_B[1]),
+        )
+
+        _as_scopes = (_SCOPE["as0"], _SCOPE["as1"])
+        _as_noalias = (_NOALIAS["as0"], _NOALIAS["as1"])
+        _bs_scopes = (_SCOPE["bs0"], _SCOPE["bs1"])
+        _bs_noalias = (_NOALIAS["bs0"], _NOALIAS["bs1"])
+
+        def _make_lds_view_2d(base_ptr, shape, my_scope, other_scopes):
+            stride = []
+            s = 1
+            for sh in reversed(shape):
+                stride.insert(0, s)
+                s *= sh
+            stride = tuple(stride)
+
+            def linear_offset(idxs):
+                if not isinstance(idxs, tuple):
+                    idxs = (idxs,)
+                offset = idxs[0] * stride[0]
+                for i in range_constexpr(1, len(idxs)):
+                    offset = offset + idxs[i] * stride[i]
+                return offset
+
+            def vec_load(idxs, vec_size):
+                elem_off = linear_offset(idxs)
+                byte_off_idx = elem_off * DTYPE_BYTES
+                byte_off_i32 = arith.index_cast(T.i32, byte_off_idx)
+                gep = _gep_lds(base_ptr, byte_off_i32)
+                vec_t = T.vec(vec_size, dtype_)
+                return llvm.LoadOp(
+                    vec_t, gep, alignment=2,
+                    alias_scopes=my_scope, noalias_scopes=other_scopes,
+                ).result
+
+            ns = type("LDSView", (), {})()
+            ns.base_ptr = base_ptr
+            ns.shape = shape
+            ns.stride = stride
+            ns.linear_offset = linear_offset
+            ns.vec_load = vec_load
+            return ns
+
+        as_views = tuple(
+            _make_lds_view_2d(_as_bases[s], (BLOCK_M, BLOCK_K),
+                              _as_scopes[s], _as_noalias[s])
+            for s in range(STAGES)
+        )
+        bs_views = tuple(
+            _make_lds_view_2d(_bs_bases[s], (BLOCK_N, BLOCK_K),
+                              _bs_scopes[s], _bs_noalias[s])
+            for s in range(STAGES)
+        )
 
         # ----- Tile coords (1D grid → 2D via 2-stage swizzle) -----
         # (1) XCD swizzle (OGS-style): remap flat pid so each XCD owns one
@@ -241,13 +314,16 @@ def _compile_nt_pingpong_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = as_.linear_offset(
-                    (fx.Index(lds_stage), m_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = as_views[lds_stage]
+
+                lds_offset = view.linear_offset((m_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_as_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     A_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -255,6 +331,11 @@ def _compile_nt_pingpong_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_as_scopes[lds_stage],
+
+                    noalias_scopes=_as_noalias[lds_stage],
+
                 )
 
         # =========================================================
@@ -274,13 +355,16 @@ def _compile_nt_pingpong_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = B_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = bs_.linear_offset(
-                    (fx.Index(lds_stage), n_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = bs_views[lds_stage]
+
+                lds_offset = view.linear_offset((n_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_bs_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     B_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -288,6 +372,11 @@ def _compile_nt_pingpong_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_bs_scopes[lds_stage],
+
+                    noalias_scopes=_bs_noalias[lds_stage],
+
                 )
 
         # =========================================================
@@ -295,7 +384,7 @@ def _compile_nt_pingpong_kernel(
         # Returns WARP_M_STEPS frags (one per atom in M direction).
         # =========================================================
         def lds_matrix_a_kk(lds_stage, kk_target):
-            s = fx.Index(lds_stage)
+            view = as_views[lds_stage]  # compile-time stage dispatch
             a_frags = [0] * WARP_M_STEPS
             for ii in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + ii * WMMA_M
@@ -303,8 +392,8 @@ def _compile_nt_pingpong_kernel(
                 row = warp_atom_m_idx + lane_m_idx
                 col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                vec = as_.vec_load(
-                    (s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
+                vec = view.vec_load(
+                    (row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
                 )
                 a_frags[ii] = vec
             return a_frags
@@ -316,7 +405,7 @@ def _compile_nt_pingpong_kernel(
         # just indexed by N rather than M.
         # =========================================================
         def lds_matrix_b_kk(lds_stage, kk_target):
-            s = fx.Index(lds_stage)
+            view = bs_views[lds_stage]  # compile-time stage dispatch
             b_frags = [0] * WARP_N_STEPS
             for jj in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + jj * WMMA_N
@@ -324,8 +413,8 @@ def _compile_nt_pingpong_kernel(
                 row = warp_atom_n_idx + lane_m_idx     # lane_m_idx mapping reused (N now)
                 col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                vec = bs_.vec_load(
-                    (s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
+                vec = view.vec_load(
+                    (row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
                 )
                 b_frags[jj] = vec
             return b_frags
@@ -383,29 +472,27 @@ def _compile_nt_pingpong_kernel(
         if arith.cmpi(arith.CmpIPredicate.eq, warp_row, fx.Int32(1)):
             rocdl.s_barrier()
 
-        # ----- Main loop: 4 barriers per K-step (HK pingpong shape) -----
-        # Mirrors HK's ``256_256_64_32_with32x16.cpp:95-124``:
-        #   Cluster 0: ds_read kk=0 + buffer_load_lds prefetch -> B1
-        #   Cluster 1: lgkmcnt(0) + MFMA kk=0                  -> B2
-        #   Cluster 2: ds_read kk=1                            -> vmcnt(0) -> B3
-        #   Cluster 3: lgkmcnt(0) + MFMA kk=1                  -> B4
-        # The vmcnt(0) sits before B3 (not B4) so cluster 0's DMA writes
-        # are drained one cluster early — by the time r1 (one cluster
-        # behind r0) starts NEXT iter's cluster 0 LDS reads, both warp
-        # groups' DMA writes have committed.
-        BLOCK_K_LOOPS = k // BLOCK_K
-        init_state = [k_begin, arith.constant(0, index=True)] + c_frags
-        for _bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
-            k_offset = state[0]
-            current_stage = fx.Index(state[1])
-            next_stage = 1 - current_stage
-            c_frags = state[2 : 2 + C_FRAGS_LEN]
+        # ----- Main loop: 2 K-steps unrolled per outer iter -----
+        # The 1-K-step-per-iter design used runtime ``current_stage`` /
+        # ``next_stage`` from the loop state, so each ``lds_matrix_a_kk``
+        # / ``ldg_sts_a_async`` call took a runtime ``lds_stage``. With
+        # per-stage alias scopes that's a problem — Python can't index
+        # into ``as_views[lds_stage]`` with a runtime value.
+        #
+        # Unrolling 2× makes ``lds_stage`` a Python int at every call
+        # site (sub-step 0 → stage 0, sub-step 1 → stage 1). Same 4
+        # barriers per K-step (= 8 barriers per outer iter) as before.
+        TOTAL_K_STEPS = k // BLOCK_K
+        OUTER_ITERS = TOTAL_K_STEPS // 2
+        assert TOTAL_K_STEPS % 2 == 0, "32x16 kernel requires K % 128 == 0"
 
-            # Cluster 0: ds_read kk=0 + HBM→LDS prefetch for next iter.
-            a_frags_kk0 = lds_matrix_a_kk(current_stage, 0)
-            b_frags_kk0 = lds_matrix_b_kk(current_stage, 0)
-            ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
-            ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
+        def kstep_cluster(read_stage, prefetch_k, prefetch_stage):
+            """One K-step body: 4 clusters (LD0 / MMA0 / LD1 / MMA1)."""
+            # Cluster 0: ds_read kk=0 + HBM→LDS prefetch for a later K-step.
+            a_frags_kk0 = lds_matrix_a_kk(read_stage, 0)
+            b_frags_kk0 = lds_matrix_b_kk(read_stage, 0)
+            ldg_sts_a_async(prefetch_k, prefetch_stage)
+            ldg_sts_b_async(prefetch_k, prefetch_stage)
             rocdl.s_barrier()
 
             # Cluster 1: MFMA on kk=0. Drain lgkmcnt so ds_reads land first.
@@ -413,11 +500,12 @@ def _compile_nt_pingpong_kernel(
             mma_kk(a_frags_kk0, b_frags_kk0, c_frags)
             rocdl.s_barrier()
 
-            # Cluster 2: ds_read kk=1 from current_stage. vmcnt(0) drains
-            # cluster 0's DMA writes (committed before next iter's cluster
-            # 0 reads them).
-            a_frags_kk1 = lds_matrix_a_kk(current_stage, 1)
-            b_frags_kk1 = lds_matrix_b_kk(current_stage, 1)
+            # Cluster 2: ds_read kk=1. vmcnt(0) drains cluster 0's DMA
+            # writes one cluster early — by the time r1 (one cluster
+            # behind r0) starts the NEXT cluster 0 LDS reads, both warp
+            # groups' DMA writes have committed.
+            a_frags_kk1 = lds_matrix_a_kk(read_stage, 1)
+            b_frags_kk1 = lds_matrix_b_kk(read_stage, 1)
             rocdl.s_waitcnt(VMCNT_0)
             rocdl.s_barrier()
 
@@ -426,19 +514,58 @@ def _compile_nt_pingpong_kernel(
             mma_kk(a_frags_kk1, b_frags_kk1, c_frags)
             rocdl.s_barrier()
 
-            k_offset = k_offset + fx.Int32(BLOCK_K)
-            rocdl.sched_barrier(0)
-            results = yield [k_offset, next_stage] + c_frags
+        k_zero = arith.constant(0, type=T.i32)
+        init_state = [k_zero] + c_frags
+        # Loop runs OUTER_ITERS - 1 times. Last outer iter (= last 2
+        # K-steps) handled by the epilogue so we can omit the trailing
+        # prefetch of K-steps that don't exist.
+        for _oi, state in range(0, OUTER_ITERS - 1, init=init_state):
+            k_now = state[0]
+            k_next_stage0 = k_now + fx.Int32(2 * BLOCK_K)
+            k_next_stage1 = k_now + fx.Int32(3 * BLOCK_K)
+            c_frags = list(state[1 : 1 + C_FRAGS_LEN])
 
-        # ----- Epilogue: process the final iter (no prefetch) -----
-        c_frags = results[2 : 2 + C_FRAGS_LEN]
-        final_stage = (BLOCK_K_LOOPS - 1) % 2
-        a_frags_kk0_last = lds_matrix_a_kk(final_stage, 0)
-        b_frags_kk0_last = lds_matrix_b_kk(final_stage, 0)
+            # === K-step 2k from stage 0 ===
+            # Reads K-step 2k (already in stage 0); prefetches K-step
+            # 2k+1 (next sub-step's data) into stage 1.
+            kstep_cluster(0, k_now + fx.Int32(BLOCK_K), 1)
+
+            # === K-step 2k+1 from stage 1 ===
+            # Reads K-step 2k+1 (just prefetched); prefetches K-step
+            # 2k+2 (next outer iter's first sub-step) into stage 0.
+            kstep_cluster(1, k_next_stage0, 0)
+
+            rocdl.sched_barrier(0)
+            results = yield [k_next_stage0] + c_frags
+
+        # ----- Epilogue: last 2 K-steps -----
+        # State after the loop: stage 0 has K-step 2*OUTER_ITERS-2
+        # (just prefetched by the loop's last sub-step), stage 1 is
+        # stale. We still need to prefetch K-step 2*OUTER_ITERS-1 into
+        # stage 1 before reading it.
+        c_frags = list(results[1 : 1 + C_FRAGS_LEN])
+        k_last = results[0]  # = (OUTER_ITERS - 1) * 2 * BLOCK_K
+        # K-step 2*OUTER_ITERS-2 from stage 0; prefetch K-step 2*OUTER_ITERS-1 into stage 1.
+        kstep_cluster(0, k_last + fx.Int32(BLOCK_K), 1)
+        # K-step 2*OUTER_ITERS-1 from stage 1. No prefetch — but the
+        # cluster helper still issues one for code reuse; we just
+        # prefetch the FIRST K-step into stage 0 (harmlessly overwrites
+        # data nobody reads). The downstream barriers are all there are
+        # extant K-steps to do.
+        # Simpler: inline the last cluster without the prefetch.
+        a_frags_kk0_last = lds_matrix_a_kk(1, 0)
+        b_frags_kk0_last = lds_matrix_b_kk(1, 0)
+        rocdl.s_barrier()
+        rocdl.s_waitcnt(LGKMCNT_0)
         mma_kk(a_frags_kk0_last, b_frags_kk0_last, c_frags)
-        a_frags_kk1_last = lds_matrix_a_kk(final_stage, 1)
-        b_frags_kk1_last = lds_matrix_b_kk(final_stage, 1)
+        rocdl.s_barrier()
+        a_frags_kk1_last = lds_matrix_a_kk(1, 1)
+        b_frags_kk1_last = lds_matrix_b_kk(1, 1)
+        rocdl.s_waitcnt(VMCNT_0)
+        rocdl.s_barrier()
+        rocdl.s_waitcnt(LGKMCNT_0)
         mma_kk(a_frags_kk1_last, b_frags_kk1_last, c_frags)
+        rocdl.s_barrier()
 
         # =========================================================
         # Writeback: each c_frag is vec<4 x f32>. MFMA 16x16x32 output
@@ -483,7 +610,20 @@ def _compile_nt_pingpong_kernel(
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
+            linkage = ir.Attribute.parse('#llvm.linkage<external>')
+            for sym, size in (
+                (LDS_SYMS_A[0], AS_STAGE_BYTES),
+                (LDS_SYMS_A[1], AS_STAGE_BYTES),
+                (LDS_SYMS_B[0], BS_STAGE_BYTES),
+                (LDS_SYMS_B[1], BS_STAGE_BYTES),
+            ):
+                llvm.GlobalOp(
+                    global_type=ir.Type.parse(f"!llvm.array<{size} x i8>"),
+                    sym_name=sym,
+                    linkage=linkage,
+                    addr_space=3,
+                    alignment=1024,
+                )
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         total_tiles = bm * bn
