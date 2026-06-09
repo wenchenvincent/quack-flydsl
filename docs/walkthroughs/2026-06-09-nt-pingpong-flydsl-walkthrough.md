@@ -603,7 +603,23 @@ QuACK ends up at the same drain count as HK, but via "be honest with the alias-a
 | Compiler-inserted extra `vmcnt(0)` at `ds_read`s | None — `ds_read_b128` is inline asm, opaque to `SIInsertWaitcnts` | None — per-stage scopes prove disjoint to `SIInsertWaitcnts` |
 | `vmcnt(0)` per K-step in final ISA | 1 | ~1 |
 
-The headline: both kernels *place* the same explicit drains. The per-stage-scope plumbing in QuACK exists to **suppress the 9 extra `vmcnt(0)` drains per kernel that `SIInsertWaitcnts` would otherwise pile on top** of the programmer-placed ones. HK avoids those extras by emitting its `ds_read`s as inline assembly — opaque to the pass's per-MMO LDS tracking. The QuACK approach gives the optimizer more to work with (it can still do alias-aware scheduling, prove disjointness across loop iterations, etc.); the HK approach is simpler but forfeits any analysis the compiler might do on typed LDS loads. Both work. The QuACK direction is the one that scales as you ask the compiler to do more (autotuner-generated schedules, larger pipeline depths, etc.).
+The headline: both kernels *place* the same explicit drains. The per-stage-scope plumbing in QuACK exists to **suppress the 9 extra `vmcnt(0)` drains per kernel that `SIInsertWaitcnts` would otherwise pile on top** of the programmer-placed ones. HK avoids those extras by emitting its `ds_read`s as inline assembly — opaque to the pass's per-MMO LDS tracking.
+
+### Trade-offs of HK's inline-asm choice
+
+Hiding the LDS read behind `asm sideeffect` solves the drain problem but pays for it elsewhere:
+
+- **Loses the optimizer's help.** Inline asm is a black box. LLVM can't reorder it for ILP, can't hoist it out of loops, can't fold constant offsets, can't elide redundant reads, can't pipeline it. HK gets that work back by writing the schedule by hand — the manual `s_setprio`, the explicit `s_waitcnt`, the unrolled K-loop are all there because the compiler can't see the structure.
+- **Loses TBAA / scope-based scheduling.** Even if you wanted to add `!alias.scope` or `!tbaa` to an inline-asm op there's no path for it — asm doesn't carry AA info downstream. So the AMDGPU machine-scheduler can't reorder ds_reads across other LDS traffic based on aliasing facts; it can only respect the asm's sequential order.
+- **Locks in the ISA mnemonic per arch.** `"ds_read_b128"` is gfx9-family. Porting to gfx12 (RDNA WMMA, where ds_read has different forms and operand layouts) means rewriting every asm block in the kernel and the header library.
+
+QuACK's typed `llvm.LoadOp(vec_t, gep, ..., alias_scopes=...)` makes the opposite trade:
+
+- `SIInsertWaitcnts` keeps seeing the operation, which is precisely why the per-stage scope metadata is load-bearing — without it the pass falls back to a conservative drain. The metadata isn't optional; it's how we keep the pass off our back while remaining honest about what we're doing.
+- The instruction selector picks the right `DS_READ_*` opcode per arch. The same Python source builds for gfx942 / gfx950 / gfx1250 (modulo the MFMA wrapper choice in `_WmmaHalfK*`). No hand-edited assembly to maintain per target.
+- Other passes — MachineLICM, regalloc, MachinePipeliner — can still reason about the load. ILP / register-pressure analysis sees it as a normal `DS_READ_*` op, not an opaque side-effecting blob.
+
+Same drain budget, opposite philosophies: HK trusts the human to schedule; QuACK trusts the compiler given enough metadata.
 
 ---
 
