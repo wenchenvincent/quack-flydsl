@@ -49,9 +49,7 @@ from flydsl._mlir.dialects import llvm, memref
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-from quack.amd.flydsl_tensor_shim import GTensor, STensor, get_dtype_in_kernel
+from quack.amd.flydsl_tensor_shim import GTensor, get_dtype_in_kernel
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.gemm_gfx950_mfma_core import _WmmaHalfK32, swizzle_xor16
 
@@ -135,30 +133,24 @@ def _compile_nt_4wave_hk_kernel(
 
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
-    # ----- LDS allocation -----
-    # Attempted: 8 separate ``memref.global`` (one per subregion) to get
-    # ``AMDGPULowerModuleLDSPass`` to attach distinct alias scopes per
-    # subregion. Didn't work — FlyDSL's ``raw_ptr_buffer_load_lds``
-    # constructs the LDS pointer via ``inttoptr(extract_aligned_pointer_as_index
-    # + offset)`` (see flydsl/expr/rocdl/__init__.py:386-393), which destroys
-    # provenance. The buffer_load_lds intrinsic call ends up with no
-    # ``!alias.scope`` metadata, so ``SIInsertWaitcnts`` falls back to
-    # the conservative all-LDS-aliasing path either way. To unlock this
-    # optimization upstream, FlyDSL would need to expose a memref→llvm.ptr<3>
-    # path that doesn't go through int.
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=GPU_ARCH,
-        global_sym_name=f"nt_4wave_hk_smem_{dtype}_{k}_{n}",
+    # ----- LDS allocation — per-stage globals + alias scopes -----
+    # Four LDS globals (AS@0, AS@1, BS@0, BS@1) with per-stage scopes
+    # so ds_reads of stage N don't drain pending buffer_load_lds writes
+    # to stage N^1. See the 8-wave pingpong siblings for the equivalent
+    # pattern + a longer explanation. Required 2× unrolling the main
+    # loop below to make ``lds_stage`` a Python int at every call site.
+    AS_STAGE_BYTES = BLOCK_M * BLOCK_K * DTYPE_BYTES
+    BS_STAGE_BYTES = BLOCK_N * BLOCK_K * DTYPE_BYTES
+    LDS_SYMS_A = (
+        f"nt_4wave_hk_smem_as0_{dtype}_{k}_{n}",
+        f"nt_4wave_hk_smem_as1_{dtype}_{k}_{n}",
     )
-
-    smem_a_offset = allocator._align(allocator.ptr, 16)
-    AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_a_offset + AS_BYTES
-
-    smem_b_offset = allocator._align(allocator.ptr, 16)
-    BS_BYTES = STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_b_offset + BS_BYTES
+    LDS_SYMS_B = (
+        f"nt_4wave_hk_smem_bs0_{dtype}_{k}_{n}",
+        f"nt_4wave_hk_smem_bs1_{dtype}_{k}_{n}",
+    )
+    LDS_ALIAS_DOMAIN = f'#llvm.alias_scope_domain<id = "nt_4wave_hk_{dtype}_{k}_{n}.lds">'
+    SCOPE_IDS = ("as0", "as1", "bs0", "bs1")
 
     BLOCK_K_LOOPS_HINT = max(1, k // BLOCK_K)
 
@@ -174,12 +166,86 @@ def _compile_nt_4wave_hk_kernel(
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))     # (N, K) K-inner — NT
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))    # (M, N) N-inner
 
-        # ----- LDS descriptors -----
-        base_ptr = allocator.get_base()
-        smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
-        as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
-        bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
+        # ----- LDS descriptors (provenance + per-stage alias scopes) -----
+        _LDS_PTR_TY = ir.Type.parse("!llvm.ptr<3>")
+        _I8_TY = T.i8
+        _GEP_DYN = -(2 ** 31)
+
+        def _gep_lds(base_ptr, byte_offset_i32):
+            return llvm.getelementptr(
+                _LDS_PTR_TY, base_ptr, [byte_offset_i32], [_GEP_DYN], _I8_TY, None,
+            )
+
+        def _scope_attr(ids):
+            inner = ", ".join(
+                f'#llvm.alias_scope<id = "{i}", domain = {LDS_ALIAS_DOMAIN}>'
+                for i in ids
+            )
+            return ir.Attribute.parse(f"[{inner}]")
+
+        _SCOPE = {sid: _scope_attr((sid,)) for sid in SCOPE_IDS}
+        _NOALIAS = {sid: _scope_attr(tuple(o for o in SCOPE_IDS if o != sid))
+                    for sid in SCOPE_IDS}
+
+        _as_bases = (
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[0]),
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_A[1]),
+        )
+        _bs_bases = (
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_B[0]),
+            llvm.mlir_addressof(_LDS_PTR_TY, LDS_SYMS_B[1]),
+        )
+
+        _as_scopes = (_SCOPE["as0"], _SCOPE["as1"])
+        _as_noalias = (_NOALIAS["as0"], _NOALIAS["as1"])
+        _bs_scopes = (_SCOPE["bs0"], _SCOPE["bs1"])
+        _bs_noalias = (_NOALIAS["bs0"], _NOALIAS["bs1"])
+
+        def _make_lds_view_2d(base_ptr, shape, my_scope, other_scopes):
+            stride = []
+            s = 1
+            for sh in reversed(shape):
+                stride.insert(0, s)
+                s *= sh
+            stride = tuple(stride)
+
+            def linear_offset(idxs):
+                if not isinstance(idxs, tuple):
+                    idxs = (idxs,)
+                offset = idxs[0] * stride[0]
+                for i in range_constexpr(1, len(idxs)):
+                    offset = offset + idxs[i] * stride[i]
+                return offset
+
+            def vec_load(idxs, vec_size):
+                elem_off = linear_offset(idxs)
+                byte_off_idx = elem_off * DTYPE_BYTES
+                byte_off_i32 = arith.index_cast(T.i32, byte_off_idx)
+                gep = _gep_lds(base_ptr, byte_off_i32)
+                vec_t = T.vec(vec_size, dtype_)
+                return llvm.LoadOp(
+                    vec_t, gep, alignment=2,
+                    alias_scopes=my_scope, noalias_scopes=other_scopes,
+                ).result
+
+            ns = type("LDSView", (), {})()
+            ns.base_ptr = base_ptr
+            ns.shape = shape
+            ns.stride = stride
+            ns.linear_offset = linear_offset
+            ns.vec_load = vec_load
+            return ns
+
+        as_views = tuple(
+            _make_lds_view_2d(_as_bases[s], (BLOCK_M, BLOCK_K),
+                              _as_scopes[s], _as_noalias[s])
+            for s in range(STAGES)
+        )
+        bs_views = tuple(
+            _make_lds_view_2d(_bs_bases[s], (BLOCK_N, BLOCK_K),
+                              _bs_scopes[s], _bs_noalias[s])
+            for s in range(STAGES)
+        )
 
         # ----- Tile coords (1D grid → 2D via 2-stage swizzle) -----
         # (1) XCD swizzle (OGS-style): remap flat pid so each XCD owns one
@@ -260,13 +326,16 @@ def _compile_nt_4wave_hk_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = as_.linear_offset(
-                    (fx.Index(lds_stage), m_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = as_views[lds_stage]
+
+                lds_offset = view.linear_offset((m_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_as_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     A_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -274,6 +343,11 @@ def _compile_nt_4wave_hk_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_as_scopes[lds_stage],
+
+                    noalias_scopes=_as_noalias[lds_stage],
+
                 )
 
         def ldg_sts_b_half_async(k_offset, lds_stage, n_half):
@@ -288,13 +362,16 @@ def _compile_nt_4wave_hk_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = B_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = bs_.linear_offset(
-                    (fx.Index(lds_stage), n_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = bs_views[lds_stage]
+
+                lds_offset = view.linear_offset((n_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_bs_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     B_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -302,6 +379,11 @@ def _compile_nt_4wave_hk_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_bs_scopes[lds_stage],
+
+                    noalias_scopes=_bs_noalias[lds_stage],
+
                 )
 
         # Full-tile loaders (used only by the prologue).
@@ -320,13 +402,16 @@ def _compile_nt_4wave_hk_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = as_.linear_offset(
-                    (fx.Index(lds_stage), m_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = as_views[lds_stage]
+
+                lds_offset = view.linear_offset((m_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_as_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     A_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -334,6 +419,11 @@ def _compile_nt_4wave_hk_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_as_scopes[lds_stage],
+
+                    noalias_scopes=_as_noalias[lds_stage],
+
                 )
 
         # =========================================================
@@ -353,13 +443,16 @@ def _compile_nt_4wave_hk_kernel(
                 col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 global_offset = B_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = bs_.linear_offset(
-                    (fx.Index(lds_stage), n_local_idx, k_local_idx)
-                ) * DTYPE_BYTES
-                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                lds_addr = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                view = bs_views[lds_stage]
+
+                lds_offset = view.linear_offset((n_local_idx, k_local_idx)) * DTYPE_BYTES
+
+                lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+                lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+                lds_ptr = _gep_lds(_bs_bases[lds_stage], lds_off_uniform)
+
                 rocdl.raw_ptr_buffer_load_lds(
                     B_.rsrc, lds_ptr,
                     arith.constant(DMA_BYTES, type=T.i32),
@@ -367,6 +460,11 @@ def _compile_nt_4wave_hk_kernel(
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
+
+                    alias_scopes=_bs_scopes[lds_stage],
+
+                    noalias_scopes=_bs_noalias[lds_stage],
+
                 )
 
         # =========================================================
@@ -375,7 +473,6 @@ def _compile_nt_4wave_hk_kernel(
         # indexed [ai * K_SUBITERS + kk] for ai ∈ 0..3, kk ∈ 0..1.
         # =========================================================
         def lds_matrix_a_half(lds_stage, m_half):
-            s = fx.Index(lds_stage)
             n_frags = M_ATOMS_PER_QUAD * K_SUBITERS
             a_frags = [0] * n_frags
             for ai in range_constexpr(M_ATOMS_PER_QUAD):
@@ -387,8 +484,12 @@ def _compile_nt_4wave_hk_kernel(
                     warp_atom_k_idx = kk * WMMA_K
                     col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = as_.vec_load(
-                        (s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
+                    view = as_views[lds_stage]
+
+                    vec = view.vec_load(
+
+                        (row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
+
                     )
                     a_frags[ai * K_SUBITERS + kk] = vec
             return a_frags
@@ -400,7 +501,6 @@ def _compile_nt_4wave_hk_kernel(
         # =========================================================
         def lds_matrix_b_half(lds_stage, n_half):
             warp_col = wid % BLOCK_N_WARPS
-            s = fx.Index(lds_stage)
             n_frags = N_ATOMS_PER_QUAD * K_SUBITERS
             b_frags = [0] * n_frags
             for aj in range_constexpr(N_ATOMS_PER_QUAD):
@@ -412,8 +512,12 @@ def _compile_nt_4wave_hk_kernel(
                     warp_atom_k_idx = kk * WMMA_K
                     col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = bs_.vec_load(
-                        (s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
+                    view = bs_views[lds_stage]
+
+                    vec = view.vec_load(
+
+                        (row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
+
                     )
                     b_frags[aj * K_SUBITERS + kk] = vec
             return b_frags
@@ -486,7 +590,6 @@ def _compile_nt_4wave_hk_kernel(
         # in the interleaved cluster.
         # =========================================================
         def lds_load_a_atom(out_list, atom_idx, lds_stage, m_half, ai, kk):
-            s = fx.Index(lds_stage)
             warp_atom_m_idx = (m_half * HALF_BLOCK_M
                                + warp_row * HALF_WARP_M
                                + ai * WMMA_M)
@@ -494,13 +597,14 @@ def _compile_nt_4wave_hk_kernel(
             warp_atom_k_idx = kk * WMMA_K
             col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
             col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-            out_list[atom_idx] = as_.vec_load(
-                (s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
+            out_list[atom_idx] = as_views[lds_stage].vec_load(
+
+                (row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG,
+
             )
 
         def lds_load_b_atom(out_list, atom_idx, lds_stage, n_half, aj, kk):
             warp_col = wid % BLOCK_N_WARPS
-            s = fx.Index(lds_stage)
             warp_atom_n_idx = (n_half * HALF_BLOCK_N
                                + warp_col * HALF_WARP_N
                                + aj * WMMA_N)
@@ -508,8 +612,10 @@ def _compile_nt_4wave_hk_kernel(
             warp_atom_k_idx = kk * WMMA_K
             col_in_bytes = (warp_atom_k_idx + lane_k_vec_idx) * DTYPE_BYTES
             col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-            out_list[atom_idx] = bs_.vec_load(
-                (s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
+            out_list[atom_idx] = bs_views[lds_stage].vec_load(
+
+                (row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG,
+
             )
 
         # =========================================================
@@ -531,13 +637,16 @@ def _compile_nt_4wave_hk_kernel(
             col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
             global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
-            lds_offset = as_.linear_offset(
-                (fx.Index(lds_stage), m_local_idx, k_local_idx)
-            ) * DTYPE_BYTES
-            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-            lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-            lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-            lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+            view = as_views[lds_stage]
+
+            lds_offset = view.linear_offset((m_local_idx, k_local_idx)) * DTYPE_BYTES
+
+            lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+            lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+            lds_ptr = _gep_lds(_as_bases[lds_stage], lds_off_uniform)
+
             rocdl.raw_ptr_buffer_load_lds(
                 A_.rsrc, lds_ptr,
                 arith.constant(DMA_BYTES, type=T.i32),
@@ -545,6 +654,11 @@ def _compile_nt_4wave_hk_kernel(
                 arith.constant(0, type=T.i32),
                 arith.constant(0, type=T.i32),
                 arith.constant(1, type=T.i32),
+
+                alias_scopes=_as_scopes[lds_stage],
+
+                noalias_scopes=_as_noalias[lds_stage],
+
             )
 
         def ldg_sts_b_call(k_offset, lds_stage, i):
@@ -557,13 +671,16 @@ def _compile_nt_4wave_hk_kernel(
             col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
             global_offset = B_.linear_offset((row_idx, col_idx)) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
-            lds_offset = bs_.linear_offset(
-                (fx.Index(lds_stage), n_local_idx, k_local_idx)
-            ) * DTYPE_BYTES
-            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-            lds_addr = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-            lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
-            lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+            view = bs_views[lds_stage]
+
+            lds_offset = view.linear_offset((n_local_idx, k_local_idx)) * DTYPE_BYTES
+
+            lds_off_i32 = arith.index_cast(T.i32, lds_offset)
+
+            lds_off_uniform = rocdl.readfirstlane(T.i32, lds_off_i32)
+
+            lds_ptr = _gep_lds(_bs_bases[lds_stage], lds_off_uniform)
+
             rocdl.raw_ptr_buffer_load_lds(
                 B_.rsrc, lds_ptr,
                 arith.constant(DMA_BYTES, type=T.i32),
@@ -571,6 +688,11 @@ def _compile_nt_4wave_hk_kernel(
                 arith.constant(0, type=T.i32),
                 arith.constant(0, type=T.i32),
                 arith.constant(1, type=T.i32),
+
+                alias_scopes=_bs_scopes[lds_stage],
+
+                noalias_scopes=_bs_noalias[lds_stage],
+
             )
 
         # ----- Accumulator init (4 quadrants × 8 atoms = 32 frags) -----
@@ -623,35 +745,29 @@ def _compile_nt_4wave_hk_kernel(
         # Load b[0] = K=0's B_h0 (6 vec_loads).
         b0_init = lds_matrix_b_half(0, 0)
 
-        # ----- Main loop -----
-        # Carry c_frags + a0 + b0 in scf.for state. a[1], b[1] are local
-        # to each iter (re-loaded). 4 clusters per iter, each does:
-        #   24 mfmas + 1 LDS half-load + 1 HBM prefetch chunk for K+2.
+        # ----- Main loop (2× unrolled) -----
+        # The original 1-K-step-per-iter design carried ``current_stage``
+        # in the scf.for state and dispatched lds_matrix_*_half on a
+        # runtime stage. Per-stage alias scopes require compile-time
+        # ``lds_stage`` at every call site, so we unroll: each outer
+        # iter processes 2 K-steps (sub-step 0 = stage 0, sub-step 1 =
+        # stage 1) with the stages hardcoded throughout.
         TOTAL_K_STEPS = k // BLOCK_K
+        OUTER_ITERS = TOTAL_K_STEPS // 2
         assert TOTAL_K_STEPS % 2 == 0, "HK 4-wave requires K % 128 == 0"
 
         A0_LEN = M_ATOMS_PER_QUAD * K_SUBITERS  # 4 × 2 = 8 frags for a_h
         B0_LEN = N_ATOMS_PER_QUAD * K_SUBITERS  # 3 × 2 = 6 frags for b_h
 
-        init_state = ([k_zero, arith.constant(0, index=True)]
-                      + c_frags + a0_init + b0_init)
-        # state layout: [k_offset, current_stage, c_frags..., a0_frags..., b0_frags...]
-        # Loop runs TOTAL_K_STEPS-2 times; last 2 K-steps in epilogue.
-        for _ki, state in range(0, TOTAL_K_STEPS - 2, init=init_state):
-            k_now = state[0]
-            stage_curr = fx.Index(state[1])
-            stage_next = 1 - stage_curr
-            c_frags = list(state[2 : 2 + C_FRAGS_LEN])
-            a0_frags = list(state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A0_LEN])
-            b0_frags = list(state[2 + C_FRAGS_LEN + A0_LEN : 2 + C_FRAGS_LEN + A0_LEN + B0_LEN])
+        def kstep_body(k_now, stage_curr, stage_next, c_frags,
+                       a0_frags, b0_frags):
+            """One K-step (4 clusters). Returns (a0_next, b0_next) loaded
+            from stage_next for the FOLLOWING K-step.
 
+            stage_curr / stage_next are Python ints (0 or 1)."""
             k_prefetch = k_now + fx.Int32(2 * BLOCK_K)
-            k_next = k_now + fx.Int32(BLOCK_K)
 
-            # ====== BARRIER 1 (start of iter) ======
-            # vmcnt(4) drains pending prefetches so iter (k-1)'s writes are
-            # visible. lgkmcnt(0) ensures any pending LDS reads complete.
-            # s_barrier's auto-inserted vmcnt(0) finishes the drain.
+            # ====== BARRIER 1 (start of K-step) ======
             rocdl.s_waitcnt(VMCNT_4)
             rocdl.s_waitcnt(LGKMCNT_0)
             rocdl.s_barrier()
@@ -670,14 +786,11 @@ def _compile_nt_4wave_hk_kernel(
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a0_frags, b1_frags, c_frags, 1)
 
-            # ====== BARRIER 2 (mid-iter) ======
-            # Needed because c2 prefetches into Bs[curr][1] which c0 just
-            # read from. Barrier ensures all warps finished their share of
-            # that ds_read before any warp's buffer_load_lds overwrites it.
+            # ====== BARRIER 2 (mid-K-step) ======
             rocdl.s_waitcnt(VMCNT_4)
             rocdl.s_barrier()
 
-            # === c2: mma C[1][0]; load a[0] for next iter; prefetch Bs[curr][1] ===
+            # === c2: mma C[1][0]; load a[0]_next; prefetch Bs[curr][1] ===
             a0_next_frags = lds_matrix_a_half(stage_next, 0)
             for i in range_constexpr(LDG_B_REG_COUNT - LDG_B_REG_COUNT // 2):
                 ldg_sts_b_call(k_prefetch, stage_curr,
@@ -685,7 +798,7 @@ def _compile_nt_4wave_hk_kernel(
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a1_frags, b0_frags, c_frags, 2)
 
-            # === c3: mma C[1][1]; load b[0] for next iter; prefetch As[curr][1] ===
+            # === c3: mma C[1][1]; load b[0]_next; prefetch As[curr][1] ===
             b0_next_frags = lds_matrix_b_half(stage_next, 0)
             for i in range_constexpr(LDG_A_REG_COUNT - LDG_A_REG_COUNT // 2):
                 ldg_sts_a_call(k_prefetch, stage_curr,
@@ -693,38 +806,59 @@ def _compile_nt_4wave_hk_kernel(
             rocdl.s_waitcnt(LGKMCNT_0)
             mma_quadrant(a1_frags, b1_frags, c_frags, 3)
 
-            # No end-of-iter barrier — next iter's BARRIER 1 serves.
             rocdl.sched_barrier(0)
-            results = yield ([k_next, stage_next] + c_frags
-                             + a0_next_frags + b0_next_frags)
+            return a0_next_frags, b0_next_frags
 
-        # ----- Epilogue: process the last 2 K-steps without prefetch -----
-        # State at this point: a[0]/b[0] hold K_last_minus_1's A_h0/B_h0.
-        # LDS still has K_last_minus_1 and K_last data.
-        c_frags = list(results[2 : 2 + C_FRAGS_LEN])
-        a0_frags = list(results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A0_LEN])
-        b0_frags = list(results[2 + C_FRAGS_LEN + A0_LEN : 2 + C_FRAGS_LEN + A0_LEN + B0_LEN])
+        init_state = [k_zero] + c_frags + a0_init + b0_init
+        # state layout: [k_offset, c_frags..., a0_frags..., b0_frags...]
+        # Loop runs OUTER_ITERS - 1 times; last outer iter (2 K-steps)
+        # in epilogue.
+        for _oi, state in range(0, OUTER_ITERS - 1, init=init_state):
+            k_now = state[0]
+            c_frags = list(state[1 : 1 + C_FRAGS_LEN])
+            a0_frags = list(state[1 + C_FRAGS_LEN : 1 + C_FRAGS_LEN + A0_LEN])
+            b0_frags = list(state[1 + C_FRAGS_LEN + A0_LEN : 1 + C_FRAGS_LEN + A0_LEN + B0_LEN])
+
+            # Sub-step 0: process K_2i from stage 0; produces a0/b0 from stage 1.
+            a0_frags, b0_frags = kstep_body(
+                k_now, 0, 1, c_frags, a0_frags, b0_frags
+            )
+
+            # Sub-step 1: process K_2i+1 from stage 1; produces a0/b0 from stage 0.
+            k_next_kstep = k_now + fx.Int32(BLOCK_K)
+            a0_frags, b0_frags = kstep_body(
+                k_next_kstep, 1, 0, c_frags, a0_frags, b0_frags
+            )
+
+            k_next_outer = k_now + fx.Int32(2 * BLOCK_K)
+            results = yield ([k_next_outer] + c_frags + a0_frags + b0_frags)
+
+        # ----- Epilogue: last 2 K-steps without prefetch -----
+        # State at this point: a[0]/b[0] hold K_(2*OUTER_ITERS-2)'s A_h0/B_h0.
+        # LDS still has K_(2*OUTER_ITERS-2) data in stage 0 and
+        # K_(2*OUTER_ITERS-1) data in stage 1.
+        c_frags = list(results[1 : 1 + C_FRAGS_LEN])
+        a0_frags = list(results[1 + C_FRAGS_LEN : 1 + C_FRAGS_LEN + A0_LEN])
+        b0_frags = list(results[1 + C_FRAGS_LEN + A0_LEN : 1 + C_FRAGS_LEN + A0_LEN + B0_LEN])
 
         # Drain everything and run the last 2 K-steps as straightforward
         # 4-cluster bodies (no further prefetch needed).
         rocdl.s_waitcnt(VMCNT_0)
         rocdl.s_barrier()
 
-        # K_last_minus_1 (curr = (TOTAL_K_STEPS-2) % 2)
-        sm2 = fx.Index((TOTAL_K_STEPS - 2) % 2)
-        b1_e = lds_matrix_b_half(sm2, 1)
+        # K_(2*OUTER_ITERS-2) from stage 0
+        b1_e = lds_matrix_b_half(0, 1)
         mma_quadrant(a0_frags, b0_frags, c_frags, 0)
         mma_quadrant(a0_frags, b1_e, c_frags, 1)
-        a1_e = lds_matrix_a_half(sm2, 1)
+        a1_e = lds_matrix_a_half(0, 1)
         mma_quadrant(a1_e, b0_frags, c_frags, 2)
         mma_quadrant(a1_e, b1_e, c_frags, 3)
 
-        # K_last (curr = (TOTAL_K_STEPS-1) % 2)
-        sm1 = fx.Index((TOTAL_K_STEPS - 1) % 2)
-        a0_e = lds_matrix_a_half(sm1, 0)
-        b0_e = lds_matrix_b_half(sm1, 0)
-        b1_e = lds_matrix_b_half(sm1, 1)
-        a1_e = lds_matrix_a_half(sm1, 1)
+        # K_(2*OUTER_ITERS-1) from stage 1
+        a0_e = lds_matrix_a_half(1, 0)
+        b0_e = lds_matrix_b_half(1, 0)
+        b1_e = lds_matrix_b_half(1, 1)
+        a1_e = lds_matrix_a_half(1, 1)
         mma_quadrant(a0_e, b0_e, c_frags, 0)
         mma_quadrant(a0_e, b1_e, c_frags, 1)
         mma_quadrant(a1_e, b0_e, c_frags, 2)
@@ -786,7 +920,20 @@ def _compile_nt_4wave_hk_kernel(
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
+            linkage = ir.Attribute.parse('#llvm.linkage<external>')
+            for sym, size in (
+                (LDS_SYMS_A[0], AS_STAGE_BYTES),
+                (LDS_SYMS_A[1], AS_STAGE_BYTES),
+                (LDS_SYMS_B[0], BS_STAGE_BYTES),
+                (LDS_SYMS_B[1], BS_STAGE_BYTES),
+            ):
+                llvm.GlobalOp(
+                    global_type=ir.Type.parse(f"!llvm.array<{size} x i8>"),
+                    sym_name=sym,
+                    linkage=linkage,
+                    addr_space=3,
+                    alignment=1024,
+                )
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         total_tiles = bm * bn
