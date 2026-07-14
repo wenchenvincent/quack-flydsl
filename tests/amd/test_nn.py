@@ -3,6 +3,7 @@ import torch
 
 from quack.amd.nn import RMSNorm, rmsnorm
 from quack.amd.nn import LayerNorm, layernorm
+from quack.amd.nn import softmax as amd_softmax
 
 
 def _ref_rmsnorm(x, w, eps=1e-6):
@@ -112,3 +113,33 @@ def test_layernorm_module():
     assert m.weight.grad is not None
     assert m.bias.grad is not None
     assert torch.allclose(x.grad.float(), xr.grad.float(), atol=5e-4, rtol=5e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("M,N", [(128, 256), (64, 1024)])
+def test_softmax_autograd(dtype, M, N):
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=dtype, requires_grad=True)
+    xr = x.detach().clone().requires_grad_(True)
+    out = amd_softmax(x, dim=-1)
+    ref = torch.softmax(xr.float(), dim=-1).to(dtype)
+    tol = 2e-2 if dtype is torch.bfloat16 else 1e-4
+    assert torch.allclose(out.float(), ref.float(), atol=tol, rtol=tol)
+    g = torch.randn_like(out)
+    out.backward(g)
+    ref.backward(g)
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=tol * 5, rtol=tol * 5)
+
+
+def test_softmax_non_last_dim():
+    # exercise the dim-movement path: softmax over dim=0
+    torch.manual_seed(0)
+    x = torch.randn(64, 128, device="cuda", dtype=torch.float32, requires_grad=True)
+    xr = x.detach().clone().requires_grad_(True)
+    out = amd_softmax(x, dim=0)
+    ref = torch.softmax(xr, dim=0)
+    assert torch.allclose(out, ref, atol=1e-4, rtol=1e-4)
+    g = torch.randn_like(out)
+    out.backward(g)
+    ref.backward(g)
+    assert torch.allclose(x.grad, xr.grad, atol=1e-4, rtol=1e-4)

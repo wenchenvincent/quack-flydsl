@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, layernorm_fwd, layernorm_bwd
+from quack.amd.softmax import softmax_fwd, softmax_bwd
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -89,3 +90,29 @@ class LayerNorm(torch.nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return layernorm(x, self.weight, self.bias, self.eps)
+
+
+class SoftmaxFunction(torch.autograd.Function):
+    """Autograd wrapper for the AMD softmax kernels (2D, last-dim)."""
+
+    @staticmethod
+    def forward(ctx, x):
+        y = softmax_fwd(x)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        (y,) = ctx.saved_tensors
+        return softmax_bwd(dy.contiguous(), y)
+
+
+def softmax(x, dim=-1):
+    """Softmax over ``dim``. The AMD kernel is last-dim 2D, so move ``dim`` last."""
+    if dim != -1 and dim != x.ndim - 1:
+        x = x.movedim(dim, -1)
+        y = softmax(x, dim=-1)
+        return y.movedim(-1, dim)
+    n = x.shape[-1]
+    y = SoftmaxFunction.apply(x.reshape(-1, n))
+    return y.reshape(x.shape)
