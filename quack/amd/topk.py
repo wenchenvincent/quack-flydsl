@@ -10,6 +10,8 @@ Dispatches to FlyDSL bitonic-sort kernels when shape constraints are met:
 
 The FlyDSL path requires f32 input, last-dim contiguous, k ≤ 128, both
 N and k powers of 2.
+
+Also provides the autograd-integrated ``topk()`` / ``TopKFunction`` / ``topk_bwd``.
 """
 
 from typing import Tuple
