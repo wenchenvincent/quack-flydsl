@@ -14,6 +14,7 @@ from torch import Tensor
 from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, layernorm_fwd, layernorm_bwd
 from quack.amd.softmax import softmax_fwd, softmax_bwd
 from quack.amd.cross_entropy import cross_entropy_fwd, cross_entropy_bwd
+from quack.amd.topk import topk  # noqa: F401
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -180,4 +181,5 @@ __all__ = [
     "softmax",
     "CrossEntropyFunction",
     "cross_entropy",
+    "topk",
 ]

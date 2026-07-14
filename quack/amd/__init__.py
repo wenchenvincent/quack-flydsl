@@ -31,3 +31,4 @@ from quack.amd.nn import (  # noqa: F401
     softmax,
     cross_entropy,
 )
+from quack.amd.topk import topk  # noqa: F401

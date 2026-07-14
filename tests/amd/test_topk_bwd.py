@@ -64,3 +64,8 @@ def test_topk_backward_single_wave_kernel():
     vals.backward(g)
     rvals.backward(g)
     assert torch.allclose(x.grad, xr.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_topk_exported():
+    import quack.amd as qa
+    assert hasattr(qa, "topk"), "quack.amd.topk (autograd) not exported"
