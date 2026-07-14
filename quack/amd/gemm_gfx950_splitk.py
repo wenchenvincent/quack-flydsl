@@ -43,7 +43,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.compiler.protocol import fly_values
+from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -359,7 +359,7 @@ def _compile_hgemm_kernel(
                 is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(is_t0_cond_if.then_block):
                     counter_base_ptr = fly.extract_aligned_pointer_as_index(
-                        _ptr_type, fly_values(COUNTER)[0],
+                        _ptr_type, extract_to_ir_values(COUNTER)[0],
                     )
                     counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
                     counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
@@ -407,7 +407,7 @@ def _compile_hgemm_kernel(
                 scf.ConditionOp(need_wait, [cur])
             with ir.InsertionPoint(after):
                 counter_base_ptr = fly.extract_aligned_pointer_as_index(
-                    _ptr_type, fly_values(COUNTER)[0],
+                    _ptr_type, extract_to_ir_values(COUNTER)[0],
                 )
                 counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
                 counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
@@ -632,7 +632,7 @@ def _compile_hgemm_kernel(
 
         if IS_SPLIT_K:
             split_k_barrier()
-            out_raw = fly_values(C)[0]
+            out_raw = extract_to_ir_values(C)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
             for i in range_constexpr(LDG_REG_C_COUNT):

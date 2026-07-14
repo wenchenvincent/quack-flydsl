@@ -35,6 +35,7 @@ from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d, fly as _fly_d
+from flydsl.compiler.protocol import extract_to_ir_values
 
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.tile_scheduler import get_num_cus
@@ -87,7 +88,7 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
         # gives us the old value (AMD's rocdl.raw.ptr.buffer.atomic.fadd
         # discards it in the current MLIR bindings).
         counter_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-        counter_raw = Counter.__fly_values__()[0]
+        counter_raw = extract_to_ir_values(Counter)[0]
         counter_ptr = _fly_d.extract_aligned_pointer_as_index(counter_ptr_ty, counter_raw)
 
         smem_base = allocator.get_base()

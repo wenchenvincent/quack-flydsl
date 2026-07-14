@@ -46,6 +46,7 @@ from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d, fly as _fly_d
+from flydsl.compiler.protocol import extract_to_ir_values
 
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.tile_scheduler import get_num_cus
@@ -293,7 +294,7 @@ def _build_gemm_streamk_b_f16(
         # pointer from the tensor and compute per-element byte offsets.
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         _i64_type = T.i64
-        c_raw = C.__fly_values__()[0]
+        c_raw = extract_to_ir_values(C)[0]
         c_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, c_raw)
         c_base_i64 = _llvm_d.PtrToIntOp(_i64_type, c_base_ptr_idx).result
 
@@ -506,7 +507,7 @@ def _build_gemm_streamk_c_f16(*, M, N, K, num_cus, arch):
         B_buf = fx.rocdl.make_buffer_tensor(B)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         _i64_type = T.i64
-        c_raw = C.__fly_values__()[0]
+        c_raw = extract_to_ir_values(C)[0]
         c_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, c_raw)
         c_base_i64 = _llvm_d.PtrToIntOp(_i64_type, c_base_ptr_idx).result
 
@@ -783,11 +784,11 @@ def _build_gemm_streamk_d_f16(*, M, N, K, num_cus, has_bias, arch):
 
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         _i64_type = T.i64
-        c_raw = C.__fly_values__()[0]
+        c_raw = extract_to_ir_values(C)[0]
         c_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, c_raw)
         c_base_i64 = _llvm_d.PtrToIntOp(_i64_type, c_base_ptr_idx).result
         # CTR is int32[total_tiles] — raw ptr for atomic ops.
-        ctr_raw = CTR.__fly_values__()[0]
+        ctr_raw = extract_to_ir_values(CTR)[0]
         ctr_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, ctr_raw)
         ctr_base_i64 = _llvm_d.PtrToIntOp(_i64_type, ctr_base_ptr_idx).result
 
@@ -1249,10 +1250,10 @@ def _build_gemm_streamk_e_f16(
 
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         _i64_type = T.i64
-        c_raw = C.__fly_values__()[0]
+        c_raw = extract_to_ir_values(C)[0]
         c_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, c_raw)
         c_base_i64 = _llvm_d.PtrToIntOp(_i64_type, c_base_ptr_idx).result
-        ctr_raw = CTR.__fly_values__()[0]
+        ctr_raw = extract_to_ir_values(CTR)[0]
         ctr_base_ptr_idx = _fly_d.extract_aligned_pointer_as_index(_ptr_type, ctr_raw)
         ctr_base_i64 = _llvm_d.PtrToIntOp(_i64_type, ctr_base_ptr_idx).result
 
