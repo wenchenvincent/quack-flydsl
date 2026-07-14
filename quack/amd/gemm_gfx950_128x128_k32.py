@@ -217,7 +217,7 @@ def _build_gemm_128x128_k32(*, M, N, K, dtype_str, arch):
                 b_frags.append(vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_vals))
 
             def _mfma(a, b, acc):
-                if dtype_str == "bf16":
+                if fx.const_expr(dtype_str == "bf16"):
                     # The K=32 bf16 MFMA takes native bf16 vectors (unlike
                     # the K=16 bf16_1k twin which takes i16).
                     return fx.rocdl.mfma_f32_16x16x32_bf16(
@@ -283,7 +283,7 @@ _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 def _compile(M, N, K, dtype_str, arch):
     key = (M, N, K, dtype_str, arch)
     got = _kernel_cache.get(key)
-    if got is None:
+    if fx.const_expr(got is None):
         got = _build_gemm_128x128_k32(M=M, N=N, K=K, dtype_str=dtype_str, arch=arch)
         _kernel_cache[key] = got
     return got
