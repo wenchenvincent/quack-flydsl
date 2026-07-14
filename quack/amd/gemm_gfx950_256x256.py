@@ -264,7 +264,7 @@ def _build_gemm_256x256(*, M, N, K, dtype_str, arch):
                 b_frags.append(vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_vals))
 
             def _mfma(a, b, acc):
-                if dtype_str == "bf16":
+                if fx.const_expr(dtype_str == "bf16"):
                     a_i = vector.bitcast(T.vec(_FRAG_A, T.i16), a)
                     b_i = vector.bitcast(T.vec(_FRAG_B, T.i16), b)
                     return fx.rocdl.mfma_f32_16x16x16bf16_1k(

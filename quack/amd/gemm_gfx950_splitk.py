@@ -126,10 +126,10 @@ def _compile_hgemm_kernel(
     ks = k // SPLIT_K
     assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
     assert BLOCK_K >= 32
-    if B_PRE_SHUFFLE:
+    if fx.const_expr(B_PRE_SHUFFLE):
         B_TO_LDS = False
     GPU_ARCH = get_rocm_arch()
-    if GPU_ARCH == "gfx942":
+    if fx.const_expr(GPU_ARCH == "gfx942"):
         WMMA_IMPL = _WmmaHalfK16(dtype)
         DMA_BYTES = 4
         MFMA_PER_WARP_K = 2
@@ -189,7 +189,7 @@ def _compile_hgemm_kernel(
     AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
     AS_BYTES = max(AS_BYTES, BLOCK_M * BLOCK_N * DTYPE_BYTES)
     allocator.ptr = smem_a_offset + AS_BYTES
-    if B_TO_LDS:
+    if fx.const_expr(B_TO_LDS):
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
@@ -200,11 +200,11 @@ def _compile_hgemm_kernel(
 
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
     KERNEL_NAME += "_NA" if not ASYNC_COPY else "_AS"
-    if B_PRE_SHUFFLE:
+    if fx.const_expr(B_PRE_SHUFFLE):
         KERNEL_NAME += "_BP"
-    if IS_SPLIT_K:
+    if fx.const_expr(IS_SPLIT_K):
         KERNEL_NAME += f"_SPK{SPLIT_K}"
-    if B_TO_LDS:
+    if fx.const_expr(B_TO_LDS):
         KERNEL_NAME += "_BS"
 
     _HAS_BIAS = has_bias
@@ -240,10 +240,10 @@ def _compile_hgemm_kernel(
     #              tensor has 2*n cols (dpreact shape), but we compute
     #              the 2× HBM stride in the epilogue branch directly.
     #   - Plain/dact/bias/activation: unchanged.
-    if _IS_GATED:
+    if fx.const_expr(_IS_GATED):
         OUT_BLOCK_N = BLOCK_N // 2
         OUT_N = n // 2
-    elif _IS_DGATED:
+    elif fx.const_expr(_IS_DGATED):
         OUT_BLOCK_N = BLOCK_N
         OUT_N = 2 * n
     else:
@@ -275,33 +275,33 @@ def _compile_hgemm_kernel(
         #   - gated:               OUT_N = n / 2
         #   - dgated:              OUT_N = 2 * n  (dpreact has 2× cols)
         C_ = GTensor(C, dtype=dtype_, shape=(-1, OUT_N))
-        if _IS_DACT:
+        if fx.const_expr(_IS_DACT):
             # dact path: preact has the same (M, N) shape as the matmul output.
             PreAct_ = GTensor(PreAct, dtype=dtype_, shape=(-1, n))
-        if _IS_DGATED:
+        if fx.const_expr(_IS_DGATED):
             # dgated path: preact is the saved interleaved (g0,u0,g1,u1,…)
             # with shape (M, 2n).  Same shape as the dpreact output.
             PreAct_ = GTensor(PreAct, dtype=dtype_, shape=(-1, 2 * n))
-        if _EMIT_POSTACT:
+        if fx.const_expr(_EMIT_POSTACT):
             # postact = act(g_c) * u_c of shape (M, n) — one scalar per
             # matmul acc column.
             Postact_ = GTensor(Postact, dtype=dtype_, shape=(-1, n))
-        if _HAS_BIAS:
+        if fx.const_expr(_HAS_BIAS):
             Bias_ = GTensor(Bias, dtype=T.f32, shape=(n,))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        if B_TO_LDS:
+        if fx.const_expr(B_TO_LDS):
             smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
             bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
         smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
-        if B_PRE_SHUFFLE:
+        if fx.const_expr(B_PRE_SHUFFLE):
             SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(
                 n // WARP_ATOM_N, k // WARP_ATOM_K,
                 WARP_ATOM_K // LDG_VEC_SIZE, WARP_ATOM_N, LDG_VEC_SIZE,
             ))
-        if IS_SPLIT_K:
+        if fx.const_expr(IS_SPLIT_K):
             COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
 
         tid = fx.Int32(fx.thread_idx.x)
@@ -512,7 +512,7 @@ def _compile_hgemm_kernel(
                 b_k0 = b_k0_base + kk
                 for ii in range_constexpr(WARP_N_STEPS):
                     b_n0 = b_n0_base + ii
-                    if not B_PRE_SHUFFLE:
+                    if fx.const_expr(not B_PRE_SHUFFLE):
                         warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                         warp_atom_k_idx = kk * WARP_ATOM_K
                         n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
@@ -535,7 +535,7 @@ def _compile_hgemm_kernel(
                     a_frag = a_frags[kk * WARP_M_STEPS + ii]
                     for jj in range_constexpr(WARP_N_STEPS):
                         b_frag = b_frags[kk * WARP_N_STEPS + jj]
-                        if MFMA_PER_WARP_K == 2:
+                        if fx.const_expr(MFMA_PER_WARP_K == 2):
                             a_i64x2 = vector.bitcast(T.i64x2, a_frag)
                             a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
                             a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
@@ -553,7 +553,7 @@ def _compile_hgemm_kernel(
                             c_idx = ii * WARP_N_STEPS + jj
                             c_frags[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags[c_idx])
 
-        if IS_SPLIT_K:
+        if fx.const_expr(IS_SPLIT_K):
             zero_c()
 
         # Only the non-B_TO_LDS path is ported (it's the one hgemm's
@@ -570,7 +570,7 @@ def _compile_hgemm_kernel(
             LDG_TOTAL = LDG_REG_A_COUNT_ + WARP_K_STEPS * WARP_N_STEPS
             mfma_ = _OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
             ldg_ = _OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
-            if ASYNC_COPY:
+            if fx.const_expr(ASYNC_COPY):
                 AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_TOTAL - 1) // LDG_TOTAL
                 for _ in range_constexpr(LDG_TOTAL):
                     rocdl.sched_vmem(ldg_.consume(1))
@@ -594,13 +594,13 @@ def _compile_hgemm_kernel(
             c_frags = state[2 : 2 + C_FRAGS_LEN]
             a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
             b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
-            if ASYNC_COPY:
+            if fx.const_expr(ASYNC_COPY):
                 ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
             else:
                 a_regs_next = ldg_a(k_offset + BLOCK_K)
             b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
             block_mma_sync(a_frags, b_frags, c_frags)
-            if not ASYNC_COPY:
+            if fx.const_expr(not ASYNC_COPY):
                 sts_a(a_regs_next, next_stage)
             hot_loop_scheduler()
             gpu.barrier()
@@ -630,7 +630,7 @@ def _compile_hgemm_kernel(
                     )
                     cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
 
-        if IS_SPLIT_K:
+        if fx.const_expr(IS_SPLIT_K):
             split_k_barrier()
             out_raw = extract_to_ir_values(C)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
@@ -686,7 +686,7 @@ def _compile_hgemm_kernel(
                 cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    if _IS_GATED:
+                    if fx.const_expr(_IS_GATED):
                         # Interleaved-pair convention: matmul output cols
                         # [2c, 2c+1] are (gate, up) pairs. Caller must pass
                         # weight with gate and up rows interleaved (use the
@@ -705,7 +705,7 @@ def _compile_hgemm_kernel(
                             (m_local_idx, in_n_start + fx.Index(LDG_VEC_SIZE)),
                             LDG_VEC_SIZE,
                         )  # cols [2c+8..2c+16) = (g4, u4, g5, u5, g6, u6, g7, u7)
-                        if _HAS_BIAS:
+                        if fx.const_expr(_HAS_BIAS):
                             pair0 = _apply_epilogue(
                                 pair0, Bias_,
                                 n_offset + in_n_start,
@@ -723,7 +723,7 @@ def _compile_hgemm_kernel(
                             (m_global_idx, n_offset_out + n_local_idx),
                             out_vec, LDG_VEC_SIZE,
                         )
-                    elif _IS_DACT:
+                    elif fx.const_expr(_IS_DACT):
                         # Load matmul-accumulator chunk from LDS and
                         # preact chunk from HBM, then compute
                         # dpreact_i = acc_i * act'(preact_i).
@@ -739,7 +739,7 @@ def _compile_hgemm_kernel(
                             (m_global_idx, n_offset + n_local_idx),
                             vec, LDG_VEC_SIZE,
                         )
-                    elif _IS_DGATED:
+                    elif fx.const_expr(_IS_DGATED):
                         # Load one acc chunk (LDG_VEC_SIZE scalars) from LDS
                         # and two interleaved preact chunks (2 × LDG_VEC_SIZE
                         # scalars covering 4 + 4 = 8 (gate, up) pairs) from
@@ -769,7 +769,7 @@ def _compile_hgemm_kernel(
                             (m_global_idx, preact_n_start + fx.Index(LDG_VEC_SIZE)),
                             dpreact1, LDG_VEC_SIZE,
                         )
-                        if _EMIT_POSTACT:
+                        if fx.const_expr(_EMIT_POSTACT):
                             Postact_.vec_store(
                                 (m_global_idx, n_offset + n_local_idx),
                                 postact_vec, LDG_VEC_SIZE,
@@ -1066,20 +1066,20 @@ def _apply_epi_torch(
         pairs = dgated_preact.view(M, hidden, 2).float()
         gate = pairs[..., 0]
         up = pairs[..., 1]
-        if dgated_gate_type == "swiglu":
+        if fx.const_expr(dgated_gate_type == "swiglu"):
             sig = torch.sigmoid(gate)
             silu_g = gate * sig
             dsilu_dg = sig * (1.0 + gate * (1.0 - sig))
             dgate = acc32 * dsilu_dg * up
             dup = acc32 * silu_g
             post = silu_g * up
-        elif dgated_gate_type == "reglu":
+        elif fx.const_expr(dgated_gate_type == "reglu"):
             mask = (gate > 0).float()
             fwd = torch.relu(gate)
             dgate = acc32 * mask * up
             dup = acc32 * fwd
             post = fwd * up
-        elif dgated_gate_type == "geglu":
+        elif fx.const_expr(dgated_gate_type == "geglu"):
             import math as _m
             c1 = _m.sqrt(2.0 / _m.pi)
             z = c1 * (gate + 0.044715 * gate.pow(3))
@@ -1090,7 +1090,7 @@ def _apply_epi_torch(
             dgate = acc32 * dgelu_dg * up
             dup = acc32 * gelu_g
             post = gelu_g * up
-        elif dgated_gate_type == "glu":
+        elif fx.const_expr(dgated_gate_type == "glu"):
             sig = torch.sigmoid(gate)
             dsig_dg = sig * (1.0 - sig)
             dgate = acc32 * dsig_dg * up
@@ -1098,7 +1098,7 @@ def _apply_epi_torch(
             post = sig * up
         dpreact = torch.stack([dgate, dup], dim=-1).view(M, 2 * hidden)
         out.copy_(dpreact.to(out.dtype))
-        if emit_postact:
+        if fx.const_expr(emit_postact):
             postact_out.copy_(post.to(postact_out.dtype))
         return
 
@@ -1111,13 +1111,13 @@ def _apply_epi_torch(
         pairs = acc32.view(M, N // 2, 2)
         gate = pairs[..., 0]
         up = pairs[..., 1]
-        if gate_type == "swiglu":
+        if fx.const_expr(gate_type == "swiglu"):
             gated = torch.nn.functional.silu(gate) * up
-        elif gate_type == "reglu":
+        elif fx.const_expr(gate_type == "reglu"):
             gated = torch.relu(gate) * up
-        elif gate_type == "geglu":
+        elif fx.const_expr(gate_type == "geglu"):
             gated = torch.nn.functional.gelu(gate, approximate="tanh") * up
-        elif gate_type == "glu":
+        elif fx.const_expr(gate_type == "glu"):
             gated = torch.sigmoid(gate) * up
         out.copy_(gated.to(out.dtype))
         return
@@ -1125,14 +1125,14 @@ def _apply_epi_torch(
     if dact_activation != "none":
         # dpreact = acc * act'(preact)
         p32 = preact.float()
-        if dact_activation == "relu":
+        if fx.const_expr(dact_activation == "relu"):
             deriv = (p32 > 0).float()
-        elif dact_activation == "relu_sq":
+        elif fx.const_expr(dact_activation == "relu_sq"):
             deriv = 2.0 * p32 * (p32 > 0).float()
-        elif dact_activation == "silu":
+        elif fx.const_expr(dact_activation == "silu"):
             sig = torch.sigmoid(p32)
             deriv = sig * (1.0 + p32 * (1.0 - sig))
-        elif dact_activation == "gelu_tanh_approx":
+        elif fx.const_expr(dact_activation == "gelu_tanh_approx"):
             import math as _m
             c1 = _m.sqrt(2.0 / _m.pi)
             z = c1 * (p32 + 0.044715 * p32.pow(3))
@@ -1143,13 +1143,13 @@ def _apply_epi_torch(
         return
 
     # Plain bias/activation.
-    if activation == "relu":
+    if fx.const_expr(activation == "relu"):
         acc32 = torch.relu(acc32)
-    elif activation == "relu_sq":
+    elif fx.const_expr(activation == "relu_sq"):
         acc32 = torch.relu(acc32) * acc32
-    elif activation == "silu":
+    elif fx.const_expr(activation == "silu"):
         acc32 = torch.nn.functional.silu(acc32)
-    elif activation == "gelu_tanh_approx":
+    elif fx.const_expr(activation == "gelu_tanh_approx"):
         acc32 = torch.nn.functional.gelu(acc32, approximate="tanh")
     out.copy_(acc32.to(out.dtype))
 
@@ -1243,7 +1243,7 @@ def _gemm_splitk_out(
     assert not (is_gated and activation != "none"), (
         "gate_type subsumes activation; combining both is redundant/unsupported"
     )
-    if emit_postact:
+    if fx.const_expr(emit_postact):
         assert is_dgated, "emit_postact is only valid with dgated_gate_type set"
         assert postact_out.shape == (M, N)
         assert postact_out.dtype == a.dtype and postact_out.stride(-1) == 1
@@ -1266,13 +1266,13 @@ def _gemm_splitk_out(
     epi_mode = _splitk_epi_mode(
         M, N, K, has_epilogue, kwargs["SPLIT_K"], override=splitk_epi_mode,
     )
-    if epi_mode == "force_splitk1":
+    if fx.const_expr(epi_mode == "force_splitk1"):
         kwargs = dict(kwargs, SPLIT_K=1)
-    elif epi_mode == "last_partial":
+    elif fx.const_expr(epi_mode == "last_partial"):
         # Follow-up: in-kernel last-partial counter. For now, fall back to
         # force_splitk1 so correctness is preserved.
         kwargs = dict(kwargs, SPLIT_K=1)
-    elif epi_mode == "two_launch":
+    elif fx.const_expr(epi_mode == "two_launch"):
         # Run the unfused SPLIT_K>1 matmul into scratch, then torch epi.
         scratch = torch.zeros(M, N, device=a.device, dtype=a.dtype)
         _gemm_splitk_raw(
@@ -1407,7 +1407,7 @@ def gemm_splitk(
     if out is None:
         out = torch.empty(M, out_n, device=a.device, dtype=a.dtype)
     emit_postact = is_dgated and (dgated_emit_postact or dgated_postact_out is not None)
-    if emit_postact:
+    if fx.const_expr(emit_postact):
         if dgated_postact_out is None:
             dgated_postact_out = torch.empty(M, N, device=a.device, dtype=a.dtype)
         postact_arg = dgated_postact_out
@@ -1419,7 +1419,7 @@ def gemm_splitk(
         dgated_gate_type, dgated_preact, postact_arg, emit_postact,
         splitk_epi_mode, force_split_k,
     )
-    if emit_postact:
+    if fx.const_expr(emit_postact):
         return out, dgated_postact_out
     return out
 
