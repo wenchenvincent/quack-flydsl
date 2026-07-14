@@ -86,9 +86,9 @@ def _build_ce_fwd(
     elem_bits = dtype.width
 
     sym_tag = ""
-    if has_smoothing:
+    if fx.const_expr(has_smoothing):
         sym_tag += "_sm"
-    if has_loss_weight:
+    if fx.const_expr(has_loss_weight):
         sym_tag += "_lw"
     sym = f"quack_amd_ce_fwd_smem{sym_tag}"
     allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
@@ -117,7 +117,7 @@ def _build_ce_fwd(
         s_sum = SmemPtr(base_ptr, off_sum, T.f32, shape=(num_waves,))
         s_max.get()
         s_sum.get()
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             s_sum_x = SmemPtr(base_ptr, off_sum_x, T.f32, shape=(num_waves,))
             s_sum_x.get()
 
@@ -125,7 +125,7 @@ def _build_ce_fwd(
         TGT_buf = fx.rocdl.make_buffer_tensor(TGT)
         Loss_buf = fx.rocdl.make_buffer_tensor(Loss)
         Lse_buf = fx.rocdl.make_buffer_tensor(Lse)
-        if has_loss_weight:
+        if fx.const_expr(has_loss_weight):
             LW_buf = fx.rocdl.make_buffer_tensor(LossWeight)
             lw_div = fx.logical_divide(LW_buf, fx.make_layout(1, 1))
         row_x = fx.slice(X_buf, (bid, None))
@@ -211,7 +211,7 @@ def _build_ce_fwd(
 
         # Pass 2: row sum_exp (+ optional sum_x for label smoothing).
         thread_sum = zero_f
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             thread_sum_x = zero_f
         for base in range_constexpr(0, N, block_threads):
             idx = tid + fx.Int32(base)
@@ -221,12 +221,12 @@ def _build_ce_fwd(
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             e = _fm.exp(ArithValue(x) - row_max_av, fastmath="fast")
             thread_sum = ArithValue(thread_sum) + is_valid.select(e, zero_f)
-            if has_smoothing:
+            if fx.const_expr(has_smoothing):
                 thread_sum_x = ArithValue(thread_sum_x) + is_valid.select(ArithValue(x), zero_f)
         row_sum = _block_reduce(thread_sum, s_sum, lambda a, b: a.addf(b, fastmath="fast"), 0.0)
         log_sum = _fm.log(ArithValue(row_sum), fastmath="fast")
         lse = row_max_av + log_sum
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             row_sum_x = _block_reduce(
                 thread_sum_x, s_sum_x,
                 lambda a, b: a.addf(b, fastmath="fast"), 0.0,
@@ -238,7 +238,7 @@ def _build_ce_fwd(
         # that works in `quack.amd.rmsnorm` store_rstd).
         if tid == fx.Int32(0):
             t_e = _load(tgt_div, tgt_reg_ty, ca_tgt, bid)
-            if target_dtype is Int64:
+            if fx.const_expr(target_dtype is Int64):
                 t_i32 = t_e.trunci(T.i32)
             else:
                 t_i32 = t_e
@@ -248,13 +248,13 @@ def _build_ce_fwd(
             x_t = x_t_e if dtype is Float32 else x_t_e.extf(compute_type)
             lse_av = ArithValue(lse)
             nll = lse_av - ArithValue(x_t)
-            if has_smoothing:
+            if fx.const_expr(has_smoothing):
                 alpha = ArithValue(smoothing)
                 one_minus_alpha = ArithValue(Float32(1.0)) - alpha
                 loss = one_minus_alpha * nll + alpha * (lse_av - mean_x)
             else:
                 loss = nll
-            if has_loss_weight:
+            if fx.const_expr(has_loss_weight):
                 loss = loss * ArithValue(_load(lw_div, f_reg_ty, ca_f, bid))
             zero_av = ArithValue(Float32(0.0))
             loss = is_ignore.select(zero_av, loss)
@@ -328,9 +328,9 @@ def _build_ce_bwd_dx(
     elem_bits = dtype.width
 
     sym_tag = ""
-    if has_smoothing:
+    if fx.const_expr(has_smoothing):
         sym_tag += "_sm"
-    if has_loss_weight:
+    if fx.const_expr(has_loss_weight):
         sym_tag += "_lw"
     sym = f"quack_amd_ce_bwd_dx_smem{sym_tag}"
     allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
@@ -358,7 +358,7 @@ def _build_ce_bwd_dx(
         Lse_buf = fx.rocdl.make_buffer_tensor(Lse)
         DLoss_buf = fx.rocdl.make_buffer_tensor(DLoss)
         DX_buf = fx.rocdl.make_buffer_tensor(DX)
-        if has_loss_weight:
+        if fx.const_expr(has_loss_weight):
             LW_buf = fx.rocdl.make_buffer_tensor(LossWeight)
             lw_div = fx.logical_divide(LW_buf, fx.make_layout(1, 1))
 
@@ -404,11 +404,11 @@ def _build_ce_bwd_dx(
         is_ignore = arith.cmpi(arith.CmpIPredicate.eq, t_i32, ignore_index)
         zero_av = ArithValue(Float32(0.0))
         scale_val = dloss_val
-        if has_loss_weight:
+        if fx.const_expr(has_loss_weight):
             lw_val = ArithValue(_load(lw_div, f_reg_ty, ca_f, bid))
             scale_val = scale_val * lw_val
         scale_val = is_ignore.select(zero_av, scale_val)
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             alpha = ArithValue(smoothing)
             one_minus_alpha_av = ArithValue(Float32(1.0)) - alpha
             alpha_over_n = alpha * ArithValue(Float32(1.0 / N))
@@ -423,7 +423,7 @@ def _build_ce_bwd_dx(
                 x = x_e if dtype is Float32 else x_e.extf(compute_type)
                 softmax_val = _fm.exp(ArithValue(x) - lse_val, fastmath="fast")
                 is_target = arith.cmpi(arith.CmpIPredicate.eq, idx, t_i32)
-                if has_smoothing:
+                if fx.const_expr(has_smoothing):
                     match_bonus = is_target.select(one_minus_alpha_av, zero_av)
                     tgt_d = alpha_over_n + match_bonus
                 else:
@@ -488,9 +488,9 @@ def _build_ce_fwd_bwd(
     elem_bits = dtype.width
 
     sym_tag = f"m{M_hint}"
-    if has_smoothing:
+    if fx.const_expr(has_smoothing):
         sym_tag += "_sm"
-    if has_loss_weight:
+    if fx.const_expr(has_loss_weight):
         sym_tag += "_lw"
     sym = f"quack_amd_ce_fwd_bwd_smem_{sym_tag}"
     allocator = SmemAllocator(None, arch=arch, global_sym_name=sym)
@@ -519,7 +519,7 @@ def _build_ce_fwd_bwd(
         s_max = SmemPtr(base_ptr, off_max, T.f32, shape=(num_waves,))
         s_sum = SmemPtr(base_ptr, off_sum, T.f32, shape=(num_waves,))
         s_max.get(); s_sum.get()
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             s_sum_x = SmemPtr(base_ptr, off_sum_x, T.f32, shape=(num_waves,))
             s_sum_x.get()
 
@@ -528,7 +528,7 @@ def _build_ce_fwd_bwd(
         Loss_buf = fx.rocdl.make_buffer_tensor(Loss)
         Lse_buf = fx.rocdl.make_buffer_tensor(Lse)
         DX_buf = fx.rocdl.make_buffer_tensor(DX)
-        if has_loss_weight:
+        if fx.const_expr(has_loss_weight):
             LW_buf = fx.rocdl.make_buffer_tensor(LossWeight)
             lw_div = fx.logical_divide(LW_buf, fx.make_layout(1, 1))
 
@@ -618,7 +618,7 @@ def _build_ce_fwd_bwd(
         # Pass 2: row sum_exp → lse. Also tracks row sum_x for label
         # smoothing (mean(x) factor in the NLL-uniform mix term).
         thread_sum = zero_f
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             thread_sum_x = zero_f
         for base in range_constexpr(0, N, block_threads):
             idx = tid + fx.Int32(base)
@@ -628,13 +628,13 @@ def _build_ce_fwd_bwd(
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             e = _fm.exp(ArithValue(x) - row_max_av, fastmath="fast")
             thread_sum = ArithValue(thread_sum) + is_valid.select(e, zero_f)
-            if has_smoothing:
+            if fx.const_expr(has_smoothing):
                 thread_sum_x = ArithValue(thread_sum_x) + is_valid.select(ArithValue(x), zero_f)
         row_sum = _block_reduce(thread_sum, s_sum, lambda a, b: a.addf(b, fastmath="fast"), 0.0)
         log_sum = _fm.log(ArithValue(row_sum), fastmath="fast")
         lse = row_max_av + log_sum
         lse_av = ArithValue(lse)
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             row_sum_x = _block_reduce(
                 thread_sum_x, s_sum_x,
                 lambda a, b: a.addf(b, fastmath="fast"), 0.0,
@@ -664,7 +664,7 @@ def _build_ce_fwd_bwd(
         # NLL loss = lse - x[target]. For label smoothing:
         #   loss = (1-α) * nll + α * (lse - mean(x))
         nll_av = lse_av - ArithValue(x_t)
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             alpha = ArithValue(smoothing)
             one_minus_alpha = ArithValue(Float32(1.0)) - alpha
             uniform_term = lse_av - mean_x
@@ -673,7 +673,7 @@ def _build_ce_fwd_bwd(
             loss_val = nll_av
 
         # ignore_index mask is already computed above (is_ignore).
-        if has_loss_weight:
+        if fx.const_expr(has_loss_weight):
             lw_val = ArithValue(_load(lw_div, f_reg_ty, ca_f, bid))
             loss_val = loss_val * lw_val
             scale_val = lw_val
@@ -703,7 +703,7 @@ def _build_ce_fwd_bwd(
         # `tgt_d = α/N + (idx == t ? 1-α : 0)`. When α=0 this collapses
         # to the usual one_hot. scale = 0 when ignored so dx = 0
         # regardless of softmax / target distribution.
-        if has_smoothing:
+        if fx.const_expr(has_smoothing):
             alpha_over_n = alpha * ArithValue(Float32(1.0 / N))
             one_minus_alpha_av = one_minus_alpha
         for base in range_constexpr(0, N, block_threads):
@@ -713,7 +713,7 @@ def _build_ce_fwd_bwd(
                 x = x_e if dtype is Float32 else x_e.extf(compute_type)
                 softmax_val = _fm.exp(ArithValue(x) - lse_av, fastmath="fast")
                 is_target = arith.cmpi(arith.CmpIPredicate.eq, idx, t_i32)
-                if has_smoothing:
+                if fx.const_expr(has_smoothing):
                     match_bonus = is_target.select(one_minus_alpha_av, zero_av)
                     tgt_d = alpha_over_n + match_bonus
                 else:

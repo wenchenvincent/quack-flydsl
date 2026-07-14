@@ -133,65 +133,65 @@ def _build_norm_fwd(
         base_ptr = allocator.get_base()
         s_sumsq = SmemPtr(base_ptr, off_sumsq, T.f32, shape=(num_waves,))
         s_sumsq.get()
-        if is_layernorm:
+        if fx.const_expr(is_layernorm):
             s_sum = SmemPtr(base_ptr, off_sum, T.f32, shape=(num_waves,))
             s_sum.get()
 
         X_buf = fx.rocdl.make_buffer_tensor(X)
         W_buf = fx.rocdl.make_buffer_tensor(W)
         Y_buf = fx.rocdl.make_buffer_tensor(Y)
-        if has_bias:
+        if fx.const_expr(has_bias):
             B_buf = fx.rocdl.make_buffer_tensor(B)
-        if has_residual:
+        if fx.const_expr(has_residual):
             Res_buf = fx.rocdl.make_buffer_tensor(Res)
-        if store_residual_out:
+        if fx.const_expr(store_residual_out):
             ResOut_buf = fx.rocdl.make_buffer_tensor(ResOut)
-        if store_rstd:
+        if fx.const_expr(store_rstd):
             Rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
-        if store_mean:
+        if fx.const_expr(store_mean):
             Mean_buf = fx.rocdl.make_buffer_tensor(Mean)
 
         row_x = fx.slice(X_buf, (bid, None))
         row_y = fx.slice(Y_buf, (bid, None))
         x_div = fx.logical_divide(row_x, fx.make_layout(1, 1))
         y_div = fx.logical_divide(row_y, fx.make_layout(1, 1))
-        if per_head:
+        if fx.const_expr(per_head):
             # Input is reshaped to (M*H, N); weight is (H, N). Head index
             # for this workgroup is bid % H.
             head_idx = bid % fx.Int32(num_heads)
             row_w = fx.slice(W_buf, (head_idx, None))
             w_div = fx.logical_divide(row_w, fx.make_layout(1, 1))
-            if has_bias:
+            if fx.const_expr(has_bias):
                 row_b = fx.slice(B_buf, (head_idx, None))
                 b_div = fx.logical_divide(row_b, fx.make_layout(1, 1))
         else:
             w_div = fx.logical_divide(W_buf, fx.make_layout(1, 1))
-            if has_bias:
+            if fx.const_expr(has_bias):
                 b_div = fx.logical_divide(B_buf, fx.make_layout(1, 1))
-        if has_residual:
+        if fx.const_expr(has_residual):
             row_res = fx.slice(Res_buf, (bid, None))
             res_div = fx.logical_divide(row_res, fx.make_layout(1, 1))
-        if store_residual_out:
+        if fx.const_expr(store_residual_out):
             row_res_out = fx.slice(ResOut_buf, (bid, None))
             res_out_div = fx.logical_divide(row_res_out, fx.make_layout(1, 1))
-        if store_rstd:
+        if fx.const_expr(store_rstd):
             rstd_div = fx.logical_divide(Rstd_buf, fx.make_layout(1, 1))
-        if store_mean:
+        if fx.const_expr(store_mean):
             mean_div = fx.logical_divide(Mean_buf, fx.make_layout(1, 1))
 
         copy_atom_x = fx.make_copy_atom(_bufcopy_for(elem_bits), elem_type)
         copy_atom_w = fx.make_copy_atom(_bufcopy_for(w_elem_bits), w_elem_type)
         copy_atom_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
-        if has_bias:
+        if fx.const_expr(has_bias):
             copy_atom_b = fx.make_copy_atom(_bufcopy_for(b_elem_bits), b_elem_type)
-        if has_residual:
+        if fx.const_expr(has_residual):
             copy_atom_r = fx.make_copy_atom(_bufcopy_for(r_elem_bits), r_elem_type)
         x_reg_ty = fx.MemRefType.get(elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         w_reg_ty = fx.MemRefType.get(w_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         f_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
-        if has_bias:
+        if fx.const_expr(has_bias):
             b_reg_ty = fx.MemRefType.get(b_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
-        if has_residual:
+        if fx.const_expr(has_residual):
             r_reg_ty = fx.MemRefType.get(r_elem_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
         reg_lay = fx.make_layout(1, 1)
 
@@ -216,7 +216,7 @@ def _build_norm_fwd(
         # f32 values per thread — trivial register pressure for N ≤ 8192.
         c_zero_f = arith.constant(0.0, type=compute_type)
         thread_sumsq = c_zero_f
-        if is_layernorm:
+        if fx.const_expr(is_layernorm):
             thread_sum = c_zero_f
         x_cache = []  # holds x_eff (f32 ArithValue) for each base_idx step
         for base_idx in range_constexpr(0, N, block_threads):
@@ -226,16 +226,16 @@ def _build_norm_fwd(
             x_e = _load(x_div, x_reg_ty, copy_atom_x, idx_safe)
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             x_av = ArithValue(x)
-            if has_residual:
+            if fx.const_expr(has_residual):
                 r_e = _load(res_div, r_reg_ty, copy_atom_r, idx_safe)
                 r_f = r_e if residual_dtype is Float32 else r_e.extf(compute_type)
                 x_av = x_av + ArithValue(r_f)
             x_cache.append(x_av)
             x2 = x_av * x_av
             thread_sumsq = ArithValue(thread_sumsq) + is_valid.select(x2, c_zero_f)
-            if is_layernorm:
+            if fx.const_expr(is_layernorm):
                 thread_sum = ArithValue(thread_sum) + is_valid.select(x_av, c_zero_f)
-            if has_residual and store_residual_out:
+            if fx.const_expr(has_residual and store_residual_out):
                 # Only store when idx is in range (branch so out-of-range lanes skip).
                 if arith.cmpi(arith.CmpIPredicate.ult, idx, fx.Int32(N)):
                     # ResOut dtype tracks residual_dtype.
@@ -244,7 +244,7 @@ def _build_norm_fwd(
 
         sum_sq = block_reduce_add(thread_sumsq, s_sumsq, num_waves,
                                   wave_size=wave_size, tid=tid)
-        if is_layernorm:
+        if fx.const_expr(is_layernorm):
             sum_x = block_reduce_add(thread_sum, s_sum, num_waves,
                                      wave_size=wave_size, tid=tid)
             mean = ArithValue(sum_x) / n_float
@@ -255,12 +255,12 @@ def _build_norm_fwd(
             mean_sq = ArithValue(sum_sq) / n_float
             rstd = (mean_sq + _EPS).rsqrt(fastmath=fm_fast)
 
-        if store_rstd:
+        if fx.const_expr(store_rstd):
             if tid == fx.Int32(0):
                 _store(rstd_div, f_reg_ty, copy_atom_f, bid, rstd)
-        if store_mean:
+        if fx.const_expr(store_mean):
             if tid == fx.Int32(0):
-                if is_layernorm:
+                if fx.const_expr(is_layernorm):
                     _store(mean_div, f_reg_ty, copy_atom_f, bid, mean)
                 else:
                     _store(mean_div, f_reg_ty, copy_atom_f, bid, c_zero_f)
@@ -275,7 +275,7 @@ def _build_norm_fwd(
                 x_eff = x_cache[step]
                 x_centered = (x_eff - mean) if is_layernorm else x_eff
                 y_f32 = (x_centered * rstd) * w
-                if has_bias:
+                if fx.const_expr(has_bias):
                     b_e = _load(b_div, b_reg_ty, copy_atom_b, idx)
                     b = b_e if bias_dtype is Float32 else b_e.extf(compute_type)
                     y_f32 = y_f32 + ArithValue(b)
@@ -339,7 +339,7 @@ def _build_norm_dx(*, N, dtype, weight_dtype, is_layernorm, arch):
         base_ptr = allocator.get_base()
         s_red = SmemPtr(base_ptr, red_offset, T.f32, shape=(num_waves,))
         s_red.get()
-        if is_layernorm:
+        if fx.const_expr(is_layernorm):
             s_red2 = SmemPtr(base_ptr, red_offset + num_waves * 4, T.f32,
                              shape=(num_waves,))
             s_red2.get()
@@ -383,7 +383,7 @@ def _build_norm_dx(*, N, dtype, weight_dtype, is_layernorm, arch):
             fx.copy_atom_call(ca, r, fx.slice(div, (None, idx)))
 
         rstd_val = ArithValue(_load(rstd_div, f_reg_ty, copy_atom_f, bid))
-        if is_layernorm:
+        if fx.const_expr(is_layernorm):
             mean_val = ArithValue(_load(mean_div, f_reg_ty, copy_atom_f, bid))
 
         c_zero_f = arith.constant(0.0, type=compute_type)
@@ -399,7 +399,7 @@ def _build_norm_dx(*, N, dtype, weight_dtype, is_layernorm, arch):
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             d = d_e if dtype is Float32 else d_e.extf(compute_type)
             w = w_e if weight_dtype is Float32 else w_e.extf(compute_type)
-            if is_layernorm:
+            if fx.const_expr(is_layernorm):
                 x_hat = (ArithValue(x) - mean_val) * rstd_val
             else:
                 x_hat = ArithValue(x) * rstd_val
@@ -407,14 +407,14 @@ def _build_norm_dx(*, N, dtype, weight_dtype, is_layernorm, arch):
             contrib = x_hat * wdy
             contrib_safe = is_valid.select(contrib, c_zero_f)
             thread_acc_xhat_wdy = ArithValue(thread_acc_xhat_wdy) + contrib_safe
-            if is_layernorm:
+            if fx.const_expr(is_layernorm):
                 wdy_safe = is_valid.select(wdy, c_zero_f)
                 thread_acc_wdy = ArithValue(thread_acc_wdy) + wdy_safe
 
         sum_xhat_wdy = block_reduce_add(thread_acc_xhat_wdy, s_red, num_waves,
                                         wave_size=wave_size, tid=tid)
         c1 = ArithValue(sum_xhat_wdy) / n_float
-        if is_layernorm:
+        if fx.const_expr(is_layernorm):
             sum_wdy = block_reduce_add(thread_acc_wdy, s_red2, num_waves,
                                        wave_size=wave_size, tid=tid)
             c0 = ArithValue(sum_wdy) / n_float
@@ -428,12 +428,12 @@ def _build_norm_dx(*, N, dtype, weight_dtype, is_layernorm, arch):
                 x = x_e if dtype is Float32 else x_e.extf(compute_type)
                 d = d_e if dtype is Float32 else d_e.extf(compute_type)
                 w = w_e if weight_dtype is Float32 else w_e.extf(compute_type)
-                if is_layernorm:
+                if fx.const_expr(is_layernorm):
                     x_hat = (ArithValue(x) - mean_val) * rstd_val
                 else:
                     x_hat = ArithValue(x) * rstd_val
                 wdy = ArithValue(d) * w
-                if is_layernorm:
+                if fx.const_expr(is_layernorm):
                     dx_f32 = (wdy - c0 - x_hat * c1) * rstd_val
                 else:
                     dx_f32 = (wdy - x_hat * c1) * rstd_val
@@ -560,7 +560,7 @@ def _build_norm_dw(*, N, dtype, weight_dtype, is_layernorm, arch):
             r_e = _load(rstd_div, f_reg_ty, copy_atom_f, m_i32)
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             d = d_e if dtype is Float32 else d_e.extf(compute_type)
-            if is_layernorm:
+            if fx.const_expr(is_layernorm):
                 mean_e = _load(mean_div, f_reg_ty, copy_atom_f, m_i32)
                 x_hat = (ArithValue(x) - ArithValue(mean_e)) * ArithValue(r_e)
             else:
@@ -714,7 +714,7 @@ def _build_norm_dw_partial(
             r_e = _load(rstd_div, f_reg_ty, copy_atom_f, m_i32)
             x = x_e if dtype is Float32 else x_e.extf(compute_type)
             d = d_e if dtype is Float32 else d_e.extf(compute_type)
-            if is_layernorm:
+            if fx.const_expr(is_layernorm):
                 mean_e = _load(mean_div, f_reg_ty, copy_atom_f, m_i32)
                 x_hat = (ArithValue(x) - ArithValue(mean_e)) * ArithValue(r_e)
             else:
@@ -1059,12 +1059,12 @@ def _norm_fwd(
     assert x.dim() == 2 and out.shape == x.shape
     assert x.stride(-1) == 1 and out.stride(-1) == 1
     per_head = num_heads > 0
-    if per_head:
+    if fx.const_expr(per_head):
         assert weight.dim() == 2 and weight.size(0) == num_heads and weight.size(1) == x.size(-1)
     else:
         assert weight.dim() == 1 and weight.size(0) == x.size(-1)
     if bias is not None:
-        if per_head:
+        if fx.const_expr(per_head):
             assert bias.dim() == 2 and bias.size(0) == num_heads and bias.size(1) == x.size(-1)
         else:
             assert bias.dim() == 1 and bias.size(0) == x.size(-1)
@@ -1271,7 +1271,7 @@ def _prep_norm_fwd_inputs(x, weight, bias, residual, residual_out):
     the 1D-weight (non-per-head) path.
     """
     per_head = x.dim() == 3 or (weight is not None and weight.dim() == 2)
-    if per_head:
+    if fx.const_expr(per_head):
         assert x.dim() == 3, f"per-head rmsnorm needs 3D x; got dim {x.dim()}"
         assert weight.dim() == 2, f"per-head weight must be 2D (H, N); got dim {weight.dim()}"
         B, H, N = x.shape
