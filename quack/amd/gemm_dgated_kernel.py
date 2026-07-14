@@ -128,7 +128,7 @@ def _build_gemm_dgated_f16(*, M, N, K, gate_type, out_dtype_str, preact_dtype_st
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -199,7 +199,7 @@ def _build_gemm_dgated_f16(*, M, N, K, gate_type, out_dtype_str, preact_dtype_st
             one = arith.constant(1.0, type=T.f32)
             zero = arith.constant(0.0, type=T.f32)
 
-            if gate_type == "swiglu":
+            if fx.const_expr(gate_type == "swiglu"):
                 # y = silu(gate) * up; sig = sigmoid(gate)
                 sig = ArithValue(one) / (ArithValue(one) + _fm.exp(-gate, fastmath="fast"))
                 silu_g = gate * sig
@@ -209,13 +209,13 @@ def _build_gemm_dgated_f16(*, M, N, K, gate_type, out_dtype_str, preact_dtype_st
                 # d y / d up   = silu(gate)
                 dgate = dout * up * silu_prime
                 dup = dout * silu_g
-            elif gate_type == "reglu":
+            elif fx.const_expr(gate_type == "reglu"):
                 is_pos = gate > Float32(0.0)
                 relu_g = ArithValue(is_pos.select(gate, ArithValue(zero)))
                 postact = relu_g * up
                 dgate = dout * up * ArithValue(is_pos.select(one, zero))
                 dup = dout * relu_g
-            elif gate_type == "geglu":
+            elif fx.const_expr(gate_type == "geglu"):
                 import math as _py_math
                 c1 = _py_math.sqrt(2.0 / _py_math.pi)
                 c2 = 0.044715 * c1
@@ -233,7 +233,7 @@ def _build_gemm_dgated_f16(*, M, N, K, gate_type, out_dtype_str, preact_dtype_st
                 postact = gelu_g * up
                 dgate = dout * up * gelu_prime
                 dup = dout * gelu_g
-            elif gate_type == "glu":
+            elif fx.const_expr(gate_type == "glu"):
                 sig = ArithValue(one) / (ArithValue(one) + _fm.exp(-gate, fastmath="fast"))
                 postact = sig * up
                 dgate = dout * up * sig * (ArithValue(one) - sig)
@@ -267,7 +267,7 @@ _kernel_cache: dict = {}
 def _compile(M, N, K, gate_type, out_dtype, preact_dtype, arch):
     key = (M, N, K, gate_type, out_dtype, preact_dtype, arch)
     got = _kernel_cache.get(key)
-    if got is None:
+    if fx.const_expr(got is None):
         got = _build_gemm_dgated_f16(
             M=M, N=N, K=K,
             gate_type=gate_type,

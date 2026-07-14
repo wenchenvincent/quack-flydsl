@@ -55,15 +55,15 @@ _SUPPORTED_GATES = {"swiglu", "reglu", "geglu", "glu"}
 def _apply_gate(gate_val, up_val, gate_type):
     """Apply the gating function to f32 ArithValues. Same math as
     gemm_gfx950.py's inlined activations — computed via hardware exp."""
-    if gate_type == "swiglu":
+    if fx.const_expr(gate_type == "swiglu"):
         # silu(gate) * up. silu(x) = x / (1 + exp(-x)).
         silu = gate_val / (Float32(1.0) + _fm.exp(-gate_val, fastmath="fast"))
         return silu * up_val
-    if gate_type == "reglu":
+    if fx.const_expr(gate_type == "reglu"):
         # relu(gate) * up.
         zero = arith.constant(0.0, type=T.f32)
         return gate_val.maximumf(zero) * up_val
-    if gate_type == "geglu":
+    if fx.const_expr(gate_type == "geglu"):
         # gelu_tanh_approx(gate) * up.
         import math as _py_math
         c1 = _py_math.sqrt(2.0 / _py_math.pi)
@@ -74,7 +74,7 @@ def _apply_gate(gate_val, up_val, gate_type):
         tanh_z = Float32(1.0) - Float32(2.0) / (Float32(1.0) + _fm.exp(Float32(2.0) * tanh_arg, fastmath="fast"))
         gelu = x * (Float32(0.5) + Float32(0.5) * tanh_z)
         return gelu * up_val
-    if gate_type == "glu":
+    if fx.const_expr(gate_type == "glu"):
         # sigmoid(gate) * up. sigmoid(x) = 1 / (1 + exp(-x)).
         sig = Float32(1.0) / (Float32(1.0) + _fm.exp(-gate_val, fastmath="fast"))
         return sig * up_val
@@ -137,7 +137,7 @@ def _build_gated_16x16(*, M, N, K, dtype_str, out_dtype_str, gate_type, arch):
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -186,7 +186,7 @@ def _build_gated_16x16(*, M, N, K, dtype_str, out_dtype_str, gate_type, arch):
             b_gate_frag = vector.from_elements(T.vec(_FRAG_C, in_elem_type), b_gate_vals)
             b_up_frag = vector.from_elements(T.vec(_FRAG_C, in_elem_type), b_up_vals)
 
-            if dtype_str == "bf16":
+            if fx.const_expr(dtype_str == "bf16"):
                 a_frag_i16 = vector.bitcast(T.vec(_FRAG_C, T.i16), a_frag)
                 b_gate_i16 = vector.bitcast(T.vec(_FRAG_C, T.i16), b_gate_frag)
                 b_up_i16 = vector.bitcast(T.vec(_FRAG_C, T.i16), b_up_frag)
@@ -254,7 +254,7 @@ def gemm_gated(
     assert A.dtype in (torch.float16, torch.bfloat16)
     assert A.dtype == B.dtype
     assert gate_type in _SUPPORTED_GATES
-    if out_dtype is None:
+    if fx.const_expr(out_dtype is None):
         out_dtype = A.dtype
     assert out_dtype in _OUT_DTYPE_MAP
     M, K = A.shape
@@ -265,7 +265,7 @@ def gemm_gated(
     out_dtype_str = _OUT_DTYPE_MAP[out_dtype]
     key = (M, N, K, dtype_str, out_dtype_str, gate_type, get_rocm_arch())
     launcher = _kernel_cache.get(key)
-    if launcher is None:
+    if fx.const_expr(launcher is None):
         launcher = _build_gated_16x16(
             M=M, N=N, K=K, dtype_str=dtype_str, out_dtype_str=out_dtype_str,
             gate_type=gate_type, arch=get_rocm_arch(),

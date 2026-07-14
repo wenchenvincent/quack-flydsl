@@ -88,13 +88,13 @@ def _build_gemm_norm_act_f16(
         A_buf = fx.rocdl.make_buffer_tensor(A)
         B_buf = fx.rocdl.make_buffer_tensor(B)
         Out_buf = fx.rocdl.make_buffer_tensor(Out)
-        if has_bias:
+        if fx.const_expr(has_bias):
             Bias_buf = fx.rocdl.make_buffer_tensor(Bias)
             bias_div = fx.logical_divide(Bias_buf, fx.make_layout(1, 1))
-        if has_colvec:
+        if fx.const_expr(has_colvec):
             Colvec_buf = fx.rocdl.make_buffer_tensor(Colvec)
             colvec_div = fx.logical_divide(Colvec_buf, fx.make_layout(1, 1))
-        if has_rowvec:
+        if fx.const_expr(has_rowvec):
             Rowvec_buf = fx.rocdl.make_buffer_tensor(Rowvec)
             rowvec_div = fx.logical_divide(Rowvec_buf, fx.make_layout(1, 1))
 
@@ -134,7 +134,7 @@ def _build_gemm_norm_act_f16(
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -177,9 +177,9 @@ def _build_gemm_norm_act_f16(
 
         # Epilogue: bias → colvec × rowvec → activation.
         out_col = n_base + lane_row
-        if has_bias:
+        if fx.const_expr(has_bias):
             bias_val = ArithValue(_load_f(bias_div, out_col))
-        if has_rowvec:
+        if fx.const_expr(has_rowvec):
             rowvec_val = ArithValue(_load_f(rowvec_div, out_col))
 
         for i in range_constexpr(_FRAG_C):
@@ -190,22 +190,22 @@ def _build_gemm_norm_act_f16(
             val_i = vector.extract(acc, static_position=[i], dynamic_position=[])
             val = ArithValue(val_i)
 
-            if has_bias:
+            if fx.const_expr(has_bias):
                 val = val + bias_val
-            if has_colvec:
+            if fx.const_expr(has_colvec):
                 col_val = ArithValue(_load_f(colvec_div, out_row))
                 val = val * col_val
-            if has_rowvec:
+            if fx.const_expr(has_rowvec):
                 val = val * rowvec_val
 
             zero = arith.constant(0.0, type=T.f32)
-            if activation == "relu":
+            if fx.const_expr(activation == "relu"):
                 val = val.maximumf(zero)
-            elif activation == "relu_sq":
+            elif fx.const_expr(activation == "relu_sq"):
                 val = val.maximumf(zero) * val
-            elif activation == "silu":
+            elif fx.const_expr(activation == "silu"):
                 val = val / (Float32(1.0) + _fm.exp(-val, fastmath="fast"))
-            elif activation == "gelu_tanh_approx":
+            elif fx.const_expr(activation == "gelu_tanh_approx"):
                 import math as _py_math
                 c1 = _py_math.sqrt(2.0 / _py_math.pi)
                 c2 = 0.044715 * c1
@@ -244,7 +244,7 @@ _kernel_cache: dict = {}
 def _compile(M, N, K, activation, out_dtype, has_bias, has_colvec, has_rowvec, arch):
     key = (M, N, K, activation, out_dtype, has_bias, has_colvec, has_rowvec, arch)
     got = _kernel_cache.get(key)
-    if got is None:
+    if fx.const_expr(got is None):
         got = _build_gemm_norm_act_f16(
             M=M, N=N, K=K,
             activation=activation,

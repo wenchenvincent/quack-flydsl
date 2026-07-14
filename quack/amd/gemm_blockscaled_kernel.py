@@ -137,7 +137,7 @@ def _build_blockscaled_16x16x128(
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -266,13 +266,13 @@ def _build_blockscaled_16x16x128(
             if has_bias:
                 val = val + bias_val
             # Inlined activations — matches gemm_gfx950.py's math.
-            if activation == "relu":
+            if fx.const_expr(activation == "relu"):
                 zero = arith.constant(0.0, type=T.f32)
                 val = val.maximumf(zero)
-            elif activation == "relu_sq":
+            elif fx.const_expr(activation == "relu_sq"):
                 zero = arith.constant(0.0, type=T.f32)
                 val = val.maximumf(zero) * val
-            elif activation == "gelu_tanh_approx":
+            elif fx.const_expr(activation == "gelu_tanh_approx"):
                 import math as _py_math
                 from flydsl.expr import math as _fm
                 c1 = _py_math.sqrt(2.0 / _py_math.pi)
@@ -282,7 +282,7 @@ def _build_blockscaled_16x16x128(
                 tanh_arg = x * (c1 + c2 * x_sq)
                 tanh_z = Float32(1.0) - Float32(2.0) / (Float32(1.0) + _fm.exp(Float32(2.0) * tanh_arg, fastmath="fast"))
                 val = x * (Float32(0.5) + Float32(0.5) * tanh_z)
-            elif activation == "silu":
+            elif fx.const_expr(activation == "silu"):
                 from flydsl.expr import math as _fm
                 val = val / (Float32(1.0) + _fm.exp(-val, fastmath="fast"))
             _store_out(c_div, out_col, val)
@@ -321,7 +321,7 @@ _OUT_DTYPE_MAP = {
 def _compile(M, N, K, out_dtype_str, has_bias, activation, has_alpha, has_c, arch):
     key = (M, N, K, out_dtype_str, has_bias, activation, has_alpha, has_c, arch)
     got = _kernel_cache.get(key)
-    if got is None:
+    if fx.const_expr(got is None):
         got = _build_blockscaled_16x16x128(
             M=M, N=N, K=K, out_dtype_str=out_dtype_str,
             has_bias=has_bias, activation=activation,
@@ -356,7 +356,7 @@ def mxfp8_gemm_mfma(
     assert A.is_cuda and B.is_cuda
     assert A.dtype == torch.float8_e4m3fn
     assert B.dtype == torch.float8_e4m3fn
-    if out_dtype is None:
+    if fx.const_expr(out_dtype is None):
         out_dtype = torch.float32
     assert out_dtype in _OUT_DTYPE_MAP
     M, K = A.shape
@@ -370,7 +370,7 @@ def mxfp8_gemm_mfma(
     has_c = C is not None
     if beta != 0.0 and C is None:
         raise AssertionError("beta != 0 requires a C tensor")
-    if C is not None:
+    if fx.const_expr(C is not None):
         assert C.shape == (M, N) and C.dtype == torch.float32 and C.stride(-1) == 1
     out = torch.empty(M, N, device=A.device, dtype=out_dtype)
     launcher = _compile(

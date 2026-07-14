@@ -89,7 +89,7 @@ def _build_symmetric_16x16(*, M, K, dtype_str, out_dtype_str, arch):
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -133,7 +133,7 @@ def _build_symmetric_16x16(*, M, K, dtype_str, out_dtype_str, arch):
                 b_vals.append(_load_h(aj_div, lane_k_base + fx.Int32(i)))
             b_frag = vector.from_elements(T.vec(_FRAG_C, in_elem_type), b_vals)
 
-            if dtype_str == "bf16":
+            if fx.const_expr(dtype_str == "bf16"):
                 a_i16 = vector.bitcast(T.vec(_FRAG_C, T.i16), a_frag)
                 b_i16 = vector.bitcast(T.vec(_FRAG_C, T.i16), b_frag)
                 acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
@@ -192,14 +192,14 @@ def gemm_symmetric(
     assert A.is_cuda
     assert A.dtype in (torch.float16, torch.bfloat16)
     assert A.stride(-1) == 1
-    if out_dtype is None:
+    if fx.const_expr(out_dtype is None):
         out_dtype = torch.float32
     M, K = A.shape
     assert M % 16 == 0 and K % 16 == 0
     dtype_str = "f16" if A.dtype == torch.float16 else "bf16"
     key = (M, K, dtype_str, _OUT_DTYPE_MAP[out_dtype], get_rocm_arch())
     launcher = _kernel_cache.get(key)
-    if launcher is None:
+    if fx.const_expr(launcher is None):
         launcher = _build_symmetric_16x16(
             M=M, K=K, dtype_str=dtype_str,
             out_dtype_str=_OUT_DTYPE_MAP[out_dtype], arch=get_rocm_arch(),

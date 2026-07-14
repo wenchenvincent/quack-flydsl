@@ -117,7 +117,7 @@ def _build_gemm_dact_f16(*, M, N, K, activation, out_dtype_str, preact_dtype_str
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -181,26 +181,26 @@ def _build_gemm_dact_f16(*, M, N, K, activation, out_dtype_str, preact_dtype_str
             one = arith.constant(1.0, type=T.f32)
             half = arith.constant(0.5, type=T.f32)
 
-            if activation is None:
+            if fx.const_expr(activation is None):
                 act_prime = ArithValue(one)
                 postact = pre
-            elif activation == "relu":
+            elif fx.const_expr(activation == "relu"):
                 # act'(x) = 1 if x > 0 else 0
                 is_pos = pre > Float32(0.0)
                 act_prime = ArithValue(is_pos.select(one, zero))
                 postact = ArithValue(is_pos.select(pre, ArithValue(zero)))
-            elif activation == "relu_sq":
+            elif fx.const_expr(activation == "relu_sq"):
                 # act(x) = (max(x, 0))^2; act'(x) = 2 * max(x, 0)
                 is_pos = pre > Float32(0.0)
                 relu_x = ArithValue(is_pos.select(pre, ArithValue(zero)))
                 act_prime = relu_x * Float32(2.0)
                 postact = relu_x * relu_x
-            elif activation == "silu":
+            elif fx.const_expr(activation == "silu"):
                 # silu(x) = x * sigmoid(x); silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
                 sig = ArithValue(one) / (ArithValue(one) + _fm.exp(-pre, fastmath="fast"))
                 act_prime = sig * (ArithValue(one) + pre * (ArithValue(one) - sig))
                 postact = pre * sig
-            elif activation == "gelu_tanh_approx":
+            elif fx.const_expr(activation == "gelu_tanh_approx"):
                 import math as _py_math
                 c1 = _py_math.sqrt(2.0 / _py_math.pi)
                 c2 = 0.044715 * c1
@@ -249,7 +249,7 @@ _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16", torch.float32: "f32"
 def _compile(M, N, K, activation, out_dtype, preact_dtype, arch):
     key = (M, N, K, activation, out_dtype, preact_dtype, arch)
     got = _kernel_cache.get(key)
-    if got is None:
+    if fx.const_expr(got is None):
         got = _build_gemm_dact_f16(
             M=M, N=N, K=K,
             activation=activation,
