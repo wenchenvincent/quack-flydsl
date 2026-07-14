@@ -35,7 +35,11 @@ class RMSNormFunction(torch.autograd.Function):
 
 
 def rmsnorm(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
-    """RMSNorm over the last dim, autograd-enabled. Flattens leading dims."""
+    """RMSNorm over the last dim, autograd-enabled. Flattens leading dims.
+
+    Note: the AMD kernel currently supports only the default ``eps=1e-6``; any
+    other value raises ``NotImplementedError`` (runtime eps is a later pass).
+    """
     n = x.shape[-1]
     out = RMSNormFunction.apply(x.reshape(-1, n), weight, eps)
     return out.reshape(x.shape)
@@ -74,7 +78,11 @@ class LayerNormFunction(torch.autograd.Function):
 
 
 def layernorm(x: Tensor, weight: Tensor, bias: Tensor, eps: float = 1e-6) -> Tensor:
-    """LayerNorm over the last dim, autograd-enabled. Flattens leading dims."""
+    """LayerNorm over the last dim, autograd-enabled. Flattens leading dims.
+
+    Note: the AMD kernel currently supports only the default ``eps=1e-6``; any
+    other value raises ``NotImplementedError`` (runtime eps is a later pass).
+    """
     n = x.shape[-1]
     out = LayerNormFunction.apply(x.reshape(-1, n), weight, bias, eps)
     return out.reshape(x.shape)
@@ -139,19 +147,24 @@ class CrossEntropyFunction(torch.autograd.Function):
 def cross_entropy(x, target, ignore_index=-100, reduction="mean"):
     """Cross-entropy loss over the class dim, autograd-enabled.
 
-    ``x`` is ``(M, V)``, ``target`` is ``(M,)`` int. Reduction ∈ {none, mean, sum};
-    ``mean`` normalizes by the count of non-ignored rows.
+    ``x`` is ``(..., V)`` logits and ``target`` is ``(...)`` int over the leading
+    dims; leading dims are flattened like the other layers here. Reduction ∈
+    {none, mean, sum}; ``none`` returns per-element loss shaped like ``target``,
+    ``mean`` normalizes by the count of non-ignored elements.
 
-    Edge case: if every row is ignored, ``mean`` returns 0.0 (via ``clamp_min(1)``)
-    rather than nan as ``torch.nn.functional.cross_entropy`` does.
+    Edge case: if every element is ignored, ``mean`` returns 0.0 (via
+    ``clamp_min(1)``) rather than nan as ``torch.nn.functional.cross_entropy`` does.
     """
-    loss = CrossEntropyFunction.apply(x, target, ignore_index)  # per-row
+    v = x.shape[-1]
+    x2d = x.reshape(-1, v)
+    tgt1d = target.reshape(-1)
+    loss = CrossEntropyFunction.apply(x2d, tgt1d, ignore_index)  # per-element
     if reduction == "none":
-        return loss
+        return loss.reshape(target.shape)
     if reduction == "sum":
         return loss.sum()
     if reduction == "mean":
-        valid = (target != ignore_index).sum().clamp_min(1)
+        valid = (tgt1d != ignore_index).sum().clamp_min(1)
         return loss.sum() / valid
     raise ValueError(f"unknown reduction: {reduction!r}")
 

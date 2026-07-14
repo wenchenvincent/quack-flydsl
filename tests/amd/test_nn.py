@@ -186,3 +186,55 @@ def test_public_exports():
 
     for name in ("RMSNorm", "LayerNorm", "rmsnorm", "layernorm", "softmax", "cross_entropy"):
         assert hasattr(qa, name), f"quack.amd.{name} not exported"
+
+
+def test_layernorm_3d_flatten():
+    torch.manual_seed(0)
+    B, S, N = 4, 16, 256
+    x = torch.randn(B, S, N, device="cuda", dtype=torch.float32, requires_grad=True)
+    w = torch.randn(N, device="cuda", dtype=torch.float32, requires_grad=True)
+    b = torch.randn(N, device="cuda", dtype=torch.float32, requires_grad=True)
+    xr, wr, br = (t.detach().clone().requires_grad_(True) for t in (x, w, b))
+    out = layernorm(x, w, b)
+    ref = _ref_layernorm(xr, wr, br)
+    assert out.shape == (B, S, N)
+    assert torch.allclose(out.float(), ref.float(), atol=1e-4, rtol=1e-4)
+    g = torch.randn_like(out)
+    out.backward(g)
+    ref.backward(g)
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=5e-4, rtol=5e-4)
+    assert torch.allclose(w.grad.float(), wr.grad.float(), atol=5e-4, rtol=5e-4)
+    assert torch.allclose(b.grad.float(), br.grad.float(), atol=5e-4, rtol=5e-4)
+
+
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+def test_cross_entropy_bf16(reduction):
+    torch.manual_seed(0)
+    M, V = 256, 512
+    x = torch.randn(M, V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    tgt = torch.randint(0, V, (M,), device="cuda")
+    xr = x.detach().float().clone().requires_grad_(True)
+    loss = amd_ce(x, tgt, reduction=reduction)
+    ref = torch.nn.functional.cross_entropy(xr, tgt, reduction=reduction)
+    assert torch.allclose(loss.float(), ref.float(), atol=1e-2, rtol=1e-2)
+    (loss.sum() if reduction == "none" else loss).backward()
+    (ref.sum() if reduction == "none" else ref).backward()
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_cross_entropy_3d_flatten():
+    torch.manual_seed(0)
+    B, S, V = 8, 16, 256
+    x = torch.randn(B, S, V, device="cuda", dtype=torch.float32, requires_grad=True)
+    tgt = torch.randint(0, V, (B, S), device="cuda")
+    xr = x.detach().clone().requires_grad_(True)
+    loss = amd_ce(x, tgt, reduction="none")
+    ref = torch.nn.functional.cross_entropy(
+        xr.reshape(-1, V), tgt.reshape(-1), reduction="none"
+    ).reshape(B, S)
+    assert loss.shape == (B, S)
+    assert torch.allclose(loss.float(), ref.float(), atol=1e-3, rtol=1e-3)
+    g = torch.randn_like(loss)
+    loss.backward(g)
+    ref.backward(g)
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=1e-3, rtol=1e-3)
