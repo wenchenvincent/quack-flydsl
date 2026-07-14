@@ -15,6 +15,8 @@ from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd
 
 
 class RMSNormFunction(torch.autograd.Function):
+    """Autograd wrapper over the AMD ``rmsnorm_fwd``/``rmsnorm_bwd`` kernels."""
+
     @staticmethod
     def forward(ctx, x, weight, eps):
         need_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
@@ -38,6 +40,8 @@ def rmsnorm(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
 
 
 class RMSNorm(torch.nn.Module):
+    """RMSNorm layer backed by the AMD reduction kernels."""
+
     def __init__(self, dim: int, eps: float = 1e-6, device=None, dtype=None):
         super().__init__()
         self.eps = eps
