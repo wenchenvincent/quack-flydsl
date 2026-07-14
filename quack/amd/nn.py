@@ -141,6 +141,9 @@ def cross_entropy(x, target, ignore_index=-100, reduction="mean"):
 
     ``x`` is ``(M, V)``, ``target`` is ``(M,)`` int. Reduction ∈ {none, mean, sum};
     ``mean`` normalizes by the count of non-ignored rows.
+
+    Edge case: if every row is ignored, ``mean`` returns 0.0 (via ``clamp_min(1)``)
+    rather than nan as ``torch.nn.functional.cross_entropy`` does.
     """
     loss = CrossEntropyFunction.apply(x, target, ignore_index)  # per-row
     if reduction == "none":
@@ -151,3 +154,17 @@ def cross_entropy(x, target, ignore_index=-100, reduction="mean"):
         valid = (target != ignore_index).sum().clamp_min(1)
         return loss.sum() / valid
     raise ValueError(f"unknown reduction: {reduction!r}")
+
+
+__all__ = [
+    "RMSNormFunction",
+    "rmsnorm",
+    "RMSNorm",
+    "LayerNormFunction",
+    "layernorm",
+    "LayerNorm",
+    "SoftmaxFunction",
+    "softmax",
+    "CrossEntropyFunction",
+    "cross_entropy",
+]

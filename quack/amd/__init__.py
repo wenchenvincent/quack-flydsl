@@ -22,3 +22,12 @@ except ImportError as e:
         "quack.amd requires FlyDSL. Install with `pip install -e '.[amd]'` "
         "or see https://github.com/ROCm/FlyDSL for build instructions."
     ) from e
+
+from quack.amd.nn import (  # noqa: F401
+    RMSNorm,
+    LayerNorm,
+    rmsnorm,
+    layernorm,
+    softmax,
+    cross_entropy,
+)

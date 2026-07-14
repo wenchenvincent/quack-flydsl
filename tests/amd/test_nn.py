@@ -40,15 +40,16 @@ def test_rmsnorm_module():
     m = RMSNorm(256, device="cuda", dtype=torch.float32)
     x = torch.randn(64, 256, device="cuda", requires_grad=True)
     xr = x.detach().clone().requires_grad_(True)
+    wr = m.weight.detach().clone().requires_grad_(True)
     y = m(x)
-    ref = _ref_rmsnorm(xr, m.weight)
+    ref = _ref_rmsnorm(xr, wr)
     assert y.shape == (64, 256)
     assert torch.allclose(y.float(), ref.float(), atol=1e-4, rtol=1e-4)
     g = torch.randn_like(y)
     y.backward(g)
     ref.backward(g)
-    assert m.weight.grad is not None
     assert torch.allclose(x.grad.float(), xr.grad.float(), atol=5e-4, rtol=5e-4)
+    assert torch.allclose(m.weight.grad.float(), wr.grad.float(), atol=5e-4, rtol=5e-4)
 
 
 def test_rmsnorm_3d_flatten():
@@ -104,16 +105,18 @@ def test_layernorm_module():
     torch.nn.init.normal_(m.bias)
     x = torch.randn(64, 256, device="cuda", requires_grad=True)
     xr = x.detach().clone().requires_grad_(True)
+    wr = m.weight.detach().clone().requires_grad_(True)
+    br = m.bias.detach().clone().requires_grad_(True)
     y = m(x)
-    ref = _ref_layernorm(xr, m.weight, m.bias)
+    ref = _ref_layernorm(xr, wr, br)
     assert y.shape == (64, 256)
     assert torch.allclose(y.float(), ref.float(), atol=1e-4, rtol=1e-4)
     g = torch.randn_like(y)
     y.backward(g)
     ref.backward(g)
-    assert m.weight.grad is not None
-    assert m.bias.grad is not None
     assert torch.allclose(x.grad.float(), xr.grad.float(), atol=5e-4, rtol=5e-4)
+    assert torch.allclose(m.weight.grad.float(), wr.grad.float(), atol=5e-4, rtol=5e-4)
+    assert torch.allclose(m.bias.grad.float(), br.grad.float(), atol=5e-4, rtol=5e-4)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -176,3 +179,10 @@ def test_cross_entropy_ignore_index():
     loss.backward()
     ref.backward()
     assert torch.allclose(x.grad.float(), xr.grad.float(), atol=1e-3, rtol=1e-3)
+
+
+def test_public_exports():
+    import quack.amd as qa
+
+    for name in ("RMSNorm", "LayerNorm", "rmsnorm", "layernorm", "softmax", "cross_entropy"):
+        assert hasattr(qa, name), f"quack.amd.{name} not exported"
