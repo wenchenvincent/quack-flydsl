@@ -94,7 +94,7 @@ def _compile_tn_kernel(
     assert k % BLOCK_K == 0, f"k={k} must be multiple of BLOCK_K={BLOCK_K}"
 
     GPU_ARCH = get_rocm_arch()
-    if GPU_ARCH == "gfx942":
+    if fx.const_expr(GPU_ARCH == "gfx942"):
         WMMA_IMPL = _WmmaHalfK16(dtype)
         DMA_BYTES = 4
         MFMA_PER_WARP_K = 2
@@ -214,7 +214,7 @@ def _compile_tn_kernel(
         bn_c_int = n // BLOCK_N
         bn_c = fx.Int32(bn_c_int)
         bm_c = fx.Int32(bm_c_int)
-        if XCD_SWIZZLE > 1:
+        if fx.const_expr(XCD_SWIZZLE > 1):
             total_int = bm_c_int * bn_c_int
             xcd_c = fx.Int32(XCD_SWIZZLE)
             pids_per_group = fx.Int32(total_int // XCD_SWIZZLE)
@@ -228,7 +228,7 @@ def _compile_tn_kernel(
             pid = xcd_group * pids_per_group + fx.Int32(min_ge) + xcd_local
         else:
             pid = flat_pid
-        if GROUP_M > 1:
+        if fx.const_expr(GROUP_M > 1):
             gm_c = fx.Int32(GROUP_M)
             width_c = fx.Int32(GROUP_M * bn_c_int)
             group_id = pid // width_c
@@ -425,7 +425,7 @@ def _compile_tn_kernel(
                     a_frag = a_frags[kk * WARP_M_STEPS + ii]
                     for jj in range_constexpr(WARP_N_STEPS):
                         b_frag = b_frags[kk * WARP_N_STEPS + jj]
-                        if MFMA_PER_WARP_K == 2:
+                        if fx.const_expr(MFMA_PER_WARP_K == 2):
                             a_i64x2 = vector.bitcast(T.i64x2, a_frag)
                             a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
                             a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])

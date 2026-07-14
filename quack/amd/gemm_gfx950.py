@@ -110,10 +110,10 @@ def _build_gemm_16x16(
         A_buf = fx.rocdl.make_buffer_tensor(A)
         B_buf = fx.rocdl.make_buffer_tensor(B)
         C_buf = fx.rocdl.make_buffer_tensor(C)
-        if has_bias:
+        if fx.const_expr(has_bias):
             Bias_buf = fx.rocdl.make_buffer_tensor(Bias)
             bias_div = fx.logical_divide(Bias_buf, fx.make_layout(1, 1))
-        if has_c:
+        if fx.const_expr(has_c):
             Cin_buf = fx.rocdl.make_buffer_tensor(Cin)
 
         # Output tile offset in (M, N).
@@ -174,7 +174,7 @@ def _build_gemm_16x16(
             from flydsl.expr.vector import full as _vfull
             r = fx.memref_alloca(out_reg_ty, reg_lay)
             elem_py = Numeric.from_ir_type(out_reg_ty.element_type)
-            if out_dtype_str == "f32":
+            if fx.const_expr(out_dtype_str == "f32"):
                 ts = _vfull(1, Float32(val_f32), Float32)
             else:
                 val = ArithValue(val_f32).truncf(out_elem_type)
@@ -217,7 +217,7 @@ def _build_gemm_16x16(
             # `_1k` instruction; inputs stay in native dtype (the instruction
             # takes i16-viewed operands internally, handled by FlyDSL's
             # rocdl wrapper).
-            if dtype_str == "bf16":
+            if fx.const_expr(dtype_str == "bf16"):
                 a_frag_i16 = vector.bitcast(T.vec(_FRAG_A, T.i16), a_frag)
                 b_frag_i16 = vector.bitcast(T.vec(_FRAG_B, T.i16), b_frag)
                 acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
@@ -231,11 +231,11 @@ def _build_gemm_16x16(
         # Epilogue: optional alpha/beta*C + bias + activation.
         # Bias is per-column (N-dim); each lane loads bias[out_col] once
         # and adds it to all 4 of its accumulators (they share the same column).
-        if has_bias:
+        if fx.const_expr(has_bias):
             bias_val = ArithValue(_load_f_scalar(bias_div, n_base + lane_row))
-        if has_alpha:
+        if fx.const_expr(has_alpha):
             alpha_av = ArithValue(alpha)
-        if has_c:
+        if fx.const_expr(has_c):
             beta_av = ArithValue(beta)
         # Store C: 4 rows per lane at column `lane_row` in the output tile.
         # C[(bid_m*16) + (lane_k_group*4 + i), (bid_n*16) + lane_row] = acc[i]
@@ -246,24 +246,24 @@ def _build_gemm_16x16(
             c_div = fx.logical_divide(row_c, fx.make_layout(1, 1))
             val_i = vector.extract(acc, static_position=[i], dynamic_position=[])
             val = ArithValue(val_i)
-            if has_alpha:
+            if fx.const_expr(has_alpha):
                 val = val * alpha_av
-            if has_c:
+            if fx.const_expr(has_c):
                 row_cin = fx.slice(Cin_buf, (out_row, None))
                 cin_div = fx.logical_divide(row_cin, fx.make_layout(1, 1))
                 cin_val = ArithValue(_load_f_scalar(cin_div, out_col))
                 val = val + beta_av * cin_val
-            if has_bias:
+            if fx.const_expr(has_bias):
                 val = val + bias_val
             # Inlined activations — the module-level helpers use an arg shape
             # that doesn't always round-trip through the epilogue context;
             # open-coding keeps the IR clean.
             zero = arith.constant(0.0, type=T.f32)
-            if activation == "relu":
+            if fx.const_expr(activation == "relu"):
                 val = val.maximumf(zero)
-            elif activation == "relu_sq":
+            elif fx.const_expr(activation == "relu_sq"):
                 val = val.maximumf(zero) * val
-            elif activation == "gelu_tanh_approx":
+            elif fx.const_expr(activation == "gelu_tanh_approx"):
                 import math as _py_math
                 c1 = _py_math.sqrt(2.0 / _py_math.pi)
                 c2 = 0.044715 * c1
@@ -273,7 +273,7 @@ def _build_gemm_16x16(
                 # tanh(z) = 1 - 2 / (1 + exp(2z))  (no libcall; uses hardware exp).
                 tanh_z = Float32(1.0) - Float32(2.0) / (Float32(1.0) + _fm.exp(Float32(2.0) * tanh_arg, fastmath="fast"))
                 val = x * (Float32(0.5) + Float32(0.5) * tanh_z)
-            elif activation == "silu":
+            elif fx.const_expr(activation == "silu"):
                 # silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
                 val = val / (Float32(1.0) + _fm.exp(-val, fastmath="fast"))
             _store_out_scalar(c_div, out_col, val)
@@ -347,7 +347,7 @@ def _gemm_mfma_out(
     assert M % 16 == 0 and N % 16 == 0 and K % 16 == 0
     assert all(t.stride(-1) == 1 for t in (A, B, out))
     has_bias = bias is not None
-    if has_bias:
+    if fx.const_expr(has_bias):
         assert bias.dim() == 1 and bias.size(0) == N and bias.dtype == torch.float32
     has_alpha = alpha != 1.0
     has_c = cin is not None
