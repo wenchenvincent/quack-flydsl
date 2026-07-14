@@ -162,7 +162,7 @@ def _build_gemm_64x64_4wave(*, M, N, K, dtype_str, arch):
             b_right = vector.from_elements(T.vec(_FRAG_B, in_elem_type), b_right_vals)
 
             def _mfma(a, b, acc):
-                if dtype_str == "bf16":
+                if fx.const_expr(dtype_str == "bf16"):
                     a_i = vector.bitcast(T.vec(_FRAG_A, T.i16), a)
                     b_i = vector.bitcast(T.vec(_FRAG_B, T.i16), b)
                     return fx.rocdl.mfma_f32_16x16x16bf16_1k(
@@ -213,7 +213,7 @@ _DTYPE2STR = {torch.float16: "f16", torch.bfloat16: "bf16"}
 def _compile(M, N, K, dtype_str, arch):
     key = (M, N, K, dtype_str, arch)
     got = _kernel_cache.get(key)
-    if got is None:
+    if fx.const_expr(got is None):
         got = _build_gemm_64x64_4wave(M=M, N=N, K=K, dtype_str=dtype_str, arch=arch)
         _kernel_cache[key] = got
     return got
