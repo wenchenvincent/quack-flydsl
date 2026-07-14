@@ -118,4 +118,45 @@ def topk_fwd(
     return values, indices, None
 
 
-__all__ = ["topk_fwd"]
+def topk_bwd(dvalues, values, indices, N, softmax=False):
+    """Scatter ``dvalues`` back into a full ``(M, N)`` gradient at ``indices``.
+
+    When ``softmax`` is True, ``values`` are the softmax outputs and the
+    softmax Jacobian ``y*(g - sum(y*g))`` is applied before scattering.
+    """
+    if softmax:
+        y = values
+        dvalues = y * (dvalues - (dvalues * y).sum(-1, keepdim=True))
+    M = indices.shape[0]
+    dx = torch.zeros(M, N, dtype=dvalues.dtype, device=dvalues.device)
+    dx.scatter_(1, indices.long(), dvalues)
+    return dx
+
+
+class TopKFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, k, softmax):
+        values, indices, sm = topk_fwd(x, k, softmax=softmax)
+        out_values = sm if softmax else values
+        ctx.save_for_backward(out_values if softmax else None, indices)
+        ctx.N = x.shape[-1]
+        ctx.softmax = softmax
+        ctx.mark_non_differentiable(indices)
+        ctx.set_materialize_grads(False)
+        return out_values, indices
+
+    @staticmethod
+    def backward(ctx, dvalues, dindices=None):
+        saved_values, indices = ctx.saved_tensors
+        if dvalues is None:
+            return None, None, None
+        dx = topk_bwd(dvalues, saved_values, indices, ctx.N, softmax=ctx.softmax)
+        return dx, None, None
+
+
+def topk(x, k, softmax=False):
+    """Autograd-enabled top-k over the last dim. Returns ``(values, indices)``."""
+    return TopKFunction.apply(x, k, softmax)
+
+
+__all__ = ["topk_fwd", "topk_bwd", "topk", "TopKFunction"]
