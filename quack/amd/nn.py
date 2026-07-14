@@ -13,6 +13,7 @@ from torch import Tensor
 
 from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, layernorm_fwd, layernorm_bwd
 from quack.amd.softmax import softmax_fwd, softmax_bwd
+from quack.amd.cross_entropy import cross_entropy_fwd, cross_entropy_bwd
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -116,3 +117,37 @@ def softmax(x, dim=-1):
     n = x.shape[-1]
     y = SoftmaxFunction.apply(x.reshape(-1, n))
     return y.reshape(x.shape)
+
+
+class CrossEntropyFunction(torch.autograd.Function):
+    """Autograd wrapper for the AMD cross-entropy kernels. Returns per-row loss."""
+
+    @staticmethod
+    def forward(ctx, x, target, ignore_index):
+        loss, lse = cross_entropy_fwd(x, target, return_lse=True, ignore_index=ignore_index)
+        ctx.save_for_backward(x, target, lse)
+        ctx.ignore_index = ignore_index
+        return loss  # per-row, float32
+
+    @staticmethod
+    def backward(ctx, dloss):
+        x, target, lse = ctx.saved_tensors
+        dx = cross_entropy_bwd(x, target, lse, dloss.contiguous(), ignore_index=ctx.ignore_index)
+        return dx, None, None
+
+
+def cross_entropy(x, target, ignore_index=-100, reduction="mean"):
+    """Cross-entropy loss over the class dim, autograd-enabled.
+
+    ``x`` is ``(M, V)``, ``target`` is ``(M,)`` int. Reduction ∈ {none, mean, sum};
+    ``mean`` normalizes by the count of non-ignored rows.
+    """
+    loss = CrossEntropyFunction.apply(x, target, ignore_index)  # per-row
+    if reduction == "none":
+        return loss
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "mean":
+        valid = (target != ignore_index).sum().clamp_min(1)
+        return loss.sum() / valid
+    raise ValueError(f"unknown reduction: {reduction!r}")

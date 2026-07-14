@@ -4,6 +4,7 @@ import torch
 from quack.amd.nn import RMSNorm, rmsnorm
 from quack.amd.nn import LayerNorm, layernorm
 from quack.amd.nn import softmax as amd_softmax
+from quack.amd.nn import cross_entropy as amd_ce
 
 
 def _ref_rmsnorm(x, w, eps=1e-6):
@@ -143,3 +144,35 @@ def test_softmax_non_last_dim():
     out.backward(g)
     ref.backward(g)
     assert torch.allclose(x.grad, xr.grad, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+def test_cross_entropy_autograd(reduction):
+    torch.manual_seed(0)
+    M, V = 256, 512
+    x = torch.randn(M, V, device="cuda", dtype=torch.float32, requires_grad=True)
+    tgt = torch.randint(0, V, (M,), device="cuda")
+    xr = x.detach().clone().requires_grad_(True)
+
+    loss = amd_ce(x, tgt, reduction=reduction)
+    ref = torch.nn.functional.cross_entropy(xr, tgt, reduction=reduction)
+
+    assert torch.allclose(loss.float(), ref.float(), atol=1e-3, rtol=1e-3)
+    (loss.sum() if reduction == "none" else loss).backward()
+    (ref.sum() if reduction == "none" else ref).backward()
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=1e-3, rtol=1e-3)
+
+
+def test_cross_entropy_ignore_index():
+    torch.manual_seed(0)
+    M, V = 128, 256
+    x = torch.randn(M, V, device="cuda", dtype=torch.float32, requires_grad=True)
+    tgt = torch.randint(0, V, (M,), device="cuda")
+    tgt[::4] = -100  # ignore every 4th row
+    xr = x.detach().clone().requires_grad_(True)
+    loss = amd_ce(x, tgt, ignore_index=-100, reduction="mean")
+    ref = torch.nn.functional.cross_entropy(xr, tgt, ignore_index=-100, reduction="mean")
+    assert torch.allclose(loss.float(), ref.float(), atol=1e-3, rtol=1e-3)
+    loss.backward()
+    ref.backward()
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=1e-3, rtol=1e-3)
