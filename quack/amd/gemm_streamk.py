@@ -36,9 +36,15 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d, fly as _fly_d
 from flydsl.compiler.protocol import extract_to_ir_values
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 
 from quack.amd.flydsl_utils import get_rocm_arch
 from quack.amd.tile_scheduler import get_num_cus
+
+# Emit an ``scf.if`` from a closure for a dynamic condition, so the SmemPtr
+# broadcast slab is not threaded through as scf.if state (SmemPtr is not an
+# MLIR value, which the upstream AST rewriter now rejects).
+_scf_if = ReplaceIfWithDispatch.scf_if_dispatch
 
 
 _MFMA_M = 16
@@ -179,7 +185,7 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
             # (accounting for the initial bid-indexed tiles), so the first
             # atomic returns ``num_cus`` — the (num_cus)-th tile index.
             # Other lanes in the wg read the broadcast via LDS.
-            if tid == fx.Int32(0):
+            def _claim_next_tile():
                 rmw_op = _llvm_d.AtomicRMWOp(
                     _llvm_d.AtomicBinOp.fadd,
                     counter_ptr, one_f32,
@@ -187,6 +193,8 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
                 )
                 old_f = rmw_op.result
                 s_tile.store(old_f, [fx.Index(0)])
+
+            _scf_if(tid == fx.Int32(0), _claim_next_tile)
             _gpu.barrier()
             next_f = s_tile.load([fx.Index(0)])
             next_iv = next_f.ir_value() if hasattr(next_f, "ir_value") else next_f

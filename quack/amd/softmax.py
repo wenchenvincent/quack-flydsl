@@ -24,9 +24,16 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.numeric import Numeric, Float32, Float16, BFloat16
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl._mlir import ir
 
 from quack.amd.flydsl_utils import get_rocm_arch, get_wave_size, torch2flydsl_dtype_map
+
+# Emit an ``scf.if`` for a dynamic condition from a closure body. Using the
+# explicit dispatch (rather than a plain ``if`` statement) keeps the AST
+# rewriter from threading the SmemPtr scratch handle through as scf.if state —
+# a SmemPtr is not an MLIR value, which the upstream rewriter now rejects.
+_scf_if = ReplaceIfWithDispatch.scf_if_dispatch
 
 
 def _elem_type_for(numeric_cls):
@@ -111,22 +118,31 @@ def _build_softmax_fwd(*, N, dtype, arch):
             return w
 
         def _block_reduce(val, smem, op, init_val):
-            if num_waves == 1:
+            if fx.const_expr(num_waves == 1):
                 return _wave_reduce(val, op)
             lane = tid % fx.Int32(wave_size)
             wave = tid // fx.Int32(wave_size)
             w0 = _wave_reduce(val, op)
-            if lane == fx.Int32(0):
+
+            def _publish():
                 smem.store(w0, [ArithValue(wave).index_cast(T.index)])
+
+            _scf_if(lane == fx.Int32(0), _publish)
             _gpu.barrier()
-            if wave == fx.Int32(0):
+
+            def _combine():
                 in_range = lane < fx.Int32(num_waves)
                 lane_safe = in_range.select(lane, fx.Int32(0))
                 v = smem.load([ArithValue(lane_safe).index_cast(T.index)])
                 v = in_range.select(v, Float32(init_val))
                 v = _wave_reduce(v, op)
-                if lane == fx.Int32(0):
+
+                def _store_final():
                     smem.store(v, [fx.Index(0)])
+
+                _scf_if(lane == fx.Int32(0), _store_final)
+
+            _scf_if(wave == fx.Int32(0), _combine)
             _gpu.barrier()
             return smem.load([fx.Index(0)])
 
@@ -261,23 +277,32 @@ def _build_softmax_bwd(*, N, dtype, arch):
                 w = w.addf(peer, fastmath="fast")
             return w
 
-        if num_waves == 1:
+        if fx.const_expr(num_waves == 1):
             dot = _wave_reduce_add(thread_acc)
         else:
             lane = tid % fx.Int32(wave_size)
             wave = tid // fx.Int32(wave_size)
             w0 = _wave_reduce_add(thread_acc)
-            if lane == fx.Int32(0):
+
+            def _publish_dot():
                 s_red.store(w0, [ArithValue(wave).index_cast(T.index)])
+
+            _scf_if(lane == fx.Int32(0), _publish_dot)
             _gpu.barrier()
-            if wave == fx.Int32(0):
+
+            def _combine_dot():
                 in_range = lane < fx.Int32(num_waves)
                 lane_safe = in_range.select(lane, fx.Int32(0))
                 v = s_red.load([ArithValue(lane_safe).index_cast(T.index)])
                 v = in_range.select(v, Float32(0.0))
                 v = _wave_reduce_add(v)
-                if lane == fx.Int32(0):
+
+                def _store_final_dot():
                     s_red.store(v, [fx.Index(0)])
+
+                _scf_if(lane == fx.Int32(0), _store_final_dot)
+
+            _scf_if(wave == fx.Int32(0), _combine_dot)
             _gpu.barrier()
             dot = s_red.load([fx.Index(0)])
         dot_av = ArithValue(dot)
