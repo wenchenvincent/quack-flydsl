@@ -35,6 +35,12 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.numeric import Float32, Int32
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+
+# Emit an ``scf.if`` from a closure for a dynamic condition, so the LDS
+# SmemPtr handles (vals_lds/idxs_lds) accessed inside are not threaded as
+# scf.if state (a SmemPtr is not an MLIR value, which the rewriter rejects).
+_scf_if = ReplaceIfWithDispatch.scf_if_dispatch
 from flydsl._mlir import ir
 
 from quack.amd.flydsl_utils import get_rocm_arch
@@ -134,7 +140,8 @@ def _build_topk_lds_f32(*, N, k, arch):
                 # Each thread does `workers_per_thread` compare-swaps.
                 for w_local in range_constexpr(workers_per_thread):
                     w = tid + fx.Int32(w_local * _BLOCK_THREADS)
-                    if w < fx.Int32(workers):
+
+                    def _compare_swap():
                         # p0 = ((w & ~(j-1)) << 1) | (w & (j-1))
                         low_mask = fx.Int32(j - 1) if j > 0 else fx.Int32(0)
                         low = w & low_mask
@@ -159,6 +166,8 @@ def _build_topk_lds_f32(*, N, k, arch):
                         vals_lds.store(new_v1, [_idx(p1)])
                         idxs_lds.store(new_i0, [_idx(p0)])
                         idxs_lds.store(new_i1, [_idx(p1)])
+
+                    _scf_if(w < fx.Int32(workers), _compare_swap)
                 gpu.barrier()
 
         # --- Write top-k (descending) ---
@@ -167,12 +176,15 @@ def _build_topk_lds_f32(*, N, k, arch):
         K_PER_THREAD = max((k + _BLOCK_THREADS - 1) // _BLOCK_THREADS, 1)
         for i in range_constexpr(K_PER_THREAD):
             out_pos = tid + fx.Int32(i * _BLOCK_THREADS)
-            if out_pos < fx.Int32(k):
+
+            def _write_topk():
                 pos_in_sorted = fx.Int32(N - 1) - out_pos
                 v = vals_lds.load([_idx(pos_in_sorted)])
                 ix = idxs_lds.load([_idx(pos_in_sorted)])
                 _store_f32(v_div, out_pos, ArithValue(v))
                 _store_i32(i_div, out_pos, ArithValue(ix))
+
+            _scf_if(out_pos < fx.Int32(k), _write_topk)
 
     @flyc.jit
     def launch(X: fx.Tensor, OutVals: fx.Tensor, OutIdx: fx.Tensor,
