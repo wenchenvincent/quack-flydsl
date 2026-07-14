@@ -67,5 +67,16 @@ def test_topk_backward_single_wave_kernel():
 
 
 def test_topk_exported():
+    import types
+
     import quack.amd as qa
-    assert hasattr(qa, "topk"), "quack.amd.topk (autograd) not exported"
+
+    # Must be the autograd function, not the submodule ``quack.amd.topk``
+    # (which would also satisfy a bare ``hasattr``).
+    assert not isinstance(qa.topk, types.ModuleType), (
+        "quack.amd.topk resolves to the submodule, not the exported autograd function"
+    )
+    assert callable(qa.topk), "quack.amd.topk is not callable"
+    from quack.amd.nn import topk as nn_topk
+
+    assert callable(nn_topk)
