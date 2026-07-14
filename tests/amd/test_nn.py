@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from quack.amd.nn import RMSNorm, rmsnorm
+from quack.amd.nn import LayerNorm, layernorm
 
 
 def _ref_rmsnorm(x, w, eps=1e-6):
@@ -64,3 +65,50 @@ def test_rmsnorm_3d_flatten():
     ref.backward(g)
     assert torch.allclose(x.grad.float(), xr.grad.float(), atol=5e-4, rtol=5e-4)
     assert torch.allclose(w.grad.float(), wr.grad.float(), atol=5e-4, rtol=5e-4)
+
+
+def _ref_layernorm(x, w, b, eps=1e-6):
+    xf = x.float()
+    mu = xf.mean(-1, keepdim=True)
+    var = xf.var(-1, keepdim=True, unbiased=False)
+    return ((xf - mu) * torch.rsqrt(var + eps)) * w.float() + b.float()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_layernorm_autograd(dtype):
+    torch.manual_seed(0)
+    M, N = 128, 256
+    x = torch.randn(M, N, device="cuda", dtype=dtype, requires_grad=True)
+    w = torch.randn(N, device="cuda", dtype=dtype, requires_grad=True)
+    b = torch.randn(N, device="cuda", dtype=dtype, requires_grad=True)
+    xr, wr, br = (t.detach().clone().requires_grad_(True) for t in (x, w, b))
+
+    out = layernorm(x, w, b)
+    ref = _ref_layernorm(xr, wr, br).to(dtype)
+    tol = 2e-2 if dtype is torch.bfloat16 else 1e-4
+    assert torch.allclose(out.float(), ref.float(), atol=tol, rtol=tol)
+
+    g = torch.randn_like(out)
+    out.backward(g)
+    ref.backward(g)
+    for a, bb in ((x, xr), (w, wr), (b, br)):
+        assert torch.allclose(a.grad.float(), bb.grad.float(), atol=tol * 5, rtol=tol * 5)
+
+
+def test_layernorm_module():
+    torch.manual_seed(0)
+    m = LayerNorm(256, device="cuda", dtype=torch.float32)
+    torch.nn.init.normal_(m.weight)
+    torch.nn.init.normal_(m.bias)
+    x = torch.randn(64, 256, device="cuda", requires_grad=True)
+    xr = x.detach().clone().requires_grad_(True)
+    y = m(x)
+    ref = _ref_layernorm(xr, m.weight, m.bias)
+    assert y.shape == (64, 256)
+    assert torch.allclose(y.float(), ref.float(), atol=1e-4, rtol=1e-4)
+    g = torch.randn_like(y)
+    y.backward(g)
+    ref.backward(g)
+    assert m.weight.grad is not None
+    assert m.bias.grad is not None
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=5e-4, rtol=5e-4)

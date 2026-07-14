@@ -11,7 +11,7 @@ kernel files stay kernel-only; this is the user-facing layer.
 import torch
 from torch import Tensor
 
-from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd
+from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, layernorm_fwd, layernorm_bwd
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -49,3 +49,43 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return rmsnorm(x, self.weight, self.eps)
+
+
+class LayerNormFunction(torch.autograd.Function):
+    """Autograd wrapper over the AMD ``layernorm_fwd``/``layernorm_bwd`` kernels."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        need_grad = any(ctx.needs_input_grad[:3])
+        out, rstd, mean, _residual_out = layernorm_fwd(
+            x, weight, bias=bias, eps=eps, store_stats=need_grad
+        )
+        ctx.save_for_backward(x, weight, bias, rstd, mean)
+        ctx.eps = eps
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, weight, bias, rstd, mean = ctx.saved_tensors
+        dx, dw, db = layernorm_bwd(x, weight, dout.contiguous(), rstd, mean, bias=bias, eps=ctx.eps)
+        return dx, dw, db, None
+
+
+def layernorm(x: Tensor, weight: Tensor, bias: Tensor, eps: float = 1e-6) -> Tensor:
+    """LayerNorm over the last dim, autograd-enabled. Flattens leading dims."""
+    n = x.shape[-1]
+    out = LayerNormFunction.apply(x.reshape(-1, n), weight, bias, eps)
+    return out.reshape(x.shape)
+
+
+class LayerNorm(torch.nn.Module):
+    """LayerNorm layer backed by the AMD reduction kernels."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, device=None, dtype=None):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+        self.bias = torch.nn.Parameter(torch.zeros(dim, device=device, dtype=dtype))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return layernorm(x, self.weight, self.bias, self.eps)
