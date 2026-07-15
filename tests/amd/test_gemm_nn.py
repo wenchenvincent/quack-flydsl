@@ -60,3 +60,20 @@ def test_gemm_nn_matches_torch_mid_shape(dtype):
     # Looser tolerance for larger K accumulation.
     tol = 0.2 if dtype is torch.float16 else 0.2
     assert err < tol, f"{dtype} 2048x1024x4096: max_err {err:.4f} > {tol}"
+
+
+@pytest.mark.parametrize("MKN", [4096])
+def test_gemm_nn_large_shape_nn_big(MKN):
+    """Large shape routes gemm_nn -> gemm_gfx950_nn_big (tile-swizzle path).
+
+    Regression guard for the class-1 fx.const_expr drift that crashed
+    nn_big at large shapes (NameError: 'pid'/'e0' not defined) — nn_big
+    had no test, so the drift slipped the 2026-07-14 sweep.
+    """
+    torch.manual_seed(0)
+    a = torch.randn(MKN, MKN, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(MKN, MKN, device="cuda", dtype=torch.bfloat16)
+    c = gemm_nn(a, b)
+    ref = (a.float() @ b.float())
+    # bf16 accumulation over K=4096 — loose but real.
+    assert torch.allclose(c.float(), ref, atol=2.0, rtol=2e-2)
