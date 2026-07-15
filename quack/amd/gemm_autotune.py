@@ -15,9 +15,9 @@ entry into ``_TUNED_TABLE`` and the dispatcher will use it instead of
 the default heuristic. The table is a list (not a dict) so shape
 ranges can be expressed via predicates rather than exact keys.
 
-Empty table today — pending benchmarking runs. The infrastructure is
-in place so profiling results land as one-line additions rather than
-code edits across the dispatch surface.
+The table currently holds a handful of MI355X-profiled entries (see
+``_TUNED_TABLE`` below); more profiling results land as one-line
+additions rather than code edits across the dispatch surface.
 
 Future work (mirrors QuACK NVIDIA's autotune flow):
   - Per-shape perf database (JSON / pickle on disk at ``~/.quack_amd_tune``).
