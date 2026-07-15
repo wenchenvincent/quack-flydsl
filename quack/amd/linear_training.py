@@ -257,11 +257,14 @@ def _fused_dact_eligible(dout: Tensor, w2: Tensor, preact: Tensor, activation: s
 class _MLPActFunction(torch.autograd.Function):
     """Two-layer MLP with activation-backward fusion via gemm_dact.
 
-    Forward: ``out = act(linear(x, w1)) @ w2.T``. Saves preact (not postact)
-    so backward can recompute postact cheaply and fuse the dpreact
-    computation into the dout @ w2 matmul via the splitk kernel's
-    ``dact_activation`` epilogue. Matches NVIDIA's
-    ``MLPRecomputeFunc`` pattern at the kernel-fusion level.
+    Forward: ``out = act(linear(x, w1)) @ w2.T``. Saves **both** ``preact``
+    and ``postact`` (no recompute) — ``postact`` is needed for ``dW2``
+    without an extra kernel launch, and ``preact`` feeds the fused
+    ``dact_activation`` epilogue in the splitk backward matmul. This is
+    the memory-heavier, launch-cheaper twin of ``mlp_recompute_train``,
+    which drops both saved activations and recomputes ``preact`` (and
+    ``postact``) in backward instead — see ``_MLPRecomputeFunction``
+    below for the true activation-recompute variant.
     """
 
     @staticmethod
@@ -348,6 +351,92 @@ def mlp_func_train(
     Eligible activations: relu, silu, gelu_tanh_approx, relu_sq.
     """
     return _MLPActFunction.apply(x, w1, w2, activation, bias1, bias2)
+
+
+class _MLPRecomputeFunction(torch.autograd.Function):
+    """Two-layer MLP that saves only ``x`` (+weights) and RECOMPUTES ``preact``
+    in backward — trading one x@w1.T matmul + one act_fwd for the
+    ~2×(M,hidden) activation memory. Mirrors NVIDIA's ``MLPRecomputeFunc``.
+    """
+
+    @staticmethod
+    def forward(ctx, x, w1, w2, activation, bias1, bias2):
+        preact = linear(x, w1, bias=bias1)
+        postact = _act_fwd(preact, activation)
+        out = linear(postact, w2, bias=bias2)
+        # save_for_backward(None) "works" (returns None back out of
+        # saved_tensors) but pollutes the saved-tensor tuple with a
+        # phantom entry — save only the non-None biases and reconstruct
+        # via the has_bias* flags below, so ctx.saved_tensors only ever
+        # holds real Tensors (x, w1, w2[, bias1][, bias2]).
+        to_save = [x, w1, w2]
+        if bias1 is not None:
+            to_save.append(bias1)
+        if bias2 is not None:
+            to_save.append(bias2)
+        ctx.save_for_backward(*to_save)
+        ctx.activation = activation
+        ctx.has_bias1 = bias1 is not None
+        ctx.has_bias2 = bias2 is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        saved = ctx.saved_tensors
+        x, w1, w2 = saved[0], saved[1], saved[2]
+        idx = 3
+        bias1 = None
+        if ctx.has_bias1:
+            bias1 = saved[idx]
+            idx += 1
+        bias2 = None
+        if ctx.has_bias2:
+            bias2 = saved[idx]
+            idx += 1
+        grad_x = grad_w1 = grad_w2 = grad_b1 = grad_b2 = None
+        # Recompute the forward activations (the memory-saving tradeoff).
+        preact = linear(x, w1, bias=bias1)
+        postact = _act_fwd(preact, ctx.activation)
+        if ctx.needs_input_grad[2]:
+            grad_w2 = torch.mm(grad_out.t(), postact)
+        if ctx.has_bias2 and ctx.needs_input_grad[5]:
+            grad_b2 = grad_out.sum(dim=0).to(torch.float32)
+        need_dpreact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or (
+            ctx.has_bias1 and ctx.needs_input_grad[4]
+        )
+        if need_dpreact:
+            if _fused_dact_eligible(grad_out, w2, preact, ctx.activation):
+                from quack.amd.gemm_gfx950_splitk import gemm_splitk
+                w2_T = w2.t().contiguous()
+                dpreact = gemm_splitk(grad_out, w2_T, preact=preact, dact_activation=ctx.activation)
+            else:
+                grad_postact = torch.mm(grad_out, w2)
+                dpreact = _act_bwd(preact, grad_postact, ctx.activation)
+            if ctx.needs_input_grad[0]:
+                grad_x = torch.mm(dpreact, w1)
+            if ctx.needs_input_grad[1]:
+                grad_w1 = torch.mm(dpreact.t(), x)
+            if ctx.has_bias1 and ctx.needs_input_grad[4]:
+                grad_b1 = dpreact.sum(dim=0).to(torch.float32)
+        return grad_x, grad_w1, grad_w2, None, grad_b1, grad_b2
+
+
+def mlp_recompute_train(
+    x: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    activation: str = "silu",
+    bias1: Optional[Tensor] = None,
+    bias2: Optional[Tensor] = None,
+) -> Tensor:
+    """Two-layer MLP training with activation recompute (memory-saving).
+
+    Same math and result as ``mlp_func_train``, but backward recomputes the
+    hidden activations instead of stashing them — saving ~2×(M,hidden) memory
+    at the cost of one extra x@w1.T matmul + one activation in backward. Use
+    for large hidden dims where activation memory dominates.
+    """
+    return _MLPRecomputeFunction.apply(x, w1, w2, activation, bias1, bias2)
 
 
 _DGATED_ELIGIBLE_GATES = {"swiglu", "reglu", "geglu", "glu"}
@@ -562,5 +651,5 @@ def linear_gated_func(
 
 __all__ = [
     "linear_act_func", "linear_gated_func",
-    "mlp_func_train", "gated_mlp_func_train",
+    "mlp_func_train", "mlp_recompute_train", "gated_mlp_func_train",
 ]
