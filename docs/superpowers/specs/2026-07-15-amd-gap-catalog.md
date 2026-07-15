@@ -120,20 +120,29 @@ absent functionality. **Verify before building.**
 
 ---
 
-## Overnight execution decision (autonomous, no feedback available)
+## Overnight execution — final status (autonomous run, 2026-07-15)
 
-**Implement tonight** (low risk, high value, fully testable, no giant-kernel authoring):
-- **G1** — Linear/MLP/LinearCrossEntropy nn.Module wrappers. *(in progress)*
-- **G15** — fix the stale autotuner docstring. **DONE `1416a4c`.**
-- **G3** — swiglu_oai forward, wired into the gated kernel + tested (41 gated
-  tests pass). **DONE `03bfb24`.** Forward/inference only; the dgated backward
-  for swiglu_oai is a noted follow-up.
+**Implemented + tested + committed:**
+- **G15** — stale autotuner docstring fixed. `1416a4c`.
+- **G3** — `swiglu_oai` wired into the fused gated kernel (forward), +8 tests
+  (41 gated pass). `03bfb24`. dgated backward for swiglu_oai = noted follow-up.
+- **G1** — `Linear` / `MLP` / `LinearCrossEntropy` `nn.Module` wrappers, 29
+  nn-layer tests pass, exported from `quack.amd`. `ddac26d` + docs `9dea368`.
+  The drop-in high-level layer is now complete (reductions + linear/MLP).
+- **G11** — `mlp_recompute_train` activation-recompute autograd. *(in progress
+  as of this write; verify commit before relying on it.)*
 
-**Plan-only tonight** (real kernel/infra projects — building blind overnight would risk leaving broken kernels; each gets a scoped plan for later execution):
-- G2, G4, G5, G6, G7, G8, G9, G10, G11, G12, G13, G14.
+**Plan-only (design plans committed `91370d5`; NOT implemented — real kernel/
+arch/infra projects, deliberately not built unattended):**
+- G2 (fuse_grad_accum), G4 (composable epilogue), G5 (symmetric richness),
+  G6 (fp8/int8 GEMM), G7 (blockscaled formats), G8 (stochastic rounding),
+  G9 (TT layout), G10 (varlen-K), G12 (RDNA WMMA), G13 (in-kernel scheduler),
+  G14 (profiler/sort). Each plan is in `docs/superpowers/plans/2026-07-15-amd-g*`.
 
-Rationale: the user is asleep and asked for my judgement. The responsible move
-is to land the safe, verifiable plumbing (G1/G15, maybe G3) with full test
-coverage and reviews, and to hand over crisp plans for the large kernel work
-rather than half-finish a dtype/arch/scheduler kernel that can't be validated
-or rolled back cleanly before morning.
+Rationale: the user was asleep and asked for my judgement. I landed the safe,
+verifiable plumbing (G1/G3/G11/G15) with full test coverage, and handed over
+crisp source-grounded plans for the large kernel work — rather than
+half-finishing a dtype/arch/scheduler kernel that couldn't be validated or
+cleanly rolled back before morning. Recurring lesson banked: verify before
+building — several "gaps" (autotuner, fused-dact, large-N, MLPActFunction
+docstring) were stale docs or missing tests, not absent functionality.
