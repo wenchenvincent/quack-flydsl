@@ -35,3 +35,4 @@ from quack.amd.nn import (  # noqa: F401
     LinearCrossEntropy,
 )
 from quack.amd.topk import topk  # noqa: F401
+from quack.amd.gemm_gfx950_fp8 import gemm_fp8  # noqa: F401
