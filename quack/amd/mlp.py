@@ -15,7 +15,7 @@ from typing import Optional
 
 from torch import Tensor
 
-from quack.amd.linear import linear, linear_gated, linear_act_train, linear_train
+from quack.amd.linear import linear, linear_gated
 
 
 def mlp(
@@ -64,24 +64,22 @@ def mlp_train(
     bias1: Optional[Tensor] = None,
     bias2: Optional[Tensor] = None,
 ) -> Tensor:
-    """Autograd-aware two-layer MLP: ``w2 @ act(w1 @ x + b1) + b2``.
+    """Autograd-aware two-layer MLP: ``out = act(x @ w1.T + b1) @ w2.T + b2``.
 
-    Uses ``LinearActFunc`` for the first layer (activation fused into the
-    autograd Function's saved state) and ``LinearFunc`` for the second.
-    Both layers route backward through ``gemm_nn`` / ``gemm_tn`` so the
-    full training step stays on our kernels.
+    Delegates to ``mlp_func_train`` — a single fused autograd Function whose
+    backward fuses the activation gradient into the ``dout @ w2`` matmul
+    (``gemm_splitk`` dact epilogue) for eligible bf16 shapes, and uses robust
+    matmuls otherwise. This is the one source of truth for two-layer MLP
+    training; it replaces the earlier ``linear_act_train`` + ``linear_train``
+    composition, which routed backward through ``gemm_nn`` / ``gemm_tn`` and
+    crashed at large shapes via the ``gemm_gfx950_nn_big`` tile-swizzle drift.
+    It also handles ``bias2`` natively (the old path added it out-of-kernel).
 
     Weights are ``(out, in)`` like ``torch.nn.Linear``.
     """
-    h = linear_act_train(x, w1, activation=activation, bias=bias1)
-    if bias2 is None:
-        y = linear_train(h, w2)
-    else:
-        # MVP: bias2 on the output layer falls back to the
-        # unfused-act LinearActFunc with activation='none' semantics — but
-        # LinearActFunc requires a real activation, so we manually add bias2.
-        y = linear_train(h, w2) + bias2
-    return y
+    from quack.amd.linear_training import mlp_func_train
+
+    return mlp_func_train(x, w1, w2, activation=activation, bias1=bias1, bias2=bias2)
 
 
 __all__ = ["mlp", "gated_mlp", "mlp_train"]
