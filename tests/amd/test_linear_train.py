@@ -211,3 +211,30 @@ def test_linear_train_mlp_composition(dtype):
     assert dx_err < tol, f"MLP dx {dtype}: {dx_err:.4f}"
     assert dW1_err < tol, f"MLP dW1 {dtype}: {dW1_err:.4f}"
     assert dW2_err < tol, f"MLP dW2 {dtype}: {dW2_err:.4f}"
+
+
+def test_mlp_func_train_backward_matches_reference():
+    """mlp_func_train fwd+bwd (fused-dact path enabled) vs a torch reference."""
+    import torch
+    import torch.nn.functional as F
+
+    from quack.amd.linear_training import mlp_func_train
+
+    torch.manual_seed(0)
+    # Eligible fused-dact shape: M%128, hidden%256, out_dim%64, bf16.
+    M, in_dim, hidden, out_dim = 128, 256, 256, 128
+    x = torch.randn(M, in_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w1 = torch.randn(hidden, in_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w2 = torch.randn(out_dim, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    xr, w1r, w2r = (t.detach().clone().requires_grad_(True) for t in (x, w1, w2))
+
+    out = mlp_func_train(x, w1, w2, activation="silu")
+    ref = F.linear(F.silu(F.linear(xr, w1r)), w2r)
+
+    g = torch.randn_like(out)
+    out.backward(g)
+    ref.backward(g)
+    # bf16 MLP backward through two matmuls — loose but real.
+    assert torch.allclose(x.grad.float(), xr.grad.float(), atol=6e-2, rtol=6e-2)
+    assert torch.allclose(w1.grad.float(), w1r.grad.float(), atol=6e-2, rtol=6e-2)
+    assert torch.allclose(w2.grad.float(), w2r.grad.float(), atol=6e-2, rtol=6e-2)

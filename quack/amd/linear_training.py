@@ -334,14 +334,16 @@ def mlp_func_train(
     ``GemmDActMixin`` / ``matmul_bwd_dact`` pattern.
 
     **Status of the fused path** (gated in ``_fused_dact_eligible``):
-    currently disabled by default because splitk's matmul runs ~1.07×
-    slower than hipBLASLt's torch.mm at typical MLP-backward shapes
-    on MI355X — the fusion saving (~50 μs) is less than the matmul
-    gap (~20 μs per invocation) at these shapes. The fused kernel is
-    correctness-tested and can be invoked directly via
-    ``gemm_splitk(a, b, preact=p, dact_activation=act)``. Flipping
-    the gate in ``_fused_dact_eligible`` turns on dispatch once
-    splitk hits hipBLASLt parity across shapes.
+    ENABLED for eligible shapes/dtypes. The fused splitk-dact backward
+    is ~2.17× faster than ``torch.mm + torch act-bwd`` at the reference
+    MLP-backward shape (M=4096, hidden=8192, out_dim=4096, silu, bf16):
+    0.320 ms vs 0.695 ms on MI355X (see ``tests/amd/bench_fused_dact.py``,
+    2026-07-15). The splitk matmul runs slightly slower than hipBLASLt,
+    but the fusion eliminates the whole ``* act'(preact)`` elementwise
+    kernel, which dominates. Dispatch happens automatically when
+    ``_fused_dact_eligible`` holds (eligible bf16/fp16, M%128, hidden%256,
+    out_dim%64, contiguous); otherwise it falls back to
+    ``torch.mm`` + ``_act_bwd``.
 
     Eligible activations: relu, silu, gelu_tanh_approx, relu_sq.
     """
