@@ -15,6 +15,9 @@ from quack.amd.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, layernorm_fwd, layernorm
 from quack.amd.softmax import softmax_fwd, softmax_bwd
 from quack.amd.cross_entropy import cross_entropy_fwd, cross_entropy_bwd
 from quack.amd.topk import topk  # noqa: F401
+from quack.amd.linear import linear_train, linear_act_train
+from quack.amd.linear_training import mlp_func_train
+from quack.amd.linear_cross_entropy import linear_cross_entropy
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -182,4 +185,148 @@ __all__ = [
     "CrossEntropyFunction",
     "cross_entropy",
     "topk",
+    "Linear",
+    "MLP",
+    "LinearCrossEntropy",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Linear / MLP / LinearCrossEntropy — training nn.Module wrappers
+# ---------------------------------------------------------------------------
+#
+# Thin torch.nn.Module wrappers over the autograd-enabled functional entry
+# points in quack.amd.linear / quack.amd.linear_training /
+# quack.amd.linear_cross_entropy. Those modules stay kernel-only; this is
+# the user-facing layer, mirroring the RMSNorm/LayerNorm/Softmax/CrossEntropy
+# pattern above.
+
+
+class Linear(torch.nn.Module):
+    """Autograd-aware linear layer (``y = act(x @ W.T + b)``) on AMD kernels.
+
+    ``activation=None`` is a plain linear; a string activation uses the fused
+    ``linear_act_train`` path. Weights are ``(out, in)`` like ``torch.nn.Linear``.
+    """
+
+    def __init__(
+        self, in_features, out_features, bias=True, activation=None, device=None, dtype=None,
+    ):
+        super().__init__()
+        self.activation = activation
+        self.weight = torch.nn.Parameter(
+            torch.empty(out_features, in_features, device=device, dtype=dtype)
+        )
+        self.bias = (
+            torch.nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+            if bias
+            else None
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        if self.bias is not None:
+            torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        if self.activation is not None:
+            return linear_act_train(x, self.weight, self.activation, bias=self.bias)
+        y = linear_train(x, self.weight)
+        return y if self.bias is None else y + self.bias
+
+
+class MLP(torch.nn.Module):
+    """Autograd-aware two-layer MLP backed by ``mlp_func_train`` (fused-dact)."""
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        out_features,
+        activation="silu",
+        bias=False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.activation = activation
+        self.w1 = torch.nn.Parameter(
+            torch.empty(hidden_features, in_features, device=device, dtype=dtype)
+        )
+        self.w2 = torch.nn.Parameter(
+            torch.empty(out_features, hidden_features, device=device, dtype=dtype)
+        )
+        self.bias1 = (
+            torch.nn.Parameter(torch.zeros(hidden_features, device=device, dtype=dtype))
+            if bias
+            else None
+        )
+        self.bias2 = (
+            torch.nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
+            if bias
+            else None
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.w1, a=5**0.5)
+        torch.nn.init.kaiming_uniform_(self.w2, a=5**0.5)
+
+    def forward(self, x):
+        return mlp_func_train(
+            x, self.w1, self.w2, activation=self.activation, bias1=self.bias1, bias2=self.bias2
+        )
+
+
+class LinearCrossEntropy(torch.nn.Module):
+    """Fused linear + cross-entropy training layer: ``loss = CE(x @ W.T, target)``.
+
+    Wraps ``quack.amd.linear_cross_entropy.linear_cross_entropy``, which
+    routes through a fused chunked fwd+bwd kernel when ``x``/``weight``
+    require grad — it never materialises the full ``(B*L, V)`` logits.
+
+    ``bias`` is **not supported**: the grad path of ``linear_cross_entropy``
+    has no gradient wrt bias (documented limitation of the fused kernel), so
+    this module refuses to construct with ``bias=True`` rather than silently
+    producing a layer whose bias never trains.
+    """
+
+    def __init__(
+        self,
+        in_features,
+        num_classes,
+        bias=False,
+        chunk_size=None,
+        *,
+        ignore_index=-100,
+        label_smoothing=0.0,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        assert not bias, (
+            "LinearCrossEntropy does not support bias: the fused grad path in "
+            "linear_cross_entropy has no gradient wrt bias."
+        )
+        self.ignore_index = ignore_index
+        self.label_smoothing = label_smoothing
+        self.chunk_size = chunk_size
+        self.weight = torch.nn.Parameter(
+            torch.empty(num_classes, in_features, device=device, dtype=dtype)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+    def forward(self, x: Tensor, target: Tensor, loss_weight=None) -> Tensor:
+        kwargs = dict(
+            ignore_index=self.ignore_index,
+            label_smoothing=self.label_smoothing,
+            loss_weight=loss_weight,
+        )
+        if self.chunk_size is not None:
+            kwargs["chunk_size"] = self.chunk_size
+        loss, _lse = linear_cross_entropy(x, self.weight, target, **kwargs)
+        return loss

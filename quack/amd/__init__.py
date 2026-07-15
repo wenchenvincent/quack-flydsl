@@ -30,5 +30,8 @@ from quack.amd.nn import (  # noqa: F401
     layernorm,
     softmax,
     cross_entropy,
+    Linear,
+    MLP,
+    LinearCrossEntropy,
 )
 from quack.amd.topk import topk  # noqa: F401
