@@ -220,3 +220,21 @@ def test_linear_cross_entropy_ignore_index():
     torch.testing.assert_close(loss.sum(), ref_loss.sum(), atol=5e-1, rtol=1e-2)
     torch.testing.assert_close(x.grad, xr.grad, atol=5e-1, rtol=5e-2)
     torch.testing.assert_close(w.grad.float(), wr.grad.float(), atol=5e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("N", [131072])
+def test_cross_entropy_large_vocab(N):
+    """Lock the existing huge-vocab capability (fwd+bwd correct at 128K)."""
+    torch.manual_seed(0)
+    M = 4
+    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    tgt = torch.randint(0, N, (M,), device="cuda")
+    loss, lse = cross_entropy_fwd(x, tgt, return_lse=True)
+    ref = torch.nn.functional.cross_entropy(x, tgt, reduction="none")
+    assert torch.allclose(loss.float(), ref.float(), atol=1e-3, rtol=1e-3)
+    dloss = torch.randn(M, device="cuda", dtype=torch.float32)
+    dx = cross_entropy_bwd(x, tgt, lse, dloss)
+    xg = x.detach().clone().requires_grad_(True)
+    ref2 = torch.nn.functional.cross_entropy(xg, tgt, reduction="none")
+    dx_ref = torch.autograd.grad(ref2, xg, dloss)[0]
+    assert torch.allclose(dx, dx_ref, atol=1e-3, rtol=1e-3)

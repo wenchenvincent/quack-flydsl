@@ -58,3 +58,19 @@ def test_softmax_fwd_multiwave(dtype, N):
     y_ref = torch.softmax(x.float(), dim=-1).to(dtype)
     atol, rtol = _tol(dtype)
     torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("N", [131072])
+def test_softmax_large_n(N):
+    """Lock the existing large-N capability (fwd+bwd correct at 128K)."""
+    torch.manual_seed(0)
+    M = 4
+    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    y = softmax_fwd(x)
+    ref = torch.softmax(x, dim=-1)
+    assert torch.allclose(y, ref, atol=1e-6, rtol=1e-6)
+    dy = torch.randn_like(y)
+    dx = softmax_bwd(dy, y)
+    xg = x.detach().clone().requires_grad_(True)
+    dx_ref = torch.autograd.grad(torch.softmax(xg, dim=-1), xg, dy)[0]
+    assert torch.allclose(dx, dx_ref, atol=1e-6, rtol=1e-6)
