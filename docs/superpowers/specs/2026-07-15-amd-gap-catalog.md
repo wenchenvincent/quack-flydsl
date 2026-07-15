@@ -63,9 +63,10 @@ absent functionality. **Verify before building.**
 ## Genuine gaps — dtypes / formats (L, high risk)
 
 ### G6. No standard fp8 / int8 / tf32 GEMM
-- **Status:** verified — `_MFMA_SUPPORTED_DTYPES = {float16, bfloat16}`; fp8 only via blockscaled.
+- **Status:** fp8 + int8 **DONE** (`2006d1c`, `e3321e1`); tf32 deferred (YAGNI).
 - **Category:** dtype · **Effort:** L · **Risk:** high (new MFMA dtype paths).
-- **Plan:** `2026-07-15-amd-g6-fp8-int8-gemm.md` · plan-only.
+- **Plan:** `2026-07-15-amd-g6-fp8-int8-gemm.md`.
+- **Shipped:** `gemm_fp8(a,b,out_dtype)` (`gemm_gfx950_fp8.py`, `mfma_f32_16x16x32_fp8_fp8`, f32 accumulate, validated vs dequant, rel<0.003) and `gemm_int8(a,b)->int32` (`gemm_gfx950_int8.py`, `mfma_i32_16x16x32_i8`, bit-EXACT — and torch has no CUDA int matmul, so it fills a real hole). Both single-16×16-tile MVPs, K=32, 8 elems/lane packed to i64. Exported from `quack.amd`. 20 tests.
 
 ### G7. Blockscaled is MXFP8-e4m3 only
 - **Status:** verified — no fp4/nvfp4/e5m2, no standard MX scaling (128-elem f32 vs 16/32-elem e8m0/e4m3), no stochastic rounding.
