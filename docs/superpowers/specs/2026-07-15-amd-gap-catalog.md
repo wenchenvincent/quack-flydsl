@@ -69,7 +69,7 @@ absent functionality. **Verify before building.**
 - **Shipped:** `gemm_fp8(a,b,out_dtype)` (`gemm_gfx950_fp8.py`, `mfma_f32_16x16x32_fp8_fp8`, f32 accumulate, validated vs dequant, rel<0.003) and `gemm_int8(a,b)->int32` (`gemm_gfx950_int8.py`, `mfma_i32_16x16x32_i8`, bit-EXACT — and torch has no CUDA int matmul, so it fills a real hole). Both single-16×16-tile MVPs, K=32, 8 elems/lane packed to i64. Exported from `quack.amd`. 20 tests.
 
 ### G7. Blockscaled is MXFP8-e4m3 only
-- **Status:** verified — no fp4/nvfp4/e5m2, no standard MX scaling (128-elem f32 vs 16/32-elem e8m0/e4m3), no stochastic rounding.
+- **Status:** verified — no fp4/e5m2. MXFP4 MFMA semantics empirically confirmed 2026-07-15 (e2m1 elem + e8m0 scale, 32-elem blocks — `mfma_scale_f32_16x16x128_f8f6f4`); NVFP4 (e4m3 scales) is NOT hardware-supported by this instruction, so the hardware-scaled path is MXFP4-only.
 - **Category:** dtype/format · **Effort:** L · **Risk:** high.
 - **Plan:** `2026-07-15-amd-g7-blockscaled-formats.md` · plan-only.
 

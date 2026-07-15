@@ -125,3 +125,21 @@ dtype), (2) the HBM→fragment lane mapping for K=128 fp4 (each lane's
 same single-tile empirical check against a dequant reference), (3) real
 per-block e8m0 scales via scaleA/scaleB instead of neutral. The probe
 kernel is in scratchpad (`test_fp4_probe.py` pattern) for reuse.
+
+### Phase 0 addendum — the scale is e8m0, so the target is MXFP4 (not NVFP4)
+
+Second probe varied `scaleA` (keeping `scaleB` neutral, all-1.0 e2m1 inputs):
+- `0x7F` (byte 127) → C=128.0  → 2^0
+- `0x80` (byte 128) → C=256.0  → 2^1 (doubled)
+- `0x7E` (byte 126) → C=64.0   → 2^-1 (halved)
+
+So the scale operand decodes as **e8m0**: value = 2^(byte − 127), one e8m0
+byte per 32-element K-block (`0x7F7F7F7F` = 4 blocks over K=128). Element
+type e2m1 + scale type e8m0 + 32-element blocks = **MXFP4** (OCP MX standard).
+
+**NVFP4 is NOT supported by this instruction** — it uses e4m3 (fp8) block
+scales with 16-element blocks, and `mfma_scale_f32_16x16x128_f8f6f4`'s scale
+operand is e8m0-only. So on gfx950 this GEMM path is MXFP4; NVFP4 would need a
+different scale-conversion path (software dequant, or the `cvt_scalef32_*_fp4`
+converts which do take f32 scales) and is out of scope for the hardware-scaled
+kernel. Scope G7 as **MXFP4** and drop NVFP4 from the hardware-scaled goal.
