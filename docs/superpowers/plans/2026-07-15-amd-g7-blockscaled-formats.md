@@ -97,3 +97,31 @@ These are **host-side torch quantizers** (like `quack/amd/mxfp8_ops.py:quantize_
 **Placeholder scan:** Every phase step names the exact file and, where the current code lives, the exact function/line range to modify. The one item flagged as a genuine open unknown (whether `cbsz=4` behaves identically on the gfx950 MFMA instruction vs. the gfx1250 WMMA instruction whose docstring is the actual evidence source) is explicitly scoped as Phase 0's deliverable with a concrete verification method (scratch kernel + hand-computed E2M1 table), not silently assumed to transfer. The `ku_per_sb` integer-division-to-zero issue for a 32-element scale block is called out as a concrete bug the naive parameterization would hit, with two candidate fixes named. ✓
 
 **Type consistency:** MXFP4 data path: `torch.float4_e2m1fn_x2` (packed 2/byte) at the public API → raw uint8/`T.f8` buffer storage in-kernel (mirrors today's e4m3fn → `T.f8` treatment) → f32 accumulator (unchanged — `mfma_res_ty = T.f32x4` throughout, MFMA-scale always accumulates in f32 regardless of A/B format) → bf16/f16 output (unchanged store path). Scale path: e8m0 (`float8_e8m0fnu`) at the quantizer boundary → f32 host-side expansion → f32 buffer load in-kernel (byte-for-byte reuse of today's `load_scales_for_tile` load logic, only the block-size constant changes) → f32 software FMA into the f32 accumulator (unchanged mechanism from the e4m3 path). No dtype is left ambiguous across a phase boundary. ✓
+
+---
+
+## Phase 0 RESULT (2026-07-15, verified on gfx950/MI355X)
+
+Ran an in-register fp4 MFMA probe (no HBM load): built A/B fragments as
+`vec<8 x i32>` all `0x22222222` (e2m1 nibble `0x2` = value 1.0), neutral
+hardware scale (`0x7F7F7F7F`), `cbsz=blgp=4` (fp4 format select), zero
+accumulator, then read lane-0's 4 f32 outputs.
+
+**Result: C = 128.0** (all 4 outputs). This is exactly the K=128 dot of
+ones, which confirms:
+- The e2m1 encoding: nibble `0x2` decodes to 1.0. (0b0010 = sign0 exp01
+  mant0 = 1.0 × 2^0.)
+- `mfma_scale_f32_16x16x128_f8f6f4([a, b, c, cbsz=4, blgp=4, opselA=0,
+  scaleA=0x7F7F7F7F, opselB=0, scaleB=0x7F7F7F7F])` computes a correct
+  fp4×fp4 → f32 K=128 accumulate.
+- The operand type is `vec<8 x i32>` (256 bits/lane) and the neutral
+  scale `0x7F7F7F7F` (e8m0 bias, = 2^0) leaves values unscaled.
+
+This de-risks the hardest part of G7 (the MFMA semantics + fp4 encoding
+the earlier draft flagged as the key unknown). **Remaining fp4 work:**
+(1) f32→e2m1 quantizer + 2-per-byte packing in torch (no torch fp4
+dtype), (2) the HBM→fragment lane mapping for K=128 fp4 (each lane's
+32 fp4 of A / B — likely the fp8-K=32 pattern scaled ×4, but needs the
+same single-tile empirical check against a dequant reference), (3) real
+per-block e8m0 scales via scaleA/scaleB instead of neutral. The probe
+kernel is in scratchpad (`test_fp4_probe.py` pattern) for reuse.
