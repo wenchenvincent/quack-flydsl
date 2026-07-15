@@ -19,10 +19,14 @@ def _ref_gated(A, B_gate, B_up, gate_type):
         return torch.nn.functional.gelu(ga, approximate="tanh") * up
     if gate_type == "glu":
         return torch.sigmoid(ga) * up
+    if gate_type == "swiglu_oai":
+        half = 0.5 * ga
+        silu_oai = half * torch.tanh(1.702 * half) + half
+        return silu_oai * (up + 1.0)
     raise ValueError(gate_type)
 
 
-@pytest.mark.parametrize("gate", ["swiglu", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize("gate", ["swiglu", "reglu", "geglu", "glu", "swiglu_oai"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("M", [128, 16])  # largest M first
 @pytest.mark.parametrize("H", [32, 64])   # hidden size = N/2

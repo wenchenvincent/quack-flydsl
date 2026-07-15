@@ -49,7 +49,7 @@ _MFMA_K = 16
 _FRAG_C = 4
 
 
-_SUPPORTED_GATES = {"swiglu", "reglu", "geglu", "glu"}
+_SUPPORTED_GATES = {"swiglu", "reglu", "geglu", "glu", "swiglu_oai"}
 
 
 def _apply_gate(gate_val, up_val, gate_type):
@@ -78,6 +78,17 @@ def _apply_gate(gate_val, up_val, gate_type):
         # sigmoid(gate) * up. sigmoid(x) = 1 / (1 + exp(-x)).
         sig = Float32(1.0) / (Float32(1.0) + _fm.exp(-gate_val, fastmath="fast"))
         return sig * up_val
+    if fx.const_expr(gate_type == "swiglu_oai"):
+        # gpt-oss variant: silu_oai(gate) * (up + 1),
+        # silu_oai(x) = 0.5x * tanh(1.702 * 0.5x) + 0.5x.
+        half = Float32(0.5) * gate_val
+        z = Float32(1.702) * half
+        # tanh(z) = 1 - 2 / (1 + exp(2z)).
+        tanh_z = Float32(1.0) - Float32(2.0) / (
+            Float32(1.0) + _fm.exp(Float32(2.0) * z, fastmath="fast")
+        )
+        silu_oai = half * tanh_z + half
+        return silu_oai * (up_val + Float32(1.0))
     raise ValueError(f"unknown gate_type: {gate_type}")
 
 
