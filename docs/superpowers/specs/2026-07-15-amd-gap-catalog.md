@@ -123,9 +123,11 @@ absent functionality. **Verify before building.**
 ## Overnight execution decision (autonomous, no feedback available)
 
 **Implement tonight** (low risk, high value, fully testable, no giant-kernel authoring):
-- **G1** — Linear/MLP/LinearCrossEntropy nn.Module wrappers.
-- **G15** — fix the stale autotuner docstring.
-- **G3** — swiglu_oai, *only if* the FlyDSL kernel change stays contained and testable; otherwise plan-only.
+- **G1** — Linear/MLP/LinearCrossEntropy nn.Module wrappers. *(in progress)*
+- **G15** — fix the stale autotuner docstring. **DONE `1416a4c`.**
+- **G3** — swiglu_oai forward, wired into the gated kernel + tested (41 gated
+  tests pass). **DONE `03bfb24`.** Forward/inference only; the dgated backward
+  for swiglu_oai is a noted follow-up.
 
 **Plan-only tonight** (real kernel/infra projects — building blind overnight would risk leaving broken kernels; each gets a scoped plan for later execution):
 - G2, G4, G5, G6, G7, G8, G9, G10, G11, G12, G13, G14.
