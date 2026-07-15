@@ -207,6 +207,11 @@ class Linear(torch.nn.Module):
 
     ``activation=None`` is a plain linear; a string activation uses the fused
     ``linear_act_train`` path. Weights are ``(out, in)`` like ``torch.nn.Linear``.
+
+    Shape constraints (inherited from the training kernels, bf16/f16 only):
+    ``out_features`` must be a multiple of 256 and the flattened batch a
+    multiple of 128 — the ``gemm_splitk`` NT tile is 128×256. Other shapes
+    raise an assertion from the kernel rather than silently falling back.
     """
 
     def __init__(
@@ -237,7 +242,13 @@ class Linear(torch.nn.Module):
 
 
 class MLP(torch.nn.Module):
-    """Autograd-aware two-layer MLP backed by ``mlp_func_train`` (fused-dact)."""
+    """Autograd-aware two-layer MLP backed by ``mlp_func_train`` (fused-dact).
+
+    Shape constraints for the fused backward path (bf16/f16): flattened batch
+    a multiple of 128, ``hidden_features`` a multiple of 256, ``out_features``
+    a multiple of 64. Non-eligible shapes still run but fall back to the
+    unfused ``torch.mm`` + elementwise activation-backward.
+    """
 
     def __init__(
         self,
