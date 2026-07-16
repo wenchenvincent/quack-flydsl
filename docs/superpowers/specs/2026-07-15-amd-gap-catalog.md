@@ -157,31 +157,31 @@ Landed:
   `quack.amd.profiler` (`benchmark`/`benchmark_tflops`/`Timer`, consolidating
   the duplicated CUDA-event timing; 4 tests, `fb1f68c`). **G14 done.**
 
-Deferred with rationale (NOT dodged — each is a deliberate engineering call):
+Landed (round 2b, 2026-07-16 — built on explicit request to conquer these):
+- **G13 (in-kernel scheduler)** — `DynamicTileScheduler` (reserve_smem +
+  next_tile: atomic-fadd claim, LDS broadcast, barrier) + `tile_idx_to_mn`
+  raster decode factored into `tile_scheduler.py`. `gemm_streamk.py` consumes
+  both (behavior-preserving), `gemm_persistent.py` consumes the decode (second
+  consumer). Tail-tile dynamic path validated. `b1bd5d4`.
+- **G10 (varlen-K)** — two paths: host-side chunked `gemm(cu_seqlens_k=)`
+  (`da295b0`, matches NVIDIA's per-group semantics, (L,M,N) output) AND a genuine
+  single-launch in-kernel grouped-K kernel `gemm_varlen_k_inkernel` (`947534f`):
+  grid.z=group, runtime-bounded scf.for over each group's own K-range with
+  per-element boundary masking → O(total_K), no host syncs. gemm() auto-routes
+  the plain aligned case to it. Bit-exact vs torch, incl. ragged + zero-length.
+- **G4 (composable epilogue)** — `epi_ops.py` is now a real begin/apply-lifecycle
+  `EpiOp` framework (AlphaScale/BetaResidual/RowBias/Activation + EpiContext);
+  `gemm_gfx950.py`'s inline epilogue migrated onto it, all 32 (bias × act × alpha
+  × beta*C) combos match the torch reference. `d63cb06`.
+
+Only hardware-blocked gap remaining:
 - **G12 (RDNA WMMA)** — **hard blocker.** This is a CDNA (gfx950) box; the RDNA
   WMMA GEMM cannot be written or validated here at all. Needs gfx1201/gfx1250
   hardware. No amount of effort on this box produces a testable result.
-- **G4 (composable epilogue)** — deferred. The per-kernel epilogues (bias/act/
-  alpha/beta/C/gate) already work and are the most correctness-sensitive code in
-  the port. Rewiring them through a new composable framework is pure architecture
-  with **zero functional gain and high silent-numerical-regression risk** —
-  exactly the kind of speculative refactor of working code the repo's AGENTS.md
-  warns against. Not appropriate to land unattended.
-- **G10 (varlen-K)** — deferred (YAGNI). No in-repo consumer, unusual semantics
-  (per-output variable contraction length), and a full new kernel. Unlike G9
-  there isn't even a thin correct dispatch to ship. Build when a consumer appears.
-- **G13 (in-kernel scheduler)** — deferred. `tile_scheduler.py` already provides
-  the host-side planning; the "gap" is a reusable *in-kernel* atomic-work-counter
-  helper. Its only consumer would be the 1775-line `gemm_streamk_prod.py`, which
-  already hand-rolls a working version — so this is a high-risk refactor of a
-  large working kernel for **speculative reusability with no second consumer**.
-  Defer until a second stream-K-style kernel needs it.
 
-Session total: **7 gaps landed** (G5, G9, G2, G8, G7-MXFP6, G14-sort,
-G14-profiler), all tested + committed, full AMD suite green. Remaining 4 are
-1 hardware-blocked (G12) + 3 deliberate defers (refactor-of-working-code /
-no-consumer). This is the honest floor: everything validatable-and-worthwhile on
-this box is done.
+Session total: **10 gaps landed** (G5, G9, G2, G8, G7-MXFP6, G14-sort,
+G14-profiler, G13, G10, G4), all tested + committed. Only G12 remains,
+blocked solely by the absence of RDNA hardware on this box.
 
 ## Overnight execution — final status (autonomous run, 2026-07-15)
 
