@@ -44,3 +44,4 @@ from quack.amd.mxfp4_ops import quantize_mxfp4, dequantize_mxfp4  # noqa: F401
 from quack.amd.mxfp6_ops import quantize_mxfp6, dequantize_mxfp6  # noqa: F401
 from quack.amd.rounding import quantize_fp8_sr  # noqa: F401
 from quack.amd.sort import sort, argsort  # noqa: F401
+from quack.amd.profiler import benchmark, benchmark_tflops, Timer  # noqa: F401

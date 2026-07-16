@@ -27,8 +27,6 @@ Usage:
 from __future__ import annotations
 
 import sys
-import time
-from pathlib import Path
 
 import torch
 import triton
@@ -193,20 +191,10 @@ def ogs_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _bench(fn, warmup: int = 15, iters: int = 50) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    time.sleep(0.1)
-    evs = [
-        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-        for _ in range(iters)
-    ]
-    for s, e in evs:
-        s.record()
-        fn()
-        e.record()
-    torch.cuda.synchronize()
-    return sorted(s.elapsed_time(e) * 1e-3 for s, e in evs)[0]
+    # Canonical min-of-iters CUDA-event timing lives in quack.amd.profiler.
+    from quack.amd.profiler import benchmark
+
+    return benchmark(fn, warmup=warmup, iters=iters, return_mode="min")
 
 
 def main():
