@@ -55,7 +55,9 @@ def _align(x, a):
 
 def _build_topk_lds_f32(*, N, k, arch):
     assert N in (128, 256, 512, 1024, 2048, 4096), f"N must be 128..4096 pow2, got {N}"
-    assert k <= 128 and k <= N and (k & (k - 1)) == 0
+    # k ≤ 128 for top-k; k == N is the full-sort path (quack.amd.sort), which
+    # writes every sorted element rather than just the top slice.
+    assert (k <= 128 or k == N) and k <= N and (k & (k - 1)) == 0
     log2_N = int(_py_math.log2(N))
     workers = N // 2
     workers_per_thread = max(workers // _BLOCK_THREADS, 1)
