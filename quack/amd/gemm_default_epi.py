@@ -10,6 +10,9 @@ body.
 
 Extension points:
     - Stochastic rounding (gfx950 has hardware support; wire via rocdl).
+      A standalone fp8 SR quantizer using ``v_cvt_sr_fp8_f32`` now exists in
+      ``quack/amd/rounding.py`` (``quantize_fp8_sr``); wiring SR into this
+      composable epilogue's f32→bf16 writeback remains a G4/G8 follow-up.
     - CShuffle epilogue (route acc → LDS → reshape → global store).
     - Fused activation (that's `gemm_act_epi.py`, layered on top).
 """

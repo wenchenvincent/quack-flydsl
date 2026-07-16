@@ -40,3 +40,4 @@ from quack.amd.gemm_gfx950_int8 import gemm_int8  # noqa: F401
 from quack.amd.gemm_gfx950_mxfp4 import gemm_mxfp4  # noqa: F401
 from quack.amd.gemm_gfx950_tt import gemm_tt  # noqa: F401
 from quack.amd.mxfp4_ops import quantize_mxfp4, dequantize_mxfp4  # noqa: F401
+from quack.amd.rounding import quantize_fp8_sr  # noqa: F401
