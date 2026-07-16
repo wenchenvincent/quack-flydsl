@@ -10,6 +10,7 @@ from quack.linear import linear_gated_func
 from quack.mlp import mlp_func
 from quack.gemm_interface import (
     gemm,
+    gemm_act,
     gemm_add,
     gemm_add_inplace,
     gemm_tuned,
@@ -28,6 +29,7 @@ from quack.gemm_interface import (
     gemm_norm_act,
     gemm_norm_act_ref,
 )
+from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
 from quack.rounding import RoundingMode
 from quack.rms_final_reduce import rms_final_reduce
@@ -189,7 +191,59 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
 
 
-@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("alpha_kind", ["float", "tensor"])
+@pytest.mark.parametrize("activation", ["tanh", "relu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_act_alpha(input_dtype, activation, alpha_kind, has_bias):
+    """Pre-activation alpha: postact = act(alpha * A @ B + bias). The scale
+    is applied to the fp32 accumulator BEFORE the activation (and before
+    bias), which no output alpha can reproduce through the nonlinearity --
+    so parity against the alpha-carrying reference pins the application
+    point, not just the value."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, k, n = 512, 1024, 1504
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = (torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)).T
+    bias = torch.randn(n, device=device) if has_bias else None
+    alpha_val = 0.7371
+    alpha = (
+        alpha_val
+        if alpha_kind == "float"
+        else torch.tensor(alpha_val, device=device, dtype=torch.float32)
+    )
+    preact, postact = gemm_act(A, B, bias=bias, activation=activation, alpha=alpha, tuned=False)
+    preact_ref, postact_ref = gemm_act_ref(
+        A.float(), B.float(), bias=bias, activation=activation, alpha=alpha_val
+    )
+    preact_pt, postact_pt = gemm_act_ref(A, B, bias=bias, activation=activation, alpha=alpha_val)
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
+    # Warm-plan replay with a DIFFERENT alpha of the same mode: the scalar is
+    # a runtime argument (mode is what's compiled/keyed), so the cached
+    # interface plan must pick up the new value.
+    alpha2_val = 0.25
+    alpha2 = (
+        alpha2_val
+        if alpha_kind == "float"
+        else torch.tensor(alpha2_val, device=device, dtype=torch.float32)
+    )
+    _, postact2 = gemm_act(A, B, bias=bias, activation=activation, alpha=alpha2, tuned=False)
+    _, postact2_ref = gemm_act_ref(
+        A.float(), B.float(), bias=bias, activation=activation, alpha=alpha2_val
+    )
+    _, postact2_pt = gemm_act_ref(A, B, bias=bias, activation=activation, alpha=alpha2_val)
+    assert (postact2 - postact2_ref).abs().max() < 2 * (
+        postact2_pt - postact2_ref
+    ).abs().max() + 1e-6
+    # alpha=1.0 folds to the alpha-free epilogue: bitwise vs the no-alpha call.
+    _, postact_neutral = gemm_act(A, B, bias=bias, activation=activation, alpha=1.0, tuned=False)
+    _, postact_plain = gemm_act(A, B, bias=bias, activation=activation, tuned=False)
+    assert torch.equal(postact_neutral, postact_plain)
+
+
+@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "tanh"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("n", [1504, 2048])
@@ -366,7 +420,9 @@ def test_gemm_add_inplace_alpha_beta(
 
 
 @pytest.mark.parametrize("store_preact", [True, False])
-@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize(
+    "activation", ["swiglu", "swiglu_oai", "swiglu_oai-tanh", "reglu", "geglu", "glu"]
+)
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("out_features", [1504, 2048])
@@ -377,6 +433,8 @@ def test_gemm_gated(
 ):
     """Test GEMM with gated activation forward computation."""
     device = "cuda"
+    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 8:
+        pytest.skip("SM8x gated GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 1920
     x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
@@ -432,7 +490,55 @@ def test_gemm_gated(
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
 
 
-@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize("pingpong", [False, True])
+def test_gemm_gated_pingpong_configs(pingpong):
+    """Exercise tuned gated dispatch with configs that bypass the public wrapper."""
+    device = "cuda"
+    device_capacity = get_device_capacity(torch.device(device))[0]
+    if device_capacity not in (9, 12):
+        pytest.skip("pingpong config regression only covers SM90 and SM120")
+
+    torch.random.manual_seed(0)
+    input_dtype = torch.bfloat16
+    m, in_features, out_features = 512, 256, 512
+    x = torch.randn((m, in_features), device=device, dtype=input_dtype)
+    x = x[::2]
+    w = torch.randn((2 * out_features, in_features), device=device, dtype=input_dtype) / math.sqrt(
+        in_features
+    )
+    B = w.T
+    preact = torch.empty((x.shape[0], 2 * out_features), device=device, dtype=input_dtype)
+    postact = torch.empty((x.shape[0], out_features), device=device, dtype=input_dtype)
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        pingpong=pingpong,
+        is_dynamic_persistent=device_capacity == 12,
+        cluster_m=1,
+        cluster_n=1,
+        device_capacity=device_capacity,
+    )
+    gemm_act(
+        x,
+        B,
+        activation="swiglu",
+        preact_out=preact,
+        postact_out=postact,
+        store_preact=True,
+        tuned=False,
+        config=config,
+    )
+    preact_ref, postact_ref = gemm_gated_ref(
+        x.float(), B.float(), activation="swiglu", store_preact=True
+    )
+    preact_pt, postact_pt = gemm_gated_ref(x, B, activation="swiglu", store_preact=True)
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+
+
+@pytest.mark.parametrize(
+    "activation", ["swiglu", "swiglu_oai", "swiglu_oai-tanh", "reglu", "geglu", "glu"]
+)
 # @pytest.mark.parametrize("activation", ["swiglu"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("colvec_reduce", [False, True])
@@ -446,6 +552,8 @@ def test_gemm_gated(
 def test_gemm_dgated(n, k, has_colvec_scale, colvec_reduce, input_dtype, activation):
     """Test GEMM with gated activation gradient computation."""
     device = "cuda"
+    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 8:
+        pytest.skip("SM8x gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 960
     dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
@@ -496,9 +604,11 @@ def test_dact_linear_partial_grad(input_dtype, freeze, activation):
     both dpreact and dweight. Previously, freezing weight caused preact to not be saved.
     """
     device = "cuda"
+    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 8:
+        pytest.skip("SM8x (d)activation GEMM epilogues not yet supported")
     torch.random.manual_seed(0)
     m, in_features, out_features = 256, 512, 512
-    gated = activation in ("swiglu", "swiglu_oai", "reglu", "geglu", "glu")
+    gated = activation in ("swiglu", "swiglu_oai", "swiglu_oai-tanh", "reglu", "geglu", "glu")
     freeze_x = freeze == "x"
     x = torch.randn(m, in_features, device=device, dtype=input_dtype, requires_grad=not freeze_x)
     w1_out = 2 * out_features if gated else out_features
@@ -538,9 +648,9 @@ def test_linear_act_partial_grad(input_dtype, freeze, activation):
     Regression test: ensure gradient flows correctly when x or weight is frozen.
     """
     device = "cuda"
+    gated = activation in ("swiglu", "swiglu_oai", "swiglu_oai-tanh", "reglu", "geglu", "glu")
     torch.random.manual_seed(0)
     m, in_features, out_features = 256, 512, 512
-    gated = activation in ("swiglu", "swiglu_oai", "reglu", "geglu", "glu")
     freeze_x = freeze == "x"
     x = torch.randn(m, in_features, device=device, dtype=input_dtype, requires_grad=not freeze_x)
     fc1_out = 2 * out_features if gated else out_features
@@ -560,12 +670,14 @@ def test_linear_act_partial_grad(input_dtype, freeze, activation):
         assert w.grad is None
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize(
     "fn_name", ["linear_func", "linear_act_func", "linear_gated_func", "mlp_func"]
 )
-def test_autocast(fn_name):
+def test_autocast(fn_name, use_compile):
     """Autocast: float32 inputs are cast to bfloat16 for the kernel.
 
+    Covers both eager and torch.compile(fullgraph=True) paths.
     Regression test for https://github.com/Dao-AILab/quack/issues/54.
     """
     device = "cuda"
@@ -576,92 +688,51 @@ def test_autocast(fn_name):
     w = torch.randn(out_features, in_features, device=device, dtype=torch.float32)
     w /= math.sqrt(in_features)
     w.requires_grad_(True)
-
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        if fn_name == "linear_func":
-            out = linear_func(x, w, tuned=False)
-        elif fn_name == "linear_act_func":
-            out, _postact = linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
-        elif fn_name == "linear_gated_func":
-            w_gated = (
-                torch.randn(2 * out_features, in_features, device=device, dtype=torch.float32)
-                / math.sqrt(in_features)
-            ).requires_grad_(True)
-            out, _postact = linear_gated_func(x, w_gated, activation="swiglu", tuned=False)
-            w = w_gated  # for grad check below
-        elif fn_name == "mlp_func":
-            w2 = torch.randn(
-                in_features,
-                out_features,
-                device=device,
-                dtype=torch.float32,
-                requires_grad=True,
-            ) / math.sqrt(out_features)
-            out = mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
-
-    assert out.dtype == torch.bfloat16, f"expected bfloat16 output, got {out.dtype}"
-    out.sum().backward()
-    assert x.grad is not None
-    assert w.grad is not None
-
-
-@pytest.mark.parametrize(
-    "fn_name", ["linear_func", "linear_act_func", "linear_gated_func", "mlp_func"]
-)
-def test_autocast_compile(fn_name):
-    """Autocast under torch.compile(fullgraph=True).
-
-    Regression test for https://github.com/Dao-AILab/quack/issues/54.
-    """
-    device = "cuda"
-    torch.random.manual_seed(0)
-    m, in_features, out_features = 256, 512, 512
-
-    x = torch.randn(m, in_features, device=device, dtype=torch.float32, requires_grad=True)
-    w = torch.randn(out_features, in_features, device=device, dtype=torch.float32)
-    w /= math.sqrt(in_features)
-    w.requires_grad_(True)
-
-    if fn_name == "linear_func":
-
-        @torch.compile(fullgraph=True)
-        def fn(x, w):
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_func(x, w, tuned=False)
-
-        out = fn(x, w)
-    elif fn_name == "linear_act_func":
-
-        @torch.compile(fullgraph=True)
-        def fn(x, w):
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
-
-        out, _postact = fn(x, w)
-    elif fn_name == "linear_gated_func":
+    w_gated = None
+    w2 = None
+    if fn_name == "linear_gated_func":
         w_gated = (
             torch.randn(2 * out_features, in_features, device=device, dtype=torch.float32)
             / math.sqrt(in_features)
         ).requires_grad_(True)
-
-        @torch.compile(fullgraph=True)
-        def fn(x, w):
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_gated_func(x, w, activation="swiglu", tuned=False)
-
-        out, _postact = fn(x, w_gated)
-        w = w_gated
     elif fn_name == "mlp_func":
         w2 = (
             torch.randn(in_features, out_features, device=device, dtype=torch.float32)
             / math.sqrt(out_features)
         ).requires_grad_(True)
 
-        @torch.compile(fullgraph=True)
-        def fn(x, w, w2):
+    if fn_name == "linear_func":
+
+        def body(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_func(x, w, tuned=False)
+
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
+        out = fn(x, w)
+    elif fn_name == "linear_act_func":
+
+        def body(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
+
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
+        out, _postact = fn(x, w)
+    elif fn_name == "linear_gated_func":
+
+        def body(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_gated_func(x, w, activation="swiglu", tuned=False)
+
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
+        out, _postact = fn(x, w_gated)
+        w = w_gated  # for grad check below
+    elif fn_name == "mlp_func":
+
+        def body(x, w, w2):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 return mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
 
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
         out = fn(x, w, w2)
 
     assert out.dtype == torch.bfloat16, f"expected bfloat16 output, got {out.dtype}"
@@ -676,20 +747,17 @@ def test_autocast_compile(fn_name):
 
 
 @pytest.mark.parametrize("sr_seed", [0, 42])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [512, 1024])
 @pytest.mark.parametrize("k", [256, 768])
 @pytest.mark.parametrize("m", [480, 960])
 def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
-    """Test GEMM with stochastic rounding on SM100/SM110.
+    """Test GEMM with stochastic rounding (hw cvt.rs on SM100/SM103, sw emulation on SM90/SM120).
 
     Validates that SR produces results close to RNE (within BF16 tolerance)
     and that the output has correct shape and dtype.
     """
     device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
@@ -703,30 +771,13 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
     assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-3
 
 
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-def test_gemm_sr_requires_sm100(input_dtype):
-    """Assert that SR raises on non-SM100 hardware."""
-    device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] == 10:
-        pytest.skip("This test is for non-SM100 hardware")
-    torch.random.manual_seed(0)
-    A = torch.randn((128, 256), device=device, dtype=input_dtype)
-    B = torch.randn((256, 128), device=device, dtype=input_dtype)
-    with pytest.raises(AssertionError, match="SM100"):
-        gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS)
-
-
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("m", [480])
 def test_gemm_sr_different_seeds(m, k, n, input_dtype):
     """Different SR seeds should produce different results (non-deterministic rounding)."""
     device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype)
@@ -753,16 +804,18 @@ def test_rms_final_reduce(M, N, input_dtype):
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("premult_dtype", [None, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("has_norm_weight", [False, True])
 @pytest.mark.parametrize("has_C", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1504, 2048])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("m", [960, 1920])
-def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
-    """Test GEMM + RMS + optional rowvec scaling.
+def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, premult_dtype, use_compile):
+    """Test GEMM + RMS + optional rowvec scaling, optionally writing a pre-norm_weight snapshot.
 
     D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    If premult_out is provided, D_raw is also written there (cast to premult_dtype).
     """
     device = "cuda"
     torch.random.manual_seed(0)
@@ -771,8 +824,11 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
     B = torch.randn((k, n), device=device, dtype=input_dtype)
     C = torch.randn((m, n), device=device, dtype=input_dtype) if has_C else None
     norm_weight = torch.randn(n, device=device, dtype=input_dtype) if has_norm_weight else None
+    premult_out = (
+        torch.empty(m, n, device=device, dtype=premult_dtype) if premult_dtype is not None else None
+    )
     fn = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
-    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, eps=eps, tuned=False)
+    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, premult_out=premult_out, eps=eps, tuned=False)
     D_ref, rstd_ref = gemm_rms_ref(
         A.float(),
         B.float(),
@@ -784,6 +840,18 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
     assert (D - D_ref).abs().max() < 2 * (D_pt - D_ref).abs().max() + 1e-5
     assert (rstd - rstd_ref).abs().max() < 2 * (rstd_pt - rstd_ref).abs().max() + 1e-3
 
+    if premult_out is not None:
+        # premult_out holds (A@B + C) (pre-norm_weight), cast to premult_dtype.
+        ab = A.float() @ B.float()
+        if C is not None:
+            ab = ab + C.float()
+        expected_premult = ab.to(premult_dtype).float()
+        # Tolerance is gated by the wider of input/premult eps: input eps bounds matmul-accumulation
+        # divergence, premult eps bounds the storage cast.
+        eff_eps = max(torch.finfo(input_dtype).eps, torch.finfo(premult_dtype).eps)
+        tol = 2 * (expected_premult.abs().max() * eff_eps + torch.finfo(premult_dtype).tiny)
+        assert (premult_out.float() - expected_premult).abs().max() <= tol
+
 
 @pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
@@ -793,8 +861,6 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_ab):
-    from quack.gemm_interface import gemm_norm_act_tuned
-
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1024
@@ -816,16 +882,17 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
     else:
         preact = torch.empty(m, n, device=device, dtype=input_dtype)
         postact = torch.empty(m, n, device=device, dtype=input_dtype)
-        gemm_norm_act_tuned.fn(
+        gemm_norm_act(
             A,
             B,
-            preact,
-            postact,
-            C,
-            rstd,
-            activation,
-            False,
-            config=GemmConfig(swap_ab=True),
+            rstd=rstd,
+            C=C,
+            activation=activation,
+            preact_out=preact,
+            postact_out=postact,
+            store_preact=True,
+            tuned=False,
+            config=replace(default_config(torch.device(device)), swap_ab=True),
         )
     preact_ref, postact_ref = gemm_norm_act_ref(
         A.float(),
@@ -847,6 +914,59 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("tile_M,tile_N", [(128, 128), (128, 256), (64, 256)])
+@pytest.mark.parametrize("M,N,K", [(4096, 4096, 4096)])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
+    """Regression test for https://github.com/Dao-AILab/quack/issues/135:
+
+    Passing both colvec (rstd) and rowvec (norm_weight) to gemm_norm_act_fn
+    produced corrupted output for tile shapes where the vec smem region was
+    smaller than the tiled cp_async partition tile. cp_async with pred=False
+    zero-fills the destination instead of skipping the write, which corrupted
+    the adjacent vec smem field.
+    """
+    device = "cuda"
+    if get_device_capacity(torch.device(device))[0] != 9:
+        pytest.skip("This regression test targets SM90.")
+    from quack.gemm_norm_act import gemm_norm_act_fn
+
+    torch.manual_seed(0)
+    A = torch.randn(1, M, K, device=device, dtype=input_dtype)
+    B = torch.randn(1, N, K, device=device, dtype=input_dtype)
+    colvec = torch.randn(1, M, device=device, dtype=input_dtype)
+    rowvec = torch.randn(1, N, device=device, dtype=input_dtype)
+    ref = ((A.float() @ B.float().mT) * colvec.float()[:, :, None] * rowvec.float()[:, None, :]).to(
+        input_dtype
+    )
+    out = torch.empty(1, M, N, dtype=input_dtype, device=device)
+    gemm_norm_act_fn(
+        A,
+        B,
+        D=None,
+        C=None,
+        PostAct=out,
+        tile_count_semaphore=None,
+        activation=None,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+        colvec=colvec,
+        rowvec=rowvec,
+    )
+    # Bf16 dot-product noise tolerance: pre-fix this same test saw absolute
+    # errors of >1e3 because some output tiles were entirely zeroed out.
+    diff = (out.float() - ref.float()).abs()
+    # < 0.5% of elements should exceed an absolute tolerance of 0.5 (bf16 ulp
+    # at the magnitudes involved is roughly that scale).
+    frac_bad = (diff > 0.5).float().mean().item()
+    assert frac_bad < 5e-3, (
+        f"tile=({tile_M},{tile_N}): {frac_bad * 100:.2f}% of elements have |err|>0.5 "
+        f"(max|err|={diff.max().item():.2e}); see issue #135"
+    )
+
+
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu", "reglu", "geglu"])
 @pytest.mark.parametrize("n", [2048])
@@ -854,6 +974,8 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
     device = "cuda"
+    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 8:
+        pytest.skip("SM8x gated norm activation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 1024
     A = torch.randn(m, k, device=device, dtype=input_dtype)
@@ -947,3 +1069,199 @@ def test_gemm_rms_then_norm_act(input_dtype, activation, use_compile):
         f"act={activation}: err={err:.4f}, err_pt={err_pt:.4f}, ratio={err / (err_pt + 1e-10):.2f}"
     )
     assert err < 2 * err_pt + 1e-4
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm(A, B)
+    assert out.shape == (M, N)
+    if K == 0:
+        # 0 @ K x K @ N is mathematically an M x N matrix of zeros (empty sum).
+        assert torch.all(out == 0)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_add_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C)
+    assert out.shape == (M, N)
+    if K == 0:
+        # D = A@B + C reduces to D = C when K = 0.
+        assert torch.equal(out, C)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("with_backward", [False, True])
+def test_linear_func_empty(zero_dim, with_backward):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    out = linear_func(x, w)
+    assert out.shape == (M, N)
+    if K == 0:
+        assert torch.all(out == 0)
+    if with_backward and out.numel() > 0:
+        out.sum().backward()
+        assert x.grad.shape == x.shape and w.grad.shape == w.shape
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_act_empty(zero_dim, activation):
+    is_gated = activation in ("swiglu",)
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    # Gated: output preact has 2*N cols (gate || up); postact has N cols.
+    B_n = N * 2 if is_gated else N
+    B = torch.randn(K, B_n, device="cuda", dtype=torch.bfloat16)
+    preact, postact = gemm_act(A, B, activation=activation)
+    assert preact.shape == (M, B_n)
+    assert postact.shape == (M, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_dact_empty(zero_dim, activation):
+    is_dgated = activation in ("swiglu",)
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    preact_n = N * 2 if is_dgated else N
+    PreAct = torch.randn(M, preact_n, device="cuda", dtype=torch.bfloat16)
+    out = gemm_dact(A, B, PreAct, activation=activation)
+    dx, postact = out[0], out[1]
+    assert dx.shape == (M, preact_n)
+    assert postact.shape == (M, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_add_inplace_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    out = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    out_orig = out.clone()
+    gemm_add_inplace(A, B, out)
+    assert out.shape == (M, N)
+    if K == 0:
+        # K=0: A@B is zero matrix; out = 1.0 * 0 + 1.0 * out = out (unchanged).
+        assert torch.equal(out, out_orig)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_rms_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    out, rstd = gemm_rms(A, B, norm_weight=norm_weight)
+    assert out.shape == (M, N)
+    assert rstd.shape == (M,)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_norm_act_empty(zero_dim, activation):
+    is_gated = activation in ("swiglu",)
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B_n = N * 2 if is_gated else N
+    B = torch.randn(K, B_n, device="cuda", dtype=torch.bfloat16)
+    rstd = torch.randn(M, device="cuda", dtype=torch.float32)
+    _preact, postact = gemm_norm_act(A, B, rstd=rstd, activation=activation)
+    assert postact.shape == (M, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("with_backward", [False, True])
+def test_linear_act_func_empty(zero_dim, with_backward):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    preact, postact = linear_act_func(x, w, activation="relu")
+    assert preact.shape == (M, N)
+    assert postact.shape == (M, N)
+    if with_backward and postact.numel() > 0:
+        preact.sum().backward()
+        assert x.grad.shape == x.shape and w.grad.shape == w.shape
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("with_backward", [False, True])
+def test_linear_gated_func_empty(zero_dim, with_backward):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    # gated: weight has 2*N rows for (gate || up); postact has N cols.
+    w = torch.randn(N * 2, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    preact, postact = linear_gated_func(x, w, activation="swiglu")
+    assert preact.shape == (M, N * 2)
+    assert postact.shape == (M, N)
+    if with_backward and postact.numel() > 0:
+        preact.sum().backward()
+        assert x.grad.shape == x.shape and w.grad.shape == w.shape

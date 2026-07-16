@@ -17,12 +17,12 @@ torch._dynamo.config.cache_size_limit = 64
 @pytest.mark.parametrize("in_features", [512])
 def test_mlp(in_features, hidden_features, dtype, activation, use_compile):
     device = "cuda"
+    gated = activation in gated_to_pytorch_fn_map
     torch.random.manual_seed(0)
     batch = 256
     mlp = MLP(
         in_features, hidden_features, activation=activation, device=device, dtype=dtype, tuned=False
     )
-    gated = activation in gated_to_pytorch_fn_map
     if gated:
         assert mlp.fc1.out_features == 2 * hidden_features
         assert mlp.fc2.in_features == hidden_features
@@ -56,6 +56,7 @@ def test_mlp(in_features, hidden_features, dtype, activation, use_compile):
 def test_mlp_zero_stride_grad(dtype, activation, use_compile):
     """out.sum().backward() produces expanded gradient with zero strides."""
     device = "cuda"
+    gated = activation in gated_to_pytorch_fn_map
     torch.random.manual_seed(0)
     mlp = MLP(512, 512, activation=activation, device=device, dtype=dtype, tuned=False)
     w1_ref = mlp.fc1.weight.detach().clone().float()
@@ -69,7 +70,6 @@ def test_mlp_zero_stride_grad(dtype, activation, use_compile):
     # Reference
     x_ref = x.detach().clone().float().requires_grad_(True)
     y_ref = F.linear(x_ref, w1_ref)
-    gated = activation in gated_to_pytorch_fn_map
     if gated:
         y_ref = gated_to_pytorch_fn_map[activation](y_ref[..., ::2], y_ref[..., 1::2])
     else:
@@ -85,9 +85,9 @@ def test_mlp_zero_stride_grad(dtype, activation, use_compile):
 def test_mlp_recompute(dtype, activation, use_compile):
     """recompute=True should match normal mode and float32 reference."""
     device = "cuda"
+    gated = activation in gated_to_pytorch_fn_map
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
-    gated = activation in gated_to_pytorch_fn_map
     mlp = MLP(dim, hidden, activation=activation, device=device, dtype=dtype, tuned=False)
     x = torch.randn(batch, dim, device=device, dtype=dtype, requires_grad=True)
     dout = torch.randn(batch, dim, device=device, dtype=dtype)
@@ -140,9 +140,9 @@ def test_mlp_recompute_partial_grad(dtype, activation, freeze):
     Tests that needs_input_grad indexing is correct: x=[0], weight1=[1], weight2=[2].
     """
     device = "cuda"
+    gated = activation in gated_to_pytorch_fn_map
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
-    gated = activation in gated_to_pytorch_fn_map
     mlp = MLP(
         dim,
         hidden,

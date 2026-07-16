@@ -4,7 +4,7 @@ import pytest
 import torch
 
 
-from quack.topk import topk
+from quack.topk import topk, topk_fwd, topk_bwd
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -43,6 +43,9 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
     if softmax:
         out_val_ref = torch.softmax(out_val_ref.float(), dim=-1).to(input_dtype)
 
+    dvalues = torch.randn_like(out_val)
+    out_val.backward(dvalues)
+
     # Check output shape and dtype
     assert out_val.shape == (M, k)
     assert out_val.dtype == input_dtype
@@ -57,8 +60,6 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
         torch.testing.assert_close(indexed_vals, out_val, atol=atol, rtol=rtol)
 
         # Backward check
-        dvalues = torch.randn_like(out_val)
-        out_val.backward(dvalues)
         dx_ref = torch.zeros_like(x)
         dx_ref.scatter_(1, out_idx.long(), dvalues)
         torch.testing.assert_close(x.grad, dx_ref, atol=1e-3, rtol=1e-3)
@@ -71,8 +72,6 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
             rtol=1e-2,
             msg="Softmax probabilities don't sum to 1",
         )
-        dvalues = torch.randn_like(out_val)
-        out_val.backward(dvalues)
         dot = (dvalues.float() * out_val.float()).sum(dim=1, keepdim=True)
         grad_topk = out_val.float() * (dvalues.float() - dot)
         grad_topk = grad_topk.to(input_dtype)
@@ -118,3 +117,20 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
 #     out_neg = topk(x_neg, 8)
 #     out_ref_neg, _ = torch.topk(x_neg, 8, dim=-1, largest=True, sorted=True)
 #     torch.testing.assert_close(out_neg, out_ref_neg, atol=1e-6, rtol=1e-6)
+
+
+def test_topk_fwd_empty():
+    """topk_fwd must handle zero-batch inputs without launching a kernel."""
+    N, k = 4096, 8
+    x = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
+    values, indices = topk_fwd(x, k)
+    assert values.shape == (0, k) and indices.shape == (0, k)
+
+
+def test_topk_bwd_empty():
+    """topk_bwd must handle zero-batch inputs without launching a kernel."""
+    N, k = 4096, 8
+    dvalues = torch.empty(0, k, device="cuda", dtype=torch.bfloat16)
+    indices = torch.empty(0, k, device="cuda", dtype=torch.int32)
+    dx = topk_bwd(dvalues, None, indices, N=N)
+    assert dx.shape == (0, N)

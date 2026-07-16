@@ -19,6 +19,11 @@ sm100_tma_gather_only = pytest.mark.skipif(
 )
 
 
+def assert_aliased(a, b) -> None:
+    """Assert two tensors share storage."""
+    assert a.data_ptr() == b.data_ptr()
+
+
 def generate_A_with_gather(m, total_k, device, dtype, gather_A=False):
     """Generate A matrix and optionally A_idx for gather_A case with varlen_k.
 
@@ -418,12 +423,18 @@ def test_gemm_add_inplace_varlen_k(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
+@pytest.mark.parametrize("gather_A", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("m", [1024])
 @pytest.mark.parametrize("num_groups", [3])
-def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype):
-    """Test varlen_k GEMM with concat_layout={"out"} (MoE dweight backward)."""
+def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre_allocate_out):
+    """Test varlen_k GEMM with concat_layout={"out"} (MoE dweight backward).
+
+    Covers sonic-moe's down_projection_backward_weight call: cu_seqlens_k + A_idx
+    (gather) + concat_layout=("out",) + pre-allocated out= buffer.
+    """
     device = "cuda"
     torch.random.manual_seed(0)
     seq_lens = torch.randint(100, 200, (num_groups,), device=device)
@@ -431,11 +442,85 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype):
     cu_seqlens_k = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    # A must be m-major for varlen_k
-    A = torch.randn((total_k, m), device=device, dtype=input_dtype).T / math.sqrt(total_k)
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A)
+    A = A / math.sqrt(total_k)
     B = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(total_k)
     concat_layout = ("out",)
-    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False, concat_layout=concat_layout)
-    out_ref = gemm_ref(A.float(), B.float(), cu_seqlens_k=cu_seqlens_k, concat_layout=concat_layout)
-    out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, concat_layout=concat_layout)
+    out_buf = (
+        torch.empty((num_groups, m, n), device=device, dtype=input_dtype)
+        if pre_allocate_out
+        else None
+    )
+    out = gemm(
+        A,
+        B,
+        out=out_buf,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        tuned=False,
+        concat_layout=concat_layout,
+    )
+    out_ref = gemm_ref(
+        A.float(),
+        B.float(),
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        concat_layout=concat_layout,
+    )
+    out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx, concat_layout=concat_layout)
+    if pre_allocate_out:
+        assert_aliased(out, out_buf)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
+
+
+# ---- Empty-input tests for varlen_k. total_k=0 means each batch's contraction
+# dim is empty (mathematically, output is per-batch zero matrix, then summed).
+def _zero_cu_seqlens_k(L, device="cuda"):
+    return torch.zeros(L + 1, dtype=torch.int32, device=device)
+
+
+def _make_cu_seqlens_k(L, total_k, device="cuda"):
+    cu = _zero_cu_seqlens_k(L, device)
+    if total_k > 0:
+        per = total_k // L
+        cu[1:] = torch.arange(per, total_k + 1, per, dtype=torch.int32, device=device)
+    return cu
+
+
+@pytest.mark.parametrize("zero_dim", ["total_k", "M", "N"])
+def test_gemm_varlen_k_empty(zero_dim):
+    L, M, total_k, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_k":
+        total_k = 0
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    cu_seqlens_k = _make_cu_seqlens_k(L, total_k)
+    A = torch.randn(M, total_k, device="cuda", dtype=torch.bfloat16)
+    A = A.T.contiguous().T  # m-major as required by varlen_k
+    B = torch.randn(total_k, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    assert out.shape == (L, M, N)
+    if total_k == 0:
+        assert torch.all(out == 0)
+
+
+@pytest.mark.parametrize("zero_dim", ["total_k", "M", "N"])
+def test_gemm_add_varlen_k_empty(zero_dim):
+    L, M, total_k, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_k":
+        total_k = 0
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    cu_seqlens_k = _make_cu_seqlens_k(L, total_k)
+    A = torch.randn(M, total_k, device="cuda", dtype=torch.bfloat16)
+    A = A.T.contiguous().T
+    B = torch.randn(total_k, N, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(L, M, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    assert out.shape == (L, M, N)
+    if total_k == 0:
+        assert torch.equal(out, C)

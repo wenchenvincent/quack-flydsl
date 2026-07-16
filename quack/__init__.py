@@ -1,30 +1,36 @@
-__version__ = "0.3.11"
+__version__ = "0.6.1"
 
 import os
 
 try:
-    from quack.rmsnorm import rmsnorm
-    from quack.softmax import softmax
-    from quack.cross_entropy import cross_entropy
-    from quack.rounding import RoundingMode
+    import quack.dsl as _quack_dsl  # noqa: F401
+
+    if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+        from quack.dsl import cute_dsl_ptxas as _cute_dsl_ptxas
+
+        # Patch before importing any modules that instantiate CuTeDSL. The patch
+        # forces PTX dumping so the CUDA library loader can replace CUTLASS DSL's
+        # embedded ptxas-library cubin with one assembled by system ptxas.
+        _cute_dsl_ptxas.patch()
+
+    # Pythonic CuTe tensor indexing (`:` / `...` sugar) is installed as a side
+    # effect of importing `quack.dsl`, which imports
+    # `quack.dsl.cute_tensor_indexing` and monkey-patches CuTe's tensor classes
+    # process-wide.
+    from quack.rmsnorm import rmsnorm  # noqa: E402
+    from quack.softmax import softmax  # noqa: E402
+    from quack.cross_entropy import cross_entropy  # noqa: E402
+    from quack.rounding import RoundingMode  # noqa: E402
+
+    __all__ = [
+        "rmsnorm",
+        "softmax",
+        "cross_entropy",
+        "RoundingMode",
+    ]
 except ImportError:
     # CuTe-DSL (nvidia-cutlass-dsl) is not installed. The NVIDIA kernels are
     # unavailable in this environment, but `quack.amd` (FlyDSL-based AMDGPU port)
     # may still be usable. Eager NVIDIA imports are skipped so `import quack.amd`
     # works on AMD-only installs.
-    pass
-
-
-if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
-    import quack.cute_dsl_ptxas  # noqa: F401
-
-    # Patch to dump ptx and then use system ptxas to compile to cubin
-    quack.cute_dsl_ptxas.patch()
-
-
-__all__ = [
-    "rmsnorm",
-    "softmax",
-    "cross_entropy",
-    "RoundingMode",
-]
+    __all__ = []

@@ -1,0 +1,87 @@
+name: _test (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to check out (defaults to the calling event's default).
+        type: string
+        required: false
+        default: ''
+      environment:
+        description: GitHub environment to run the test job in (e.g. "gpu-ci").
+        type: string
+        required: false
+        default: ''
+
+env:
+  # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
+  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.07.09
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.07.09
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check
+        run: ruff check quack/ tests/
+      - name: Ruff format
+        run: ruff format --check quack/ tests/
+
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # paths-filter needs git history on push events; for PRs it uses the API.
+      - if: github.event_name == 'push'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'quack/**'
+              - 'tests/**'
+              - '.github/**'
+              - 'pyproject.toml'
+
+  test:
+    needs: changes
+    if: >
+      needs.changes.outputs.code == 'true' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+       github.event_name == 'pull_request_target')
+    environment: ${{ inputs.environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gpu: h100, cuda: cu129 }
+          - { gpu: h100, cuda: cu132 }
+          - { gpu: b300, cuda: cu129 }
+          - { gpu: b300, cuda: cu132 }
+          - { gpu: h100, cuda: cu129, arch: '120' }
+          - { gpu: h100, cuda: cu132, arch: '120' }
+    runs-on: [self-hosted, '${{ matrix.gpu }}']
+    name: test (${{ matrix.gpu }}${{ matrix.arch && format(' / sm{0}', matrix.arch) || '' }} / ${{ matrix.cuda }})
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/gpu-test
+        with:
+          cuda: ${{ matrix.cuda }}
+          gpu: ${{ matrix.gpu }}
+          image_cu129: ${{ env.IMAGE_CU129 }}
+          image_cu132: ${{ env.IMAGE_CU132 }}
+          arch: ${{ matrix.arch }}
