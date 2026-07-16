@@ -34,6 +34,7 @@ class VarlenArgs(NamedTuple):
     """
     cu_seqlens_m: Optional[Tensor] = None
     A_idx: Optional[Tensor] = None
+    cu_seqlens_k: Optional[Tensor] = None
 
 
 def validate_varlen(cu_seqlens_m: Tensor, total_M: int) -> int:
@@ -53,6 +54,28 @@ def validate_varlen(cu_seqlens_m: Tensor, total_M: int) -> int:
     first = cu_seqlens_m[0].item()
     assert first == 0, f"cu_seqlens_m[0]={first} must be 0"
     return B
+
+
+def validate_varlen_k(cu_seqlens_k: Tensor, total_K: int) -> int:
+    """Assert cu_seqlens_k is a well-formed cumulative-length tensor for a
+    varlen-K grouped GEMM over a shared ``(M, total_K) @ (total_K, N)``.
+
+    Same shape contract as :func:`validate_varlen` but checked against the
+    contraction axis (``A``'s last dim / ``B``'s first dim) instead of rows.
+    Returns the group count ``L``.
+    """
+    assert cu_seqlens_k.is_cuda
+    assert cu_seqlens_k.dtype in (torch.int32, torch.int64)
+    assert cu_seqlens_k.dim() == 1
+    assert cu_seqlens_k.size(0) >= 2
+    L = cu_seqlens_k.size(0) - 1
+    last = cu_seqlens_k[-1].item()
+    assert last == total_K, (
+        f"cu_seqlens_k[-1]={last} doesn't match total contraction {total_K}"
+    )
+    first = cu_seqlens_k[0].item()
+    assert first == 0, f"cu_seqlens_k[0]={first} must be 0"
+    return L
 
 
 def seqlens_from_cu(cu_seqlens_m: Tensor) -> Tensor:
@@ -80,5 +103,6 @@ def row_to_sample_idx(cu_seqlens_m: Tensor) -> Tensor:
 
 
 __all__ = [
-    "VarlenArgs", "validate_varlen", "seqlens_from_cu", "row_to_sample_idx",
+    "VarlenArgs", "validate_varlen", "validate_varlen_k",
+    "seqlens_from_cu", "row_to_sample_idx",
 ]

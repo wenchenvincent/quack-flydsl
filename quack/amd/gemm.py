@@ -148,6 +148,60 @@ def _mfma_eligible(A, B, bias, activation, alpha, beta, C, out_dtype):
     return True
 
 
+def _gemm_varlen_k(
+    A: Tensor,
+    B: Tensor,
+    cu_seqlens_k: Tensor,
+    A_idx: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    """Grouped GEMM over a ragged contraction axis (varlen-K).
+
+    ``A`` is ``(M, total_K)``, ``B`` is ``(total_K, N)``. For each group ``i``,
+    ``out[i] = alpha * A[:, s_i:e_i] @ B[s_i:e_i, :] (+ beta * C[i])`` where
+    ``[s_i, e_i)`` are consecutive ``cu_seqlens_k`` offsets. Output ``(L, M, N)``.
+
+    Host-side chunked MVP: each group dispatches through :func:`gemm`, so aligned
+    ``K_i`` take the FlyDSL fast path and ragged ``K_i`` take the torch fallback.
+    ``A_idx`` (when present) gathers ``A``'s **columns** (K axis). Costs ``O(L)``
+    boundary ``.item()`` syncs — a known scaling limit for very large ``L`` that
+    an in-kernel grouped-K reduction would remove.
+    """
+    from quack.amd.varlen_utils import validate_varlen_k
+
+    assert A.dim() == 2 and B.dim() == 2, "varlen-K expects 2-D A, B"
+    M, total_K = A.shape
+    total_K_b, N = B.shape
+    assert total_K == total_K_b, (
+        f"A K-dim {total_K} != B K-dim {total_K_b}"
+    )
+    validate_varlen_k(cu_seqlens_k, total_K)
+    L = cu_seqlens_k.numel() - 1
+    odtype = out_dtype or A.dtype
+    out = torch.empty(L, M, N, device=A.device, dtype=odtype)
+    cu = cu_seqlens_k.tolist()  # single host sync for all boundaries
+    for i in range(L):
+        s, e = cu[i], cu[i + 1]
+        k_i = e - s
+        c_i = C[i] if C is not None else None
+        if k_i == 0:
+            # Empty contraction: A@B is a (M,N) zero; add the beta*C residual.
+            out[i] = (beta * c_i).to(odtype) if c_i is not None else 0
+            continue
+        if A_idx is not None:
+            A_i = A[:, A_idx[s:e].long()].contiguous()
+        else:
+            A_i = A[:, s:e].contiguous()
+        B_i = B[s:e, :]
+        out[i] = gemm(
+            A_i, B_i, alpha=alpha, beta=beta, C=c_i, out_dtype=odtype,
+        )
+    return out
+
+
 def gemm(
     A: Tensor,
     B: Tensor,
@@ -158,6 +212,7 @@ def gemm(
     C: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
 ) -> Tensor:
     """GEMM: ``D = alpha * A @ B + beta * C + bias`` then optional activation.
@@ -181,10 +236,31 @@ def gemm(
     regular ``(total_M, K) @ (K, N)`` matmul — the dispatcher just
     routes through the standard path.
 
-    ``A_idx``: optional gather-A row index; when present ``A`` is
-    gathered via ``A[A_idx]`` before the matmul (host-side for the MVP).
+    ``A_idx``: optional gather-A row index. Its axis depends on the varlen
+    mode: for plain / ``cu_seqlens_m`` it gathers **rows** of ``A`` (``A[A_idx]``,
+    M axis); for ``cu_seqlens_k`` it gathers **columns** of ``A`` (``A[:, A_idx]``,
+    the K/contraction axis) — a real semantic split, same as NVIDIA's API.
+
+    Varlen-K (``cu_seqlens_k``): a **grouped GEMM over the contraction axis**,
+    NOT a packed reduction. ``A`` is ``(M, total_K)``, ``B`` is ``(total_K, N)``,
+    and for each group ``i`` the slice ``A[:, s_i:e_i] @ B[s_i:e_i, :]`` produces
+    its **own** output. Output shape is therefore ``(L, M, N)`` (stacked
+    per-group), unlike ``cu_seqlens_m``'s concatenated ``(total_M, N)``. ``M``
+    and ``N`` are shared across groups; each group's ``K_i`` may differ, and
+    ``K_i == 0`` yields a zero (or ``beta*C[i]``) output for that group. Mutually
+    exclusive with ``cu_seqlens_m``. Host-side chunked MVP: each group dispatches
+    through this same ``gemm()`` — 16-aligned ``K_i`` hit the FlyDSL fast path,
+    ragged ``K_i`` (the common data-dependent case) fall back to torch/hipBLASLt.
     """
     assert A.is_cuda and B.is_cuda
+    assert cu_seqlens_m is None or cu_seqlens_k is None, (
+        "cu_seqlens_m and cu_seqlens_k are mutually exclusive"
+    )
+    if cu_seqlens_k is not None:
+        return _gemm_varlen_k(
+            A, B, cu_seqlens_k, A_idx=A_idx,
+            alpha=alpha, beta=beta, C=C, out_dtype=out_dtype,
+        )
     if cu_seqlens_m is not None:
         from quack.amd.varlen_utils import validate_varlen
         validate_varlen(cu_seqlens_m, A.size(0))
