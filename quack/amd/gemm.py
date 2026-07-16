@@ -181,6 +181,17 @@ def _gemm_varlen_k(
     validate_varlen_k(cu_seqlens_k, total_K)
     L = cu_seqlens_k.numel() - 1
     odtype = out_dtype or A.dtype
+    # Fast path: plain grouped matmul (no epilogue / gather) with aligned M/N
+    # and f16/bf16 → one in-kernel launch (runtime K-loop), no O(L) host syncs.
+    if (
+        A_idx is None and C is None and alpha == 1.0 and beta == 0.0
+        and A.dtype == B.dtype and A.dtype in (torch.float16, torch.bfloat16)
+        and A.stride(-1) == 1 and B.stride(-1) == 1
+        and M % 16 == 0 and N % 16 == 0
+    ):
+        from quack.amd.gemm_gfx950_varlen_k import gemm_varlen_k_inkernel
+        out = gemm_varlen_k_inkernel(A, B, cu_seqlens_k)
+        return out if odtype == torch.float32 else out.to(odtype)
     out = torch.empty(L, M, N, device=A.device, dtype=odtype)
     cu = cu_seqlens_k.tolist()  # single host sync for all boundaries
     for i in range(L):
