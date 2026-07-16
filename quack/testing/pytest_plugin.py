@@ -281,7 +281,16 @@ def _defer_if_compile_pending(item, outcome, force_pass: bool) -> bool:
     """
     if outcome.excinfo is None:
         return False
-    from quack.cache.async_compile import CompilePending
+    try:
+        from quack.cache.async_compile import CompilePending
+    except ImportError:
+        # Async-compile deferral is a CuTe-DSL-only feature. When CuTe-DSL
+        # (cutlass) is not installed — e.g. AMD-only installs running the
+        # FlyDSL `tests/amd/` suite — there is nothing to defer, so let the
+        # original outcome stand. Without this guard the import failure would
+        # convert every `pytest.skip()` (which also sets ``excinfo``) into a
+        # spurious failure.
+        return False
 
     if not issubclass(outcome.excinfo[0], CompilePending):
         return False
