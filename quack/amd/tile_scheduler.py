@@ -7,11 +7,13 @@ supports ``PersistenceMode.{NONE, STATIC, DYNAMIC, CLC}`` with raster order
 and swizzle; this module provides the AMD equivalent, minus ``CLC`` (NVIDIA
 cluster launch control — no analogue pre-gfx1250).
 
-**Current state:** Python-side helpers (CU count query, raster-order
-classification, grid sizing) — these are production-ready and tested
-(``tests/amd/test_tile_scheduler.py``). The in-kernel atomic work-counter
-loop is documented below but not yet emitted; wire it into a client kernel
-when the perf gain vs. one-wg-per-tile is motivated by profiling.
+**Current state:** both halves are live. Python-side helpers (CU count query,
+raster-order classification, grid sizing) are production-ready and tested
+(``tests/amd/test_tile_scheduler.py``). The in-kernel scheduling helpers —
+:class:`DynamicTileScheduler` (atomic work-counter tile pickup) and
+:func:`tile_idx_to_mn` (raster decode) — are emitted into real kernels:
+``gemm_streamk.py`` uses both, ``gemm_persistent.py`` uses the decode
+(``tests/amd/test_tile_scheduler_inkernel.py``).
 
 Usage sketch for STATIC persistent (no atomics, even work split)::
 
@@ -62,6 +64,21 @@ reduction is associative-but-not-deterministic across workgroup order.
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
+
+import flydsl.expr as fx
+from flydsl.expr import arith, gpu as _gpu
+from flydsl.expr.arith import ArithValue
+from flydsl.expr.typing import T
+from flydsl.utils.smem_allocator import SmemPtr
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm_d, fly as _fly_d
+from flydsl.compiler.protocol import extract_to_ir_values
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+
+# Emit an ``scf.if`` from a closure for a dynamic condition, so LDS/pointer
+# state isn't threaded through as scf.if loop-carried state (the upstream AST
+# rewriter rejects non-MLIR-value state like SmemPtr).
+_scf_if = ReplaceIfWithDispatch.scf_if_dispatch
 
 
 class PersistenceMode(IntEnum):
@@ -171,6 +188,98 @@ def tile_to_mn(
     return (tile_idx // tiles_n, tile_idx % tiles_n)
 
 
+# ---------------------------------------------------------------------------
+# In-kernel scheduling helpers (emit FlyDSL IR — call from a @flyc.kernel body)
+# ---------------------------------------------------------------------------
+
+
+def tile_idx_to_mn(tile_idx, tiles_m: int, tiles_n: int,
+                   raster_order: RasterOrder = RasterOrder.AlongN):
+    """In-kernel counterpart of :func:`tile_to_mn`: decode a flat tile-index
+    ``ArithValue`` into ``(bid_m, bid_n)`` ``ArithValue``\\ s.
+
+    ``raster_order`` is a compile-time (Python) value, so the branch folds to
+    the same two ``//``/``%`` ops the persistent/stream-K kernels emit inline —
+    just parameterized instead of hardcoded. Default ``AlongN`` matches the
+    current hardcoded ``tile_idx // tiles_n, tile_idx % tiles_n`` decode.
+    """
+    if raster_order is RasterOrder.AlongM:
+        return (tile_idx % fx.Int32(tiles_m), tile_idx // fx.Int32(tiles_m))
+    return (tile_idx // fx.Int32(tiles_n), tile_idx % fx.Int32(tiles_n))
+
+
+class DynamicTileScheduler:
+    """Reusable in-kernel atomic work-counter tile scheduler for persistent
+    stream-K kernels.
+
+    Encapsulates the mechanics ``gemm_streamk.py`` hand-rolled: an f32 GMEM
+    counter atomically fadded (+1) by lane 0 to claim the next tile, broadcast
+    to the whole workgroup through one LDS f32 slot. The counter is f32 because
+    ``AtomicRMWOp(fadd).result`` returns the pre-add value in one op and tile
+    counts < 2^23 are exact in f32. (This is distinct from the *output*
+    atomic-fadd used by partial-tile K-split stream-K, whose bf16 reliability
+    caveat does not apply here — the counter is always f32.)
+
+    ``CLC`` mode has no AMD analogue and degrades to this DYNAMIC path; there is
+    no separate CLC code branch to look for.
+
+    Build-time (host, in the kernel builder before ``@flyc.kernel``)::
+
+        smem_off = DynamicTileScheduler.reserve_smem(allocator)
+
+    In-kernel (inside the ``@flyc.kernel`` body)::
+
+        sched = DynamicTileScheduler(allocator, Counter, smem_off)
+        tile_idx = wg_id
+        for step in range_constexpr(steps_per_wg):
+            if arith.cmpi(ult, tile_idx, total_tiles):
+                bid_m, bid_n = tile_idx_to_mn(tile_idx, tiles_m, tiles_n)
+                ...  # MFMA body + writeback
+            tile_idx = sched.next_tile(tid)
+
+    Every lane must call :meth:`next_tile` each iteration (it barriers).
+    Host-initialize the counter to ``num_cus`` so the first claim returns the
+    first tile beyond the initial bid-indexed batch.
+    """
+
+    @staticmethod
+    def reserve_smem(allocator) -> int:
+        """Reserve one f32 LDS slot for the tile-index broadcast; returns its
+        byte offset. Call at kernel-build time."""
+        off = allocator._align(allocator.ptr, 4)
+        allocator.ptr = off + 4
+        return off
+
+    def __init__(self, allocator, counter_tensor, smem_offset: int):
+        # llvm.ptr<1> to the GMEM counter — feeds llvm.atomicrmw, whose
+        # .result gives the old value (rocdl.raw.ptr.buffer.atomic.fadd
+        # discards it in the current MLIR bindings).
+        ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+        raw = extract_to_ir_values(counter_tensor)[0]
+        self._counter_ptr = _fly_d.extract_aligned_pointer_as_index(ptr_ty, raw)
+        self._s_tile = SmemPtr(allocator.get_base(), smem_offset, T.f32, shape=(1,))
+        self._s_tile.get()
+        self._one_f32 = arith.constant(1.0, type=T.f32)
+
+    def next_tile(self, tid):
+        """Atomically claim the next tile index and return it as an i32
+        ``ArithValue``. Lane 0 does the atomic fadd + LDS store; all lanes read
+        the broadcast back after a barrier. Must be called by every lane."""
+        def _claim():
+            rmw = _llvm_d.AtomicRMWOp(
+                _llvm_d.AtomicBinOp.fadd,
+                self._counter_ptr, self._one_f32,
+                _llvm_d.AtomicOrdering.monotonic,
+            )
+            self._s_tile.store(rmw.result, [fx.Index(0)])
+
+        _scf_if(tid == fx.Int32(0), _claim)
+        _gpu.barrier()
+        nxt = self._s_tile.load([fx.Index(0)])
+        nxt_iv = nxt.ir_value() if hasattr(nxt, "ir_value") else nxt
+        return ArithValue(arith.fptosi(T.i32, nxt_iv))
+
+
 __all__ = [
     "PersistenceMode",
     "RasterOrder",
@@ -179,4 +288,6 @@ __all__ = [
     "resolve_raster_order",
     "grid_for_persistent",
     "tile_to_mn",
+    "tile_idx_to_mn",
+    "DynamicTileScheduler",
 ]

@@ -32,7 +32,7 @@ from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir
 
 from quack.amd.flydsl_utils import get_rocm_arch
-from quack.amd.tile_scheduler import get_num_cus
+from quack.amd.tile_scheduler import get_num_cus, tile_idx_to_mn
 
 
 _MFMA_M = 16
@@ -93,8 +93,7 @@ def _build_gemm_persistent_f16(*, M, N, K, num_cus, arch):
 
             # Guard: skip if beyond total tiles.
             if arith.cmpi(arith.CmpIPredicate.ult, tile_idx, fx.Int32(total_tiles)):
-                bid_m = tile_idx // fx.Int32(tiles_n)
-                bid_n = tile_idx % fx.Int32(tiles_n)
+                bid_m, bid_n = tile_idx_to_mn(tile_idx, tiles_m, tiles_n)
 
                 m_base = bid_m * fx.Int32(_MFMA_M)
                 n_base = bid_n * fx.Int32(_MFMA_N)

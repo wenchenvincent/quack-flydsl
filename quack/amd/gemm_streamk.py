@@ -28,37 +28,22 @@ from torch import Tensor
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, gpu as _gpu, range_constexpr, vector
-from flydsl.expr.arith import ArithValue
+from flydsl.expr import arith, range_constexpr, vector
 from flydsl.expr.numeric import Float32
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm_d, fly as _fly_d
-from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 
 from quack.amd.flydsl_utils import get_rocm_arch
-from quack.amd.tile_scheduler import get_num_cus
-
-# Emit an ``scf.if`` from a closure for a dynamic condition, so the SmemPtr
-# broadcast slab is not threaded through as scf.if state (SmemPtr is not an
-# MLIR value, which the upstream AST rewriter now rejects).
-_scf_if = ReplaceIfWithDispatch.scf_if_dispatch
+from quack.amd.tile_scheduler import (
+    get_num_cus, DynamicTileScheduler, tile_idx_to_mn,
+)
 
 
 _MFMA_M = 16
 _MFMA_N = 16
 _MFMA_K = 16
 _FRAG_C = 4
-
-
-def _align_smem(allocator, align):
-    return allocator._align(allocator.ptr, align)
-
-
-def _bump_smem(allocator, nbytes):
-    allocator.ptr = _align_smem(allocator, 4) + nbytes
 
 
 def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
@@ -73,10 +58,9 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
         None, arch=arch,
         global_sym_name=f"quack_amd_gemm_streamk_f16_{M}_{N}_{K}_{num_cus}_smem",
     )
-    # One f32 slot for broadcasting the atomic-fetched tile index to the
-    # whole workgroup.
-    tile_idx_offset = _align_smem(allocator, 4)
-    _bump_smem(allocator, 4)
+    # One f32 LDS slot for broadcasting the atomically-claimed tile index to
+    # the whole workgroup (reserved via the shared scheduler helper).
+    tile_idx_offset = DynamicTileScheduler.reserve_smem(allocator)
 
     @flyc.kernel
     def kernel(A: fx.Tensor, B: fx.Tensor, Counter: fx.Tensor, C: fx.Tensor):
@@ -90,16 +74,8 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
         B_buf = fx.rocdl.make_buffer_tensor(B)
         C_buf = fx.rocdl.make_buffer_tensor(C)
 
-        # llvm.ptr<1> to the counter — feeds llvm.atomicrmw whose .result
-        # gives us the old value (AMD's rocdl.raw.ptr.buffer.atomic.fadd
-        # discards it in the current MLIR bindings).
-        counter_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-        counter_raw = extract_to_ir_values(Counter)[0]
-        counter_ptr = _fly_d.extract_aligned_pointer_as_index(counter_ptr_ty, counter_raw)
-
-        smem_base = allocator.get_base()
-        s_tile = SmemPtr(smem_base, tile_idx_offset, T.f32, shape=(1,))
-        s_tile.get()
+        # Reusable in-kernel atomic work-counter scheduler (shared helper).
+        sched = DynamicTileScheduler(allocator, Counter, tile_idx_offset)
 
         ca_h = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), T.f16)
         ca_f = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), T.f32)
@@ -121,9 +97,6 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
 
         acc_ty = T.vec(_FRAG_C, T.f32)
         c_total_tiles = fx.Int32(total_tiles)
-        c_num_cus = fx.Int32(num_cus)
-        zero_i32 = arith.constant(0, type=T.i32)
-        one_f32 = arith.constant(1.0, type=T.f32)
 
         # tile_idx carries across iterations. Start with wg_id. The
         # AST rewriter treats each iteration's `if` body as a closure,
@@ -135,8 +108,7 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
             current_tile = tile_idx  # capture in an outer-scope name
             # Only process the tile if it's in range.
             if arith.cmpi(arith.CmpIPredicate.ult, current_tile, c_total_tiles):
-                bid_m = current_tile // fx.Int32(tiles_n)
-                bid_n = current_tile % fx.Int32(tiles_n)
+                bid_m, bid_n = tile_idx_to_mn(current_tile, tiles_m, tiles_n)
 
                 m_base = bid_m * fx.Int32(_MFMA_M)
                 n_base = bid_n * fx.Int32(_MFMA_N)
@@ -179,26 +151,11 @@ def _build_gemm_streamk_f16(*, M, N, K, num_cus, arch):
                     val_i = vector.extract(acc, static_position=[i], dynamic_position=[])
                     _store_f(c_div, out_col, val_i)
 
-            # DYNAMIC stream-K: lane 0 of the workgroup races with other
-            # workgroups for the next tile via an f32 atomic-fadd on the
-            # shared counter. Counter is host-initialised to ``num_cus``
-            # (accounting for the initial bid-indexed tiles), so the first
-            # atomic returns ``num_cus`` — the (num_cus)-th tile index.
-            # Other lanes in the wg read the broadcast via LDS.
-            def _claim_next_tile():
-                rmw_op = _llvm_d.AtomicRMWOp(
-                    _llvm_d.AtomicBinOp.fadd,
-                    counter_ptr, one_f32,
-                    _llvm_d.AtomicOrdering.monotonic,
-                )
-                old_f = rmw_op.result
-                s_tile.store(old_f, [fx.Index(0)])
-
-            _scf_if(tid == fx.Int32(0), _claim_next_tile)
-            _gpu.barrier()
-            next_f = s_tile.load([fx.Index(0)])
-            next_iv = next_f.ir_value() if hasattr(next_f, "ir_value") else next_f
-            tile_idx = ArithValue(arith.fptosi(T.i32, next_iv))
+            # DYNAMIC stream-K: claim the next tile via the shared scheduler
+            # (lane 0 atomic-fadds the counter, broadcasts through LDS, all
+            # lanes read it back after a barrier). Counter is host-initialised
+            # to ``num_cus`` so the first claim returns the (num_cus)-th tile.
+            tile_idx = sched.next_tile(tid)
 
     @flyc.jit
     def launch(A: fx.Tensor, B: fx.Tensor, Counter: fx.Tensor, C: fx.Tensor,
