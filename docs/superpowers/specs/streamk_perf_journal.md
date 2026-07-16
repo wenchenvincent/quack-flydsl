@@ -199,24 +199,44 @@ leading-dim abstraction + trans flags); no preprocessing needed.
 Our kernel hardcodes `B as row-major (N, K)` — the transpose is
 a real required cost for the torch.matmul input pattern.
 
-Fair apples-to-apples bench (both kernels receive `B as (N, K)`,
-both compute `C = A @ B.T`, bf16 input):
+Fair apples-to-apples bench with the user's preferred pairing:
 
-| shape            | hipBLASLt ms | splitk (in-launcher shuffle) | splitk (pre-shuffled) |
-|------------------|-------------:|-----------------------------:|----------------------:|
-| 1024² K=512      | 0.016        | 0.082 (5.1×)                 | 0.072 (4.5×)          |
-| 4096³ K=1024     | 0.032        | 0.084 (2.6×)                 | 0.075 (2.3×)          |
-| 8192² K=1024     | 0.115        | 0.123 (1.07×)                | 0.116 (1.01×)         |
-| **8192³**        | 0.655        | 0.855 (1.31×)                | **0.770 (1.18×)**     |
+**Pair 1** — both sides pay a one-time layout transform (amortised):
+- hipBLASLt: `torch.matmul(A, B_kn)` with fresh `B_kn = B_nk.t().contiguous()`
+- FlyDSL: `gemm_splitk(A, B_shuf, shuffled=True)` with `B_shuf = shuffle_b(B_nk)`
 
-At 8192³ we're actually **1.18× slower** than hipBLASLt when
-pre-shuffle is amortized (e.g., persistent weights in training),
-and **1.31× slower** if the shuffle runs on every call.
+**Pair 2** — neither side pays any preprocessing:
+- hipBLASLt: `torch.matmul(A, B_nk.t())` (zero-copy view)
+- FlyDSL: `gemm_splitk(A, B_nk)` with `B_PRE_SHUFFLE=False` compiled in
+  (kernel reads native `(N, K)` layout directly, no in-launcher shuffle)
 
-The earlier "1.00× tied" claim was wrong — it came from a
-measurement where hipBLASLt carried the full transpose + load
-cost in the test's timed region but splitk didn't.  Apologies for
-the misleading previous journal entry.
+| shape            | Pair 1 ratio | Pair 2 ratio |
+|------------------|-------------:|-------------:|
+| 1024² K=512      | 7.28×        | 5.30×        |
+| 4096³ K=1024     | 2.34×        | 2.39×        |
+| **8192² K=1024** | **0.98×** ✓  | 1.42×        |
+| 8192³            | 1.17×        | 1.73×        |
+
+**Key takeaways from the honest bench:**
+
+1. **Production-training scenario (Pair 1, persistent weights
+   amortise preshuffle)**: we are **0.98-1.17× hipBLASLt at 8192²+
+   shapes** — genuinely competitive, match/slightly-beat at
+   8192² K=1024.
+
+2. **One-shot matmul scenario (Pair 2, no preprocessing)**: we are
+   **1.42-1.73× slower** at 8192²+.  The preshuffle was doing a
+   LOT of the work — without it, our `B_PRE_SHUFFLE=False` kernel
+   body pays cross-lane overhead we haven't optimised.
+
+3. **hipBLASLt is layout-agnostic**: its Pair 1 and Pair 2 results
+   are essentially identical (0.665 vs 0.652 ms at 8192³) — its
+   kernel set handles both stride patterns at native speed.  Ours
+   doesn't.
+
+The earlier journal's "1.00× tied at 8192³" was measurement
+artifact from charging transpose cost to hipBLASLt's side but
+not splitk's.  Corrected numbers above.
 
 ### Workstream summary
 

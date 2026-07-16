@@ -1,6 +1,6 @@
 # Copyright (c) 2026, AMD.
 
-"""Bench FlyDSL gemm_nn / gemm_tn vs TWO Triton references + torch (hipBLASLt).
+"""Bench FlyDSL gemm_nn / gemm_tn vs THREE Triton references + torch (hipBLASLt).
 
 Triton baselines:
   1. **Primus-Turbo GEMM** — production Triton kernel from
@@ -9,9 +9,16 @@ Triton baselines:
   2. **Triton tutorial matmul** — faithful reproduction of
      ``triton-lang/triton/python/tutorials/03-matrix-multiplication.py``
      (with GROUP_SIZE_M L2 swizzle, standard across nv/amd).
+  3. **Upstream triton_kernels matmul_ogs** — the dense 2D path of
+     ``python/triton_kernels/triton_kernels/matmul_ogs.py`` at the
+     ``v3.4.0`` tag (compatible with the installed Triton 3.4.0;
+     HEAD of main pins constexpr_function / TMA APIs we don't have).
+     Vendored read-only into ``/tmp/tk_v34`` — call with no
+     routing/gather/scatter/epilogue for a plain dense bf16 matmul.
 
-Both Triton kernels have their own autotune sweep, so the comparison
-is "best Triton config vs best FlyDSL config" — apples-to-apples.
+All Triton kernels have their own autotune / opt-flag sweep, so the
+comparison is "best Triton config vs best FlyDSL config" —
+apples-to-apples.
 
 Usage:
     PYTHONPATH=/workspace/quack python -m tests.amd.bench_vs_triton
@@ -150,6 +157,37 @@ def tutorial_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# (3) Upstream triton_kernels matmul_ogs (v3.4.0 tag) — dense 2D path.
+# ---------------------------------------------------------------------------
+#
+# Main-branch matmul.py pins constexpr_function / TMA APIs that don't exist
+# in triton 3.4.0 (the version installed on this ROCm box). The v3.4.0 tag
+# of the triton-lang/triton monorepo includes a ``triton_kernels/matmul_ogs``
+# module that was shipped together with triton 3.4.0 — the ABI matches.
+# We extract it to /tmp/tk_v34 and import from there.
+
+_TK_V34_PATH = "/tmp/tk_v34/python/triton_kernels"
+if _TK_V34_PATH not in sys.path:
+    sys.path.insert(0, _TK_V34_PATH)
+
+try:
+    from triton_kernels.matmul_ogs import matmul_ogs as _matmul_ogs  # noqa: E402
+    _HAVE_OGS = True
+except ImportError:
+    _HAVE_OGS = False
+
+
+def ogs_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Dense 2D path of upstream triton_kernels.matmul_ogs.
+
+    No routing_data / gather_indx / scatter_indx / bias / activation /
+    epilogue — just a plain ``a @ b``. ``matmul_ogs`` views ``w`` as
+    ``(1, K, N)`` internally and runs the single-expert grid.
+    """
+    return _matmul_ogs(a, b, None)
+
+
+# ---------------------------------------------------------------------------
 # Bench harness
 # ---------------------------------------------------------------------------
 
@@ -173,12 +211,18 @@ def _bench(fn, warmup: int = 15, iters: int = 50) -> float:
 
 def main():
     print(f"Primus-Turbo available: {_HAVE_PRIMUS}")
+    print(f"triton_kernels.matmul_ogs (v3.4.0) available: {_HAVE_OGS}")
     header_cells = ["kernel", "shape", "dtype", "flydsl TF/s"]
     if _HAVE_PRIMUS:
         header_cells.append("primus TF/s")
-    header_cells += ["tutorial TF/s", "torch TF/s",
+    header_cells.append("tutorial TF/s")
+    if _HAVE_OGS:
+        header_cells.append("ogs TF/s")
+    header_cells += ["torch TF/s",
                      "fly/primus" if _HAVE_PRIMUS else "",
-                     "fly/tutorial", "fly/torch"]
+                     "fly/tutorial",
+                     "fly/ogs" if _HAVE_OGS else "",
+                     "fly/torch"]
     print("  ".join(c.rjust(13) for c in header_cells))
 
     for dtype, dt_str in [(torch.bfloat16, "bf16"), (torch.float16, "f16")]:
@@ -194,22 +238,30 @@ def main():
             if _HAVE_PRIMUS:
                 primus_gemm(a, b); torch.cuda.synchronize()
             tutorial_gemm(a, b); torch.cuda.synchronize()
+            if _HAVE_OGS:
+                ogs_gemm(a, b); torch.cuda.synchronize()
 
             t_fly = _bench(lambda: gemm_nn(a, b, out))
             t_prm = _bench(lambda: primus_gemm(a, b)) if _HAVE_PRIMUS else None
             t_tut = _bench(lambda: tutorial_gemm(a, b))
+            t_ogs = _bench(lambda: ogs_gemm(a, b)) if _HAVE_OGS else None
             t_trc = _bench(lambda: torch.matmul(a, b, out=out))
 
             row = [
-                f"NN", f"{M}×{N}×{K}", dt_str,
+                "NN", f"{M}×{N}×{K}", dt_str,
                 f"{flops/t_fly:.1f}",
             ]
             if _HAVE_PRIMUS:
                 row.append(f"{flops/t_prm:.1f}")
+            row.append(f"{flops/t_tut:.1f}")
+            if _HAVE_OGS:
+                row.append(f"{flops/t_ogs:.1f}")
             row += [
-                f"{flops/t_tut:.1f}", f"{flops/t_trc:.1f}",
+                f"{flops/t_trc:.1f}",
                 f"{t_prm/t_fly:.2f}x" if _HAVE_PRIMUS else "",
-                f"{t_tut/t_fly:.2f}x", f"{t_trc/t_fly:.2f}x",
+                f"{t_tut/t_fly:.2f}x",
+                f"{t_ogs/t_fly:.2f}x" if _HAVE_OGS else "",
+                f"{t_trc/t_fly:.2f}x",
             ]
             print("  ".join(c.rjust(13) for c in row))
 
