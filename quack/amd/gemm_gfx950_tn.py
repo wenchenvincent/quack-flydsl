@@ -64,7 +64,6 @@ from quack.amd.gemm_gfx950_mfma_core import (
     _OnlineScheduler,
     _WmmaHalfK16,
     _WmmaHalfK32,
-    swizzle_xor16,
 )
 from quack.amd import _gemm_tune
 
@@ -88,6 +87,7 @@ def _compile_tn_kernel(
     # are constexpr and swizzle2d / xcd_swizzle can fold to near-static.
     XCD_SWIZZLE: int = 8,
     GROUP_M: int = 4,
+    accumulate: bool = False,
 ):
     BLOCK_K = TILE_K
     assert BLOCK_K >= 32
@@ -171,7 +171,7 @@ def _compile_tn_kernel(
 
     allocator = SmemAllocator(
         None, arch=GPU_ARCH,
-        global_sym_name=f"tn_smem_{dtype}_{k}_{m}_{n}",
+        global_sym_name=f"tn_smem_{dtype}_{k}_{m}_{n}{'_acc' if accumulate else ''}",
     )
     smem_a_offset = allocator._align(allocator.ptr, 16)
     AS_BYTES = STAGES * BLOCK_K * BLOCK_M * DTYPE_BYTES
@@ -545,6 +545,12 @@ def _compile_tn_kernel(
             n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
             m_global_idx = m_offset + m_local_idx
             vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+            if fx.const_expr(accumulate):
+                # Read-add-store: accumulate the freshly computed tile into the
+                # existing out[] contents (e.g. weight.grad). Same dtype as the
+                # store, so no extra cast beyond what the non-accumulate path does.
+                prev = C_.vec_load((m_global_idx, n_offset + n_local_idx), LDG_VEC_SIZE)
+                vec = arith.addf(vec, prev)
             C_.vec_store(
                 (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE,
             )
@@ -666,9 +672,9 @@ def autotune_tn(
 @torch.library.custom_op(
     "quack_amd::_gemm_tn_out",
     mutates_args=("out",),
-    schema="(Tensor a, Tensor b, Tensor(a0!) out) -> ()",
+    schema="(Tensor a, Tensor b, Tensor(a0!) out, bool accumulate) -> ()",
 )
-def _gemm_tn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
+def _gemm_tn_out(a: Tensor, b: Tensor, out: Tensor, accumulate: bool) -> None:
     assert a.is_cuda and b.is_cuda and out.is_cuda
     assert a.dim() == 2 and b.dim() == 2 and out.dim() == 2
     K, M = a.shape
@@ -682,16 +688,18 @@ def _gemm_tn_out(a: Tensor, b: Tensor, out: Tensor) -> None:
     tm, tn, tk, bmw, bnw = config
     _compile_tn_kernel(
         dtype_str, K, M, N, TILE_M=tm, TILE_N=tn, TILE_K=tk,
-        BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw,
+        BLOCK_M_WARPS=bmw, BLOCK_N_WARPS=bnw, accumulate=accumulate,
     )(out, a, b)
 
 
 @_gemm_tn_out.register_fake
-def _gemm_tn_out_fake(a, b, out):
+def _gemm_tn_out_fake(a, b, out, accumulate):
     return None
 
 
-def gemm_tn(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
+def gemm_tn(
+    a: Tensor, b: Tensor, out: Optional[Tensor] = None, accumulate: bool = False,
+) -> Tensor:
     """Compute ``C[M, N] = A.T @ B`` where A shape is (K, M), B shape is (K, N).
 
     In training:
@@ -701,6 +709,11 @@ def gemm_tn(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
 
     The contraction axis is axis 0 of both operands (the batch dim).
 
+    ``accumulate=True`` requires ``out`` and adds ``A.T @ B`` into its existing
+    contents in-place (``out += A.T @ B``, accumulating in ``out``'s dtype)
+    instead of overwriting — used by ``fuse_grad_accum`` to write ``dW`` straight
+    into ``weight.grad``.
+
     Constraints (MVP):
       - K (= batch) multiple of 64; M (= out) multiple of 128; N (= in) multiple of 256.
       - dtype ∈ {f16, bf16}; output dtype matches input.
@@ -708,8 +721,9 @@ def gemm_tn(a: Tensor, b: Tensor, out: Optional[Tensor] = None) -> Tensor:
     K, M = a.shape
     _, N = b.shape
     if out is None:
+        assert not accumulate, "accumulate=True requires an existing out tensor"
         out = torch.empty(M, N, device=a.device, dtype=a.dtype)
-    _gemm_tn_out(a, b, out)
+    _gemm_tn_out(a, b, out, accumulate)
     return out
 
 

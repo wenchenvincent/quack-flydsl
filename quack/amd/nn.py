@@ -216,9 +216,11 @@ class Linear(torch.nn.Module):
 
     def __init__(
         self, in_features, out_features, bias=True, activation=None, device=None, dtype=None,
+        fuse_grad_accum=False,
     ):
         super().__init__()
         self.activation = activation
+        self.fuse_grad_accum = fuse_grad_accum
         self.weight = torch.nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
         )
@@ -236,8 +238,11 @@ class Linear(torch.nn.Module):
 
     def forward(self, x):
         if self.activation is not None:
-            return linear_act_train(x, self.weight, self.activation, bias=self.bias)
-        y = linear_train(x, self.weight)
+            return linear_act_train(
+                x, self.weight, self.activation, bias=self.bias,
+                fuse_grad_accum=self.fuse_grad_accum,
+            )
+        y = linear_train(x, self.weight, fuse_grad_accum=self.fuse_grad_accum)
         return y if self.bias is None else y + self.bias
 
 

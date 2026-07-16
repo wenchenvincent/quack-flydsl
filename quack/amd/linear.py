@@ -263,6 +263,34 @@ __all__ = [
 # ``LinearFunc`` binds bwd to our NN/TN kernels directly.
 
 
+def _compute_dweight_maybe_fused(ctx, dout2: Tensor, x: Tensor) -> Tensor:
+    """Compute ``dW = dout2.T @ x`` (TN), fusing the grad-accumulation into
+    ``weight.grad`` in-place when ``ctx.fuse_grad_accum`` is set.
+
+    Mirrors NVIDIA ``quack/linear.py``: when fusing, accumulate straight into
+    the existing ``weight_og.grad`` buffer via ``gemm_tn(accumulate=True)``,
+    then return that buffer as ``dweight`` and null out ``weight_og.grad`` — so
+    PyTorch's autograd engine does not *also* add ``dweight`` on top (which
+    would double-count). Falls back to a fresh ``dW`` on the first backward
+    (``grad is None``) or under ``torch.compile`` (dynamo can't trace the
+    saved-tensor ``.grad`` mutation).
+    """
+    from quack.amd.gemm_gfx950_tn import gemm_tn
+
+    weight_og = getattr(ctx, "weight_og", None)
+    if (
+        getattr(ctx, "fuse_grad_accum", False)
+        and weight_og is not None
+        and weight_og.grad is not None
+        and not torch.compiler.is_compiling()
+    ):
+        gemm_tn(dout2, x, out=weight_og.grad, accumulate=True)
+        dweight = weight_og.grad
+        weight_og.grad = None
+        return dweight
+    return gemm_tn(dout2, x)
+
+
 class LinearFunc(torch.autograd.Function):
     """Autograd Function for plain linear (no bias, no activation).
 
@@ -275,7 +303,7 @@ class LinearFunc(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight):
+    def forward(ctx, x, weight, fuse_grad_accum=False):
         from quack.amd.gemm_gfx950_splitk import gemm_splitk
         batch_shape = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1]).contiguous()
@@ -283,12 +311,15 @@ class LinearFunc(torch.autograd.Function):
         out = gemm_splitk(x2, weight)
         ctx.save_for_backward(x2, weight)
         ctx.batch_shape = batch_shape
+        ctx.fuse_grad_accum = fuse_grad_accum
+        # Stash the original leaf weight (whose .grad the optimizer reads) so
+        # backward can accumulate dW straight into weight.grad.
+        ctx.weight_og = weight if fuse_grad_accum else None
         return out.reshape(*batch_shape, out.shape[-1])
 
     @staticmethod
     def backward(ctx, dout):
         from quack.amd.gemm_gfx950_nn import gemm_nn
-        from quack.amd.gemm_gfx950_tn import gemm_tn
 
         x, weight = ctx.saved_tensors
         dout2 = dout.reshape(-1, dout.shape[-1]).contiguous()
@@ -305,12 +336,12 @@ class LinearFunc(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             # TN: dW = dout.T @ x. gemm_tn treats axis 0 of both operands
             # as contraction (= batch dim here); output is (out, in).
-            dweight = gemm_tn(dout2, x)
+            dweight = _compute_dweight_maybe_fused(ctx, dout2, x)
 
-        return dx, dweight
+        return dx, dweight, None
 
 
-def linear_train(x: Tensor, weight: Tensor) -> Tensor:
+def linear_train(x: Tensor, weight: Tensor, fuse_grad_accum: bool = False) -> Tensor:
     """Autograd-aware plain linear (``y = x @ W.T``) for training.
 
     Routes forward through ``gemm_splitk`` (NT) and backward through
@@ -318,13 +349,19 @@ def linear_train(x: Tensor, weight: Tensor) -> Tensor:
     ``torch.is_grad_enabled()`` and no bias/activation; the simpler
     ``linear(...)`` entry above is forward-only and faster for inference.
 
+    ``fuse_grad_accum=True`` accumulates ``dW`` directly into ``weight.grad``
+    in-place (via ``gemm_tn(accumulate=True)``) instead of returning a fresh
+    tensor for autograd to add — saving a full ``(out, in)`` allocation +
+    separate add per micro-batch step. Only active from the *second* backward
+    onward (when ``weight.grad`` already exists) and outside ``torch.compile``.
+
     Constraints (MVP — matches the Phase 3/4 kernel constraints):
       - dtype ∈ {f16, bf16}
       - x last dim (in_features) % 64 == 0
       - weight.shape[0] (out_features) divisible by 256 (for DX's BLOCK_N=256)
       - batch dim (after flatten) % 128 == 0
     """
-    return LinearFunc.apply(x, weight)
+    return LinearFunc.apply(x, weight, fuse_grad_accum)
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +428,7 @@ class LinearActFunc(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, activation):
+    def forward(ctx, x, weight, bias, activation, fuse_grad_accum=False):
         from quack.amd.gemm_gfx950_splitk import gemm_splitk
         batch_shape = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1]).contiguous()
@@ -404,12 +441,13 @@ class LinearActFunc(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.batch_shape = batch_shape
+        ctx.fuse_grad_accum = fuse_grad_accum
+        ctx.weight_og = weight if fuse_grad_accum else None
         return postact.reshape(*batch_shape, postact.shape[-1])
 
     @staticmethod
     def backward(ctx, dout):
         from quack.amd.gemm_gfx950_nn import gemm_nn
-        from quack.amd.gemm_gfx950_tn import gemm_tn
 
         x, weight, preact = ctx.saved_tensors
         dout2 = dout.reshape(-1, dout.shape[-1]).contiguous()
@@ -422,7 +460,7 @@ class LinearActFunc(torch.autograd.Function):
 
         dweight = None
         if ctx.needs_input_grad[1]:
-            dweight = gemm_tn(dpreact, x)
+            dweight = _compute_dweight_maybe_fused(ctx, dpreact, x)
 
         dbias = None
         if ctx.has_bias and ctx.needs_input_grad[2]:
@@ -430,8 +468,8 @@ class LinearActFunc(torch.autograd.Function):
             # ~2.0 error over bs=256. Then cast to bias's saved dtype.
             dbias = dpreact.sum(0, dtype=torch.float32).to(ctx.bias_dtype)
 
-        # 4th arg (activation) has no grad
-        return dx, dweight, dbias, None
+        # activation (4th) and fuse_grad_accum (5th) args have no grad
+        return dx, dweight, dbias, None, None
 
 
 def linear_act_train(
@@ -439,10 +477,14 @@ def linear_act_train(
     weight: Tensor,
     activation: str,
     bias: Optional[Tensor] = None,
+    fuse_grad_accum: bool = False,
 ) -> Tensor:
     """Autograd-aware ``y = act(x @ W.T + b)``.
 
     Fwd uses gemm_splitk + torch activation (preact saved for bwd).
     Bwd: dpreact via torch elementwise, dx/dW via gemm_nn/gemm_tn.
+
+    ``fuse_grad_accum=True`` accumulates ``dW`` into ``weight.grad`` in-place
+    (second backward onward, outside ``torch.compile``); see ``linear_train``.
     """
-    return LinearActFunc.apply(x, weight, bias, activation)
+    return LinearActFunc.apply(x, weight, bias, activation, fuse_grad_accum)
