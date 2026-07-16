@@ -34,7 +34,7 @@ from torch import Tensor
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr, vector, math as _fm
+from flydsl.expr import arith, range_constexpr, vector
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.numeric import Float32, Numeric
 from flydsl.expr.typing import T
@@ -42,6 +42,9 @@ from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl._mlir import ir
 
 from quack.amd.flydsl_utils import get_rocm_arch
+from quack.amd.epi_ops import (
+    build_epilogue, epilogue_begin, epilogue_apply, EpiContext,
+)
 
 
 # For f16 MFMA: v_mfma_f32_16x16x16f16
@@ -228,15 +231,30 @@ def _build_gemm_16x16(
                     acc_ty, [a_frag, b_frag, acc, 0, 0, 0],
                 )
 
-        # Epilogue: optional alpha/beta*C + bias + activation.
-        # Bias is per-column (N-dim); each lane loads bias[out_col] once
-        # and adds it to all 4 of its accumulators (they share the same column).
-        if fx.const_expr(has_bias):
-            bias_val = ArithValue(_load_f_scalar(bias_div, n_base + lane_row))
-        if fx.const_expr(has_alpha):
-            alpha_av = ArithValue(alpha)
-        if fx.const_expr(has_c):
-            beta_av = ArithValue(beta)
+        # Epilogue: composed from EpiOp descriptors (quack.amd.epi_ops) —
+        # alpha scale → beta*C residual → per-column bias → activation. Order
+        # and numerics match the previous hand-rolled block exactly; all
+        # branching is compile-time (which flags/activation are set), so the
+        # hooks are plain calls (no scf.if / dispatch needed). Address math
+        # stays here, passed to the ops as loader closures on EpiContext.
+        epi_ops = build_epilogue(
+            has_alpha=has_alpha, has_c=has_c, has_bias=has_bias, activation=activation,
+        )
+
+        def _load_residual(row, col):
+            row_cin = fx.slice(Cin_buf, (row, None))
+            cin_div = fx.logical_divide(row_cin, fx.make_layout(1, 1))
+            return _load_f_scalar(cin_div, col)
+
+        ctx = EpiContext(
+            alpha=ArithValue(alpha) if has_alpha else None,
+            beta=ArithValue(beta) if has_c else None,
+            out_col=n_base + lane_row,
+            load_row_bias=(lambda col: _load_f_scalar(bias_div, col)) if has_bias else None,
+            load_residual=_load_residual if has_c else None,
+        )
+        # Per-column bias loaded once per lane (shared across its 4 rows).
+        epilogue_begin(epi_ops, ctx)
         # Store C: 4 rows per lane at column `lane_row` in the output tile.
         # C[(bid_m*16) + (lane_k_group*4 + i), (bid_n*16) + lane_row] = acc[i]
         for i in range_constexpr(_FRAG_C):
@@ -244,38 +262,9 @@ def _build_gemm_16x16(
             out_col = n_base + lane_row
             row_c = fx.slice(C_buf, (out_row, None))
             c_div = fx.logical_divide(row_c, fx.make_layout(1, 1))
-            val_i = vector.extract(acc, static_position=[i], dynamic_position=[])
-            val = ArithValue(val_i)
-            if fx.const_expr(has_alpha):
-                val = val * alpha_av
-            if fx.const_expr(has_c):
-                row_cin = fx.slice(Cin_buf, (out_row, None))
-                cin_div = fx.logical_divide(row_cin, fx.make_layout(1, 1))
-                cin_val = ArithValue(_load_f_scalar(cin_div, out_col))
-                val = val + beta_av * cin_val
-            if fx.const_expr(has_bias):
-                val = val + bias_val
-            # Inlined activations — the module-level helpers use an arg shape
-            # that doesn't always round-trip through the epilogue context;
-            # open-coding keeps the IR clean.
-            zero = arith.constant(0.0, type=T.f32)
-            if fx.const_expr(activation == "relu"):
-                val = val.maximumf(zero)
-            elif fx.const_expr(activation == "relu_sq"):
-                val = val.maximumf(zero) * val
-            elif fx.const_expr(activation == "gelu_tanh_approx"):
-                import math as _py_math
-                c1 = _py_math.sqrt(2.0 / _py_math.pi)
-                c2 = 0.044715 * c1
-                x = val
-                x_sq = x * x
-                tanh_arg = x * (c1 + c2 * x_sq)
-                # tanh(z) = 1 - 2 / (1 + exp(2z))  (no libcall; uses hardware exp).
-                tanh_z = Float32(1.0) - Float32(2.0) / (Float32(1.0) + _fm.exp(Float32(2.0) * tanh_arg, fastmath="fast"))
-                val = x * (Float32(0.5) + Float32(0.5) * tanh_z)
-            elif fx.const_expr(activation == "silu"):
-                # silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
-                val = val / (Float32(1.0) + _fm.exp(-val, fastmath="fast"))
+            ctx.out_row = out_row
+            val = ArithValue(vector.extract(acc, static_position=[i], dynamic_position=[]))
+            val = epilogue_apply(epi_ops, val, ctx)
             _store_out_scalar(c_div, out_col, val)
 
     @flyc.jit
