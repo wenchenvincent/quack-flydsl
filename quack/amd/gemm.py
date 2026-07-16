@@ -322,16 +322,19 @@ def gemm_symmetric(A, out_dtype=None, **kw):
     (f16/bf16, M/K multiples of 16, last-dim contig). Falls back to
     ``gemm(A, A.T)`` otherwise.
     """
+    # The dedicated kernel now supports a bias/activation/alpha/beta/C epilogue;
+    # route those through it instead of materialising an A.T transpose copy.
+    _supported = {"bias", "activation", "alpha", "beta", "C"}
     if (
         A.is_cuda
         and A.dtype in (torch.float16, torch.bfloat16)
         and A.dim() == 2
         and A.stride(-1) == 1
         and A.size(0) % 16 == 0 and A.size(1) % 16 == 0
-        and not kw   # dedicated kernel doesn't yet take bias/activation/etc.
+        and set(kw).issubset(_supported)
     ):
         from quack.amd.gemm_symmetric import gemm_symmetric as _gemm_symmetric_kernel
-        return _gemm_symmetric_kernel(A, out_dtype=out_dtype)
+        return _gemm_symmetric_kernel(A, out_dtype=out_dtype, **kw)
     return gemm(A, A.transpose(-1, -2).contiguous(), out_dtype=out_dtype, **kw)
 
 
