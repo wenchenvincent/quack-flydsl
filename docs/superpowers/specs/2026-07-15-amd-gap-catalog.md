@@ -131,6 +131,28 @@ absent functionality. **Verify before building.**
 
 ---
 
+## Round-1 gap sweep — status (autonomous run, 2026-07-16)
+
+Post-upstream-merge (v0.6.1) gap sweep. **Landed + tested + committed:**
+- **G5** — bias/activation/alpha/beta/C epilogue for `gemm_symmetric` (fixes the
+  silent A.T-transpose fallback); +13 tests. `fc196b5`.
+- **G9** — `gemm_tt` (TT layout `C=A.T@B.T`) via Option-A dispatch on transposed
+  views (no in-repo consumer → YAGNI, dedicated kernel roadmapped); 10 tests. `eddd712`.
+- **G2** — `fuse_grad_accum`: `gemm_tn` gains an `accumulate` (read-add-store)
+  flag; `LinearFunc`/`LinearActFunc`/`linear_train`/`nn.Linear` accumulate dW
+  into `weight.grad` in-place; 5 tests. `c18291b`. (linear_training's torch.mm/
+  gemm_dact dweight path deferred — not gemm_tn.)
+- **G8** — fp8 stochastic-rounding quantizer `quantize_fp8_sr` via hardware
+  `v_cvt_sr_fp8_f32`/`bf8` + in-kernel murmur3 PRNG; SR 12× less biased than RTN,
+  exact bracketing; 5 tests. `d5dd50e`. (bf16-GEMM-epilogue SR via unwrapped
+  packed intrinsic deferred.)
+- **G7 (MXFP6)** — `gemm_mxfp6` (e2m3) via cbsz=2 on the f8f6f4 atom + `mxfp6_ops`;
+  bit-exact vs dequant; 14 tests. `feb8057`. **G7 now covers MXFP8+MXFP4+MXFP6.**
+
+**Round 2 (remaining, larger):** G4 (composable epilogue), G10 (varlen-K),
+G13 (in-kernel scheduler), G14 (profiler/sort) — all validatable; G12 (RDNA
+WMMA) blocked (no RDNA hardware on this CDNA box).
+
 ## Overnight execution — final status (autonomous run, 2026-07-15)
 
 **Implemented + tested + committed:**
